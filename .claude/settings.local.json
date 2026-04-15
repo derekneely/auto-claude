@@ -19,7 +19,8 @@
       "Bash(MSYS_NO_PATHCONV=1 gh api /repos/Accelevation/QualityFieldApp/labels --method POST --field name=ac-test-label --field color=c2e0c6)",
       "Bash(MSYS_NO_PATHCONV=1 gh api /repos/Accelevation/QualityFieldApp/labels/ac-test-label --method DELETE)",
       "Bash(ls:*)",
-      "Bash(git add *)"
+      "Bash(git add *)",
+      "Bash(git commit *)"
     ]
   }
 }
