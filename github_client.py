@@ -181,6 +181,14 @@ class GithubClient:
         )
         return result.stdout.strip()
 
+    def get_pr_reviews(self, repo: str, pr_number: int) -> list[dict]:
+        """Return all top-level reviews for a pull request."""
+        return self._gh_api(f"/repos/{self.org}/{repo}/pulls/{pr_number}/reviews")
+
+    def get_pr_review_comments(self, repo: str, pr_number: int) -> list[dict]:
+        """Return all inline review comments on a pull request."""
+        return self._gh_api(f"/repos/{self.org}/{repo}/pulls/{pr_number}/comments")
+
     def clone_repo(self, repo: str, target_dir: Path) -> None:
         """Clone a repository to target_dir (longer timeout for large repos)."""
         self._run_gh(

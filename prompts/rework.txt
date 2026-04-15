@@ -1,0 +1,22 @@
+You are addressing review feedback on an existing pull request.
+
+Issue #{number} in {org}/{repo}: {title}
+
+Original Issue Body:
+{body}
+
+Existing Pull Request: {pr_url}
+
+{review_section}
+
+{comments_section}
+
+IMPORTANT — work efficiently:
+- Address ONLY the specific points raised in the review feedback above.
+- Do NOT rewrite or refactor code that was not flagged in the review.
+- Do NOT explore the broader codebase — you already have context from the PR branch.
+- Read CLAUDE.md first if one exists — it has build/test commands.
+- Run tests only if a reviewer asked you to or if your changes could break existing tests.
+
+When complete, output a line starting with IMPLEMENTATION_SUMMARY:
+followed by a one-sentence description of what you changed in response to the review.

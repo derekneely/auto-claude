@@ -16,21 +16,34 @@ pr_created_label = "ac-pr-created"
 in_progress_label = "ac-in-progress"
 plan_posted_label = "ac-plan-posted"
 review_posted_label = "ac-review-posted"
-action_labels = ["ac-fix", "ac-implement", "ac-test", "ac-plan", "ac-review"]
-dev_actions = ["fix", "implement", "test"]
+action_labels = ["ac-fix", "ac-implement", "ac-test", "ac-plan", "ac-review", "ac-rework"]
+dev_actions = ["fix", "implement", "test", "rework"]
 plan_actions = ["plan", "review"]
+rework_label = "ac-rework"
 
 [claude]
 triage_model = "claude-haiku-4-5"
-dev_model = "claude-opus-4-6"
+dev_model = "claude-sonnet-4-6"          # default model for dev actions
+light_model = "claude-haiku-4-5"         # used for handoff summaries
 permission_mode = "bypassPermissions"
-max_budget_usd = 5.0
+max_budget_usd = 10.0
 output_format = "stream-json"
+grace_budget_usd = 1.0                   # extra budget for handoff summary when main budget is exceeded
+max_turns_dev = 50                       # max tool-use turns for dev workers
+max_turns_plan = 20                      # max tool-use turns for plan/review workers
+
+# Per-action model overrides (optional). Actions not listed use dev_model.
+[claude.action_models]
+implement = "claude-opus-4-6"            # complex features get Opus
+fix = "claude-sonnet-4-6"
+test = "claude-sonnet-4-6"
+rework = "claude-sonnet-4-6"
+plan = "claude-sonnet-4-6"
+review = "claude-sonnet-4-6"
 
 [workers]
 max_parallel = 3
-retry_max = 2
-retry_delay_seconds = 30
+max_continuations = 2            # max continuation runs after budget exhaustion (3 total)
 shutdown_grace_seconds = 30
 
 [paths]
@@ -39,6 +52,7 @@ worktrees_dir = "worktrees"
 state_file = "state/issues.json"
 log_file = "logs/auto-claude.log"
 prompts_dir = "prompts"
+crash_logs_dir = "crash_logs"
 
 [logging]
 level = "INFO"       # DEBUG | INFO | WARN | ERROR

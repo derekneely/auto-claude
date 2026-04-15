@@ -7,11 +7,13 @@ Issue Body:
 
 {comments_section}
 
-Please implement the requested {action}. Focus on:
-1. Understanding the codebase structure before making changes
-2. Making targeted, minimal changes
-3. Running tests if a test command exists
-4. Following existing code style and patterns
+IMPORTANT — work efficiently:
+- If the issue mentions specific files or paths, start there. Do NOT explore the whole codebase.
+- Read the CLAUDE.md file first if one exists — it has build/test commands and project structure.
+- Make targeted, minimal changes. Do not refactor surrounding code.
+- Run tests only if CLAUDE.md or package.json/pyproject.toml tells you how.
+- Do not add comments, docstrings, or type annotations to code you didn't change.
+- Do not install new dependencies unless the issue specifically requires them.
 
 When complete, output a line starting with IMPLEMENTATION_SUMMARY:
 followed by a one-sentence description of what you did.

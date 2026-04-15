@@ -1,0 +1,25 @@
+Issue #{number} in {org}/{repo}: {title}
+
+Action: {action} (from label ac-{action})
+
+Issue Body:
+{body}
+
+{comments_section}
+
+--- Previous Agent Handoff ---
+A previous agent ran out of budget working on this issue. Here is their
+summary of what was accomplished and what remains:
+
+{handoff_summary}
+--- End Handoff ---
+
+IMPORTANT — work efficiently:
+- The previous agent's partial work is already committed. Check git log to see what was done.
+- Focus ONLY on the remaining work described in the handoff summary.
+- Do NOT re-read files the previous agent already modified unless you need to edit them.
+- Read CLAUDE.md first if one exists — it has build/test commands.
+- Do not refactor, add comments, or clean up the previous agent's code.
+
+When complete, output a line starting with IMPLEMENTATION_SUMMARY:
+followed by a one-sentence description of what you did.

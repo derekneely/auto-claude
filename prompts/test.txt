@@ -7,12 +7,13 @@ Issue Body:
 
 {comments_section}
 
-Please write and run tests for the requested change. Focus on:
-1. Understanding the existing test infrastructure and patterns
-2. Writing tests that cover the described behavior or bug
-3. Running the test suite to verify tests pass
-4. Following existing test conventions (file naming, assertions, fixtures)
-5. Covering edge cases and error paths, not just the happy path
+IMPORTANT — work efficiently:
+- Read CLAUDE.md first if one exists — it has the test runner command and conventions.
+- Look at one existing test file to learn the patterns, then write your tests.
+- Do NOT explore the entire codebase. Focus on the files mentioned in the issue.
+- Follow existing test conventions (file naming, assertions, fixtures).
+- Cover the described behavior, edge cases, and error paths.
+- Run the test suite to verify your tests pass.
 
 When complete, output a line starting with IMPLEMENTATION_SUMMARY:
 followed by a one-sentence description of what tests you wrote and their results.

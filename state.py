@@ -49,7 +49,7 @@ VALID_TRANSITIONS: dict[str, list[str]] = {
     IssueStatus.IN_PROGRESS: [IssueStatus.COMPLETED, IssueStatus.FAILED, IssueStatus.INTERRUPTED, IssueStatus.SKIPPED],
     IssueStatus.FAILED:      [IssueStatus.QUEUED, IssueStatus.DISCOVERED, IssueStatus.SKIPPED],
     IssueStatus.INTERRUPTED: [IssueStatus.QUEUED, IssueStatus.DISCOVERED, IssueStatus.SKIPPED],
-    IssueStatus.COMPLETED:   [IssueStatus.DISCOVERED, IssueStatus.SKIPPED],
+    IssueStatus.COMPLETED:   [IssueStatus.DISCOVERED, IssueStatus.QUEUED, IssueStatus.SKIPPED],
     IssueStatus.SKIPPED:     [],  # terminal
 }
 
@@ -98,7 +98,9 @@ class IssueRecord:
     pr_url: str | None = None
     triage_attempts: int = 0
     error: str | None = None
-    retry_count: int = 0
+    rework_count: int = 0
+    continuation_count: int = 0
+    handoff_summary: str | None = None
 
 
 def _now_iso() -> str:

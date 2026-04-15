@@ -58,6 +58,15 @@ class ProcessManager:
         # Assign color
         color_name, color_code = self._color_assigner.assign(record.issue_id)
 
+        # Resolve model for this action (action_models override, else dev_model)
+        action = record.action
+        claude_cfg = self._config.claude
+        resolved_model = claude_cfg.action_models.get(action, claude_cfg.dev_model)
+
+        # Resolve max_turns based on action type
+        is_plan_action = action in self._config.github.plan_actions
+        max_turns = claude_cfg.max_turns_plan if is_plan_action else claude_cfg.max_turns_dev
+
         # Build IssueContext (all picklable)
         ctx = IssueContext(
             issue_id=record.issue_id,
@@ -71,11 +80,19 @@ class ProcessManager:
             repos_dir=self._config.paths.repos_dir,
             worktrees_dir=self._config.paths.worktrees_dir,
             prompts_dir=self._config.paths.prompts_dir,
-            dev_model=self._config.claude.dev_model,
-            permission_mode=self._config.claude.permission_mode,
-            max_budget_usd=self._config.claude.max_budget_usd,
+            dev_model=resolved_model,
+            light_model=claude_cfg.light_model,
+            permission_mode=claude_cfg.permission_mode,
+            max_budget_usd=claude_cfg.max_budget_usd,
+            max_turns=max_turns,
+            crash_logs_dir=self._config.paths.crash_logs_dir,
             color_name=color_name,
             color_code=color_code,
+            existing_branch=record.branch,
+            pr_url=record.pr_url,
+            rework_count=record.rework_count,
+            handoff_summary=record.handoff_summary,
+            grace_budget_usd=claude_cfg.grace_budget_usd,
         )
 
         abort_event = multiprocessing.Event()
@@ -128,24 +145,34 @@ class ProcessManager:
                 self._state.save()
                 record = self._state.get(issue_id)
 
-            # Retry logic: failed + under retry limit → re-queue
-            if record.status == IssueStatus.FAILED:
-                new_retry_count = record.retry_count + 1
-                if new_retry_count < self._config.workers.retry_max:
+            # Budget exhaustion: re-queue for continuation if under limit
+            if record.status == IssueStatus.FAILED and record.error == "budget_exceeded":
+                new_count = record.continuation_count + 1
+                max_cont = self._config.workers.max_continuations
+                if new_count <= max_cont:
                     self._state.transition(issue_id, IssueStatus.QUEUED)
-                    self._state.update(issue_id, retry_count=new_retry_count)
+                    self._state.update(issue_id, continuation_count=new_count)
                     self._state.save()
                     self._logger.info(
-                        f"Re-queued {issue_id} (retry {new_retry_count}/{self._config.workers.retry_max})"
+                        f"Budget exceeded — re-queued {issue_id} for continuation "
+                        f"({new_count}/{max_cont})"
                     )
                 else:
-                    self._state.update(issue_id, retry_count=new_retry_count)
+                    self._state.update(issue_id, continuation_count=new_count)
                     self._state.save()
                     self._logger.error(
-                        f"{issue_id} failed after {new_retry_count} attempts — giving up"
+                        f"{issue_id} exceeded budget across {new_count} runs — giving up"
                     )
-                    # Post failure comment
-                    self._post_failure_comment(record)
+                    self._post_budget_comment(record)
+
+            # No automatic retries — crash logs are written by the worker.
+            # Re-label the issue manually to retry.
+            elif record.status == IssueStatus.FAILED:
+                self._state.save()
+                self._logger.error(
+                    f"{issue_id} failed — check crash_logs for details. "
+                    f"Re-label the issue to retry."
+                )
 
     def drain_state_queue(self) -> None:
         """Process all pending StateUpdate messages from workers."""
@@ -177,6 +204,8 @@ class ProcessManager:
                 updates["pr_url"] = update.pr_url
             if update.worker_pid is not None:
                 updates["worker_pid"] = update.worker_pid
+            if update.handoff_summary is not None:
+                updates["handoff_summary"] = update.handoff_summary
             if updates:
                 self._state.update(update.issue_id, **updates)
 
@@ -255,16 +284,22 @@ class ProcessManager:
             self._color_assigner.release(issue_id)
             proc.join(timeout=5)
 
-    def _post_failure_comment(self, record: IssueRecord) -> None:
-        """Post a failure comment on the issue via gh CLI."""
+    def _post_budget_comment(self, record: IssueRecord) -> None:
+        """Post a comment when budget was exceeded across max continuation runs."""
         try:
             import subprocess
             env = os.environ.copy()
             env["MSYS_NO_PATHCONV"] = "1"
+            max_cont = self._config.workers.max_continuations
+            budget = self._config.claude.max_budget_usd
+            total = budget * (max_cont + 1)
             body = redact(
-                f"**auto-claude** failed after {record.retry_count} attempt(s).\n\n"
-                f"> {record.error or 'Unknown error'}\n\n"
-                f"_You may re-label the issue to try again._"
+                f"**auto-claude** exceeded its budget across {record.continuation_count} "
+                f"continuation run(s) (${budget}/run, ~${total:.2f} total).\n\n"
+                f"The issue may be too large for automated handling at the current budget. "
+                f"Partial work has been pushed to branch `{record.branch}`.\n\n"
+                f"_Consider breaking this into smaller issues, or increase "
+                f"`max_budget_usd` in config._"
             )
             subprocess.run(
                 [
@@ -278,4 +313,4 @@ class ProcessManager:
                 env=env,
             )
         except Exception as exc:
-            self._logger.error(f"Failed to post failure comment on {record.issue_id}: {exc}")
+            self._logger.error(f"Failed to post budget comment on {record.issue_id}: {exc}")

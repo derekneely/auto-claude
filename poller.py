@@ -118,6 +118,26 @@ class Poller:
                         f"Plan→action: {issue_id} relabeled [{action_label}]"
                     )
 
+                # Rework: reviewer requested changes on a completed issue's PR
+                # Skip triage — go directly to QUEUED, preserving branch/pr_url
+                elif (action == "rework"
+                      and record.status == IssueStatus.COMPLETED
+                      and record.branch and record.pr_url):
+                    self._state.transition(issue_id, IssueStatus.QUEUED)
+                    self._state.update(
+                        issue_id,
+                        action="rework",
+                        labels=label_names,
+                        error=None,
+                        rework_count=record.rework_count + 1,
+                        worker_pid=None,
+                        issue_updated_at=issue.get("updated_at", ""),
+                    )
+                    self._state.save()
+                    self._logger.info(
+                        f"Rework: {issue_id} — branch={record.branch}, PR={record.pr_url}"
+                    )
+
                 # Retry: user relabeled a failed/completed/interrupted issue
                 elif record.status in (
                     IssueStatus.FAILED,
@@ -130,7 +150,6 @@ class Poller:
                         action=action,
                         labels=label_names,
                         error=None,
-                        retry_count=0,
                         branch=None,
                         pr_url=None,
                         worker_pid=None,

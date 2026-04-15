@@ -8,7 +8,12 @@ Issue Body:
 
 {comments_section}
 
-Analyze the codebase in the context of this issue and produce a review covering:
+IMPORTANT — work efficiently:
+- Read CLAUDE.md first if one exists — it has project structure and conventions.
+- Only read files directly relevant to the issue. Do not survey the whole codebase.
+- If the issue mentions specific files, focus your review there.
+
+Produce a review covering:
 1. **Summary**: Overview of the relevant code area
 2. **Findings**: Issues, bugs, or improvements found (with file paths and line numbers)
 3. **Code quality**: Style consistency, naming, documentation gaps
