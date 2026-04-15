@@ -148,6 +148,8 @@ class TriageEngine:
 
 def format_clarifying_comment(decision: TriageDecision, config: Config) -> str:
     """Format a needs_info triage decision into a GitHub comment."""
+    from redact import redact
+
     lines = [
         "**auto-claude** needs more information before proceeding:\n",
         f"> {decision.summary}\n",
@@ -161,4 +163,4 @@ def format_clarifying_comment(decision: TriageDecision, config: Config) -> str:
     lines.append("")
     lines.append("_Please respond to the questions above, then auto-claude will re-evaluate._")
 
-    return "\n".join(lines)
+    return redact("\n".join(lines))

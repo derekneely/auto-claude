@@ -10,6 +10,7 @@ from multiprocessing import Event, Process, Queue
 from config import Config
 from logger import ColorAssigner, MainLogger
 from state import IssueRecord, IssueStatus, StateStore
+from redact import redact
 from worker import IssueContext, StateUpdate, run_dev_worker, run_plan_worker
 
 
@@ -260,7 +261,7 @@ class ProcessManager:
             import subprocess
             env = os.environ.copy()
             env["MSYS_NO_PATHCONV"] = "1"
-            body = (
+            body = redact(
                 f"**auto-claude** failed after {record.retry_count} attempt(s).\n\n"
                 f"> {record.error or 'Unknown error'}\n\n"
                 f"_You may re-label the issue to try again._"

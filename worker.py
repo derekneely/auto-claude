@@ -12,6 +12,7 @@ from multiprocessing import Event, Queue
 from pathlib import Path
 
 from logger import WorkerLogger
+from redact import redact
 
 
 # ---------------------------------------------------------------------------
@@ -384,8 +385,8 @@ def _push_and_pr(
     if result.returncode != 0:
         raise RuntimeError(f"Push failed: {result.stderr.strip()}")
 
-    # Create PR
-    pr_body = f"{summary}\n\nCloses #{ctx.number}" if summary else f"Closes #{ctx.number}"
+    # Create PR — redact summary to avoid leaking secrets from Claude output
+    pr_body = f"{redact(summary)}\n\nCloses #{ctx.number}" if summary else f"Closes #{ctx.number}"
     pr_title = f"{ctx.action}: {ctx.title} (#{ctx.number})"
     logger.info("Creating pull request...")
     result = _run_cmd(
@@ -648,7 +649,7 @@ def run_plan_worker(
             footer = ""
             posted_label = "ac-review-posted"
 
-        comment_body = f"{heading}\n\n{result_text}{footer}"
+        comment_body = f"{heading}\n\n{redact(result_text)}{footer}"
 
         logger.info("Posting comment on issue...")
         _run_cmd(
