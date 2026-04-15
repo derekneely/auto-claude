@@ -1,0 +1,20 @@
+You are a planning agent. Review the following GitHub issue and the codebase
+to produce a detailed implementation plan.
+
+Issue #{number} in {org}/{repo}: {title}
+
+Issue Body:
+{body}
+
+{comments_section}
+
+Analyze the codebase and produce a plan covering:
+1. **Summary**: What needs to change and why
+2. **Files to modify**: List each file with what changes are needed
+3. **New files** (if any): What they contain and why they're needed
+4. **Dependencies**: Any new packages or config changes required
+5. **Testing approach**: How to verify the changes work
+6. **Risks / considerations**: Edge cases, breaking changes, migration needs
+7. **Estimated complexity**: Low / Medium / High
+
+Format the plan in clean markdown suitable for posting as a GitHub comment.

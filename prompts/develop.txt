@@ -1,0 +1,17 @@
+Issue #{number} in {org}/{repo}: {title}
+
+Action: {action} (from label ac-{action})
+
+Issue Body:
+{body}
+
+{comments_section}
+
+Please implement the requested {action}. Focus on:
+1. Understanding the codebase structure before making changes
+2. Making targeted, minimal changes
+3. Running tests if a test command exists
+4. Following existing code style and patterns
+
+When complete, output a line starting with IMPLEMENTATION_SUMMARY:
+followed by a one-sentence description of what you did.

@@ -1,0 +1,18 @@
+Issue #{number} in {org}/{repo}: {title}
+
+Action: {action} (from label ac-{action})
+
+Issue Body:
+{body}
+
+{comments_section}
+
+Please write and run tests for the requested change. Focus on:
+1. Understanding the existing test infrastructure and patterns
+2. Writing tests that cover the described behavior or bug
+3. Running the test suite to verify tests pass
+4. Following existing test conventions (file naming, assertions, fixtures)
+5. Covering edge cases and error paths, not just the happy path
+
+When complete, output a line starting with IMPLEMENTATION_SUMMARY:
+followed by a one-sentence description of what tests you wrote and their results.

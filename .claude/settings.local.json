@@ -1,0 +1,25 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(git -C /c/Users/DerekNeely/Work/auto-claude status)",
+      "Bash(gh auth:*)",
+      "Bash(ollama list:*)",
+      "Bash(gh repo:*)",
+      "Bash(gh api:*)",
+      "Bash(claude --version)",
+      "Bash(python -c \"import sys; print\\(sys.version_info\\)\")",
+      "Bash(python:*)",
+      "Bash(pip list:*)",
+      "Bash(git worktree:*)",
+      "Bash(git init:*)",
+      "Bash(echo \"Exit code: $?\")",
+      "Bash(gh --version)",
+      "Bash(git --version)",
+      "Bash(echo \"Exit: $?\")",
+      "Bash(MSYS_NO_PATHCONV=1 gh api /repos/Accelevation/QualityFieldApp/labels --method POST --field name=ac-test-label --field color=c2e0c6)",
+      "Bash(MSYS_NO_PATHCONV=1 gh api /repos/Accelevation/QualityFieldApp/labels/ac-test-label --method DELETE)",
+      "Bash(ls:*)",
+      "Bash(git add *)"
+    ]
+  }
+}
