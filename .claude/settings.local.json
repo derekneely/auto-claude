@@ -22,7 +22,11 @@
       "Bash(git add *)",
       "Bash(git commit *)",
       "Bash(claude --print --max-budget-usd 0.001 --model claude-haiku-4-5 \"say hello\")",
-      "Bash(echo \"EXIT_CODE=$?\")"
+      "Bash(echo \"EXIT_CODE=$?\")",
+      "Bash(./gradlew compileDebugKotlin)",
+      "Bash(./gradlew installDebug)",
+      "Bash(git checkout *)",
+      "Bash(git push *)"
     ]
   }
 }
