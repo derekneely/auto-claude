@@ -815,7 +815,7 @@ def _set_labels(
 
 
 def _clone_or_fetch(ctx: IssueContext, logger: WorkerLogger) -> Path:
-    """Clone repo if missing, otherwise fetch + reset to main."""
+    """Clone repo if missing, otherwise fetch + reset to base_branch."""
     repo_dir = ctx.repos_dir / ctx.repo
 
     if not repo_dir.exists():
@@ -827,6 +827,8 @@ def _clone_or_fetch(ctx: IssueContext, logger: WorkerLogger) -> Path:
         )
         if result.returncode != 0:
             raise RuntimeError(f"Clone failed: {result.stderr.strip()}")
+        _run_cmd(["git", "fetch", "origin"], cwd=repo_dir, logger=logger)
+        _run_cmd(["git", "checkout", ctx.base_branch], cwd=repo_dir, logger=logger)
     else:
         logger.info(f"Fetching latest for {ctx.repo}...")
         _run_cmd(["git", "fetch", "origin"], cwd=repo_dir, logger=logger)
