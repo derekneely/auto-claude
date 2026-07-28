@@ -660,6 +660,32 @@ strand an issue mid-stage, and stale-lock recovery stays trivial.
 - **H** (docs) — ⬜ README label table updated; `docs/plans/02`, `06`, `09` still
   describe the pre-consolidation design.
 
+### Scope: one repo at a time, gated on verify commands
+
+Decided 2026-07-28. `[github].repos` is narrowed to **`field_admin` only**. A
+repo joins the list when its `.claude/pipeline.json` declares *real* verify/test
+commands, not merely when the file exists.
+
+The reason is `_run_pipeline_checks`: a repo with no `pipeline.json`, or one
+with empty `verify` and `test`, has nothing to run — so it returns `ok=True`
+and the review worker approves on the diff alone. That is deliberate (failing
+would strand every legitimately-unbuildable repo at `ac-blocked`) and it is
+honest (the transcript says so, and it reaches the review prompt). But an
+approval with no build gate behind it should be an explicit choice per repo,
+not a side effect of listing it here. Listing a repo also stamps the ac-* label
+set on it at startup, so an unconfigured repo is not a free addition.
+
+Held back as of 2026-07-28:
+
+| Repo | Why |
+|---|---|
+| `QualityFieldApp` | PR #110 merged, resolves `./gradlew :app:assembleDebug` + `:app:testDebugUnitTest`. Task names verified against `settings.gradle.kts`, never executed. A cold gradle build may exceed `_run_pipeline_command`'s 600s timeout. |
+| `quality-field-agent` | PR #2 still open — no `pipeline.json` at all. |
+| `quality-field-documentation` | PR #4 still open, and declares `verify: []` / `test: []`, so merging it would not add a gate. |
+
+`field_admin` itself declares `test: []`, so review runs typecheck + build and
+never runs tests. Worth revisiting, but it is a real gate.
+
 ### Blocking a first real test
 
 1. **Assign an issue to `accelevation-bot` and label it `ac-dev-ready`.** Nothing

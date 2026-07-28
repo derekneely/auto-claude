@@ -4,6 +4,11 @@
 
 [github]
 org = "your-org"
+# Only list a repo once its .claude/pipeline.json declares real verify/test
+# commands. A repo without them still passes review — the check runner reports
+# "no verify/test commands configured" and returns ok — so the approval has no
+# build gate behind it. Listing a repo here also stamps the ac-* label set on
+# it at startup, so an unconfigured repo is not a free addition.
 repos = [
     "repo-one",
     "repo-two",
