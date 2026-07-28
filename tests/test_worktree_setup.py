@@ -183,6 +183,44 @@ class TestCopyEnvFiles:
         dst.mkdir()
         assert copy_env_files(None, dst, (".env",)) == []
 
+    def test_a_file_can_land_under_a_different_name(self, tmp_path):
+        """next build sets NODE_ENV=production, so Next loads .env.production
+        and ignores .env.development entirely. Landing the dev file as
+        .env.local - which loads in every mode - gives the build a dev
+        DATABASE_URL without putting production credentials in the worktree."""
+        src, dst = tmp_path / "src", tmp_path / "dst"
+        src.mkdir(); dst.mkdir()
+        (src / ".env.development").write_text("DATABASE_URL=dev", encoding="utf-8")
+        copied = copy_env_files(src, dst, (".env.development",),
+                                rename={".env.development": ".env.local"})
+        assert copied == [".env.local"]
+        assert (dst / ".env.local").read_text(encoding="utf-8") == "DATABASE_URL=dev"
+
+    def test_a_renamed_file_does_not_also_land_under_its_own_name(self, tmp_path):
+        src, dst = tmp_path / "src", tmp_path / "dst"
+        src.mkdir(); dst.mkdir()
+        (src / ".env.development").write_text("A=1", encoding="utf-8")
+        copy_env_files(src, dst, (".env.development",),
+                       rename={".env.development": ".env.local"})
+        assert not (dst / ".env.development").exists()
+
+    def test_unmapped_files_keep_their_name(self, tmp_path):
+        src, dst = tmp_path / "src", tmp_path / "dst"
+        src.mkdir(); dst.mkdir()
+        (src / ".env").write_text("A=1", encoding="utf-8")
+        (src / ".env.development").write_text("B=2", encoding="utf-8")
+        copied = copy_env_files(src, dst, (".env", ".env.development"),
+                                rename={".env.development": ".env.local"})
+        assert sorted(copied) == [".env", ".env.local"]
+
+    def test_a_rename_cannot_escape_the_worktree(self, tmp_path):
+        src, dst = tmp_path / "src", tmp_path / "dst"
+        src.mkdir(); dst.mkdir()
+        (src / ".env").write_text("A=1", encoding="utf-8")
+        assert copy_env_files(src, dst, (".env",),
+                              rename={".env": "../escaped.env"}) == []
+        assert not (tmp_path / "escaped.env").exists()
+
     def test_does_not_escape_the_worktree(self, tmp_path):
         """A traversal in the configured name must not write outside dst."""
         src, dst = tmp_path / "src", tmp_path / "dst"
@@ -276,6 +314,19 @@ class TestRepoSetupFromConfig:
         abs_path = (tmp_path / "elsewhere").resolve()
         extra = f'\n[repos.field_admin]\nenv_source = "{abs_path.as_posix()}"\n'
         assert _cfg(tmp_path, extra).repo_setup["field_admin"].env_source == abs_path
+
+    def test_env_file_as_is_read(self, tmp_path):
+        extra = (
+            '\n[repos.field_admin]\n'
+            'env_files = [".env.development"]\n'
+            'env_file_as = { ".env.development" = ".env.local" }\n'
+        )
+        got = _cfg(tmp_path, extra).repo_setup["field_admin"]
+        assert got.env_file_as == {".env.development": ".env.local"}
+
+    def test_env_file_as_defaults_to_empty(self, tmp_path):
+        extra = '\n[repos.field_admin]\nenv_files = [".env"]\n'
+        assert _cfg(tmp_path, extra).repo_setup["field_admin"].env_file_as == {}
 
     def test_a_repo_with_no_block_is_simply_absent(self, tmp_path):
         extra = '\n[repos.field_admin]\nsetup = ["npm ci"]\n'

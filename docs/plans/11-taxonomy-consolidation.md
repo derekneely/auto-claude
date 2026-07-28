@@ -689,10 +689,25 @@ the transcript goes on the issue, and the attempt is bumped. The review worker
 becomes a second opinion rather than the first thing that ever compiles the
 code.
 
-Verified end-to-end on a fresh `origin/dev` worktree: env files copied, three
-setup commands green, then `npm run typecheck` exit 0 and `npm run build` exit
-0 in 2m13s — inside `_run_pipeline_command`'s 600s budget. 50 tests in
-`tests/test_worktree_setup.py`.
+**Dev credentials only.** `.env.production` is deliberately not copied. Its
+`DATABASE_URL` points at the production database, and the worktree is where an
+agent runs under `bypassPermissions` — nothing would stop it running a
+migration or a query against prod. Both env files *are* gitignored in
+`field_admin`, so the worker's `git add -A` could never have committed them;
+the risk was the agent's own reach, not the commit.
+
+Copying only `.env.development` does not work either: `next build` sets
+`NODE_ENV=production`, so Next loads `.env.production` and ignores
+`.env.development` entirely. The build fails with `DATABASE_URL is not set`.
+`.env.local` loads in *every* mode, so `env_file_as` lands the dev file there —
+`{ ".env.development" = ".env.local" }`. The build gets a **dev** DATABASE_URL
+and production credentials never enter the worktree.
+
+Verified end-to-end on fresh `origin/dev` worktrees at each step: prod env
+present → build green (2m13s); dev env only → build **fails**, `DATABASE_URL is
+not set`; dev env landed as `.env.local` → typecheck exit 0, build exit 0
+(1m39s), and a grep for the production DATABASE_URL across the worktree finds
+nothing. 57 tests in `tests/test_worktree_setup.py`.
 
 ### Sequencing
 

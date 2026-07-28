@@ -145,6 +145,7 @@ def load_config(config_path: Path | None = None) -> Config:
         repo_setup[name] = RepoSetupConfig(
             setup=tuple(block["setup"]) if "setup" in block else None,
             env_files=tuple(block.get("env_files", ())),
+            env_file_as=dict(block.get("env_file_as", {})),
             env_source=_resolve_path(project_root, env_source) if env_source else None,
         )
 

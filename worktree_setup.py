@@ -47,6 +47,13 @@ class RepoSetupConfig:
     setup: tuple[str, ...] | None = None
     env_files: tuple[str, ...] = ()
     env_source: Path | None = None
+    #: source name -> name it lands under in the worktree. Exists so a *dev*
+    #: env file can be landed as `.env.local`: `next build` sets
+    #: NODE_ENV=production, so Next loads `.env.production` and ignores
+    #: `.env.development` entirely, while `.env.local` loads in every mode.
+    #: That gives the build a dev DATABASE_URL and keeps production
+    #: credentials out of a worktree an agent runs in unattended.
+    env_file_as: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass
@@ -114,8 +121,12 @@ def copy_env_files(
     source_dir: Path | None,
     worktree_dir: Path,
     names: Sequence[str],
+    rename: dict[str, str] | None = None,
 ) -> list[str]:
-    """Copy gitignored env files into the worktree. Returns what was copied.
+    """Copy gitignored env files into the worktree. Returns the names written.
+
+    `rename` maps a source name to the name it lands under, so a dev env file
+    can be placed as `.env.local` and picked up by a production-mode build.
 
     Never raises: a missing source directory or a missing file is the normal
     case for a repo that needs no env, and a build that genuinely needs one
@@ -130,9 +141,11 @@ def copy_env_files(
     worktree_dir = Path(worktree_dir).resolve()
     copied: list[str] = []
 
+    rename = rename or {}
     for name in names:
+        target = rename.get(name, name)
         src = source_dir / name
-        dst = worktree_dir / name
+        dst = worktree_dir / target
         # A configured name is not user input, but a traversal here would write
         # a secret outside the worktree — cheap to rule out.
         try:
@@ -148,7 +161,7 @@ def copy_env_files(
             shutil.copy2(src, dst)
         except OSError:
             continue
-        copied.append(name)
+        copied.append(target)
 
     return copied
 
@@ -170,7 +183,7 @@ def prepare_worktree(
 
     if config is not None and config.env_files:
         result.copied_env = copy_env_files(
-            config.env_source, worktree_dir, config.env_files
+            config.env_source, worktree_dir, config.env_files, config.env_file_as
         )
         if result.copied_env and logger is not None:
             logger.info(f"Copied env files: {', '.join(result.copied_env)}")
