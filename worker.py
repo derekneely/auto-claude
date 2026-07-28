@@ -25,6 +25,7 @@ from ratelimit import (
     pause_seconds,
 )
 from redact import redact
+from worktree_setup import RepoSetupConfig, prepare_worktree
 
 
 # ---------------------------------------------------------------------------
@@ -120,6 +121,9 @@ class IssueContext:
     # the toolchain is not configured, which disables telemetry silently.
     claude_tools_root: Path | None = None
     pipeline_project: str = ""
+    # Worktree-preparation overrides from `[repos.<name>]`. None means
+    # auto-detect from what is in the checkout, which is the normal case.
+    repo_setup: RepoSetupConfig | None = None
 
 
 @dataclass
@@ -616,6 +620,48 @@ def _issue_report(
     return "\n".join(lines)
 
 
+def _build_repair_prompt(transcript: str) -> str:
+    """Prompt for the one in-session repair round after checks fail.
+
+    A fresh `claude` invocation, so none of the first prompt's boundaries carry
+    over — they have to be restated here.
+    """
+    return (
+        "The work you just did is already committed in this worktree, but the "
+        "repository's own verify/test commands fail against it.\n\n"
+        f"{transcript}\n\n"
+        "Fix the cause. Do not start over and do not revert the existing work — "
+        "amend it. Keep the fix as small as the failure requires; if the failure "
+        "is unrelated to your change, say so rather than papering over it.\n\n"
+        "You may edit files and commit locally. Do NOT run git push, do NOT open "
+        "or modify a pull request, and do NOT touch any ac-* label — the daemon "
+        "owns all of that.\n\n"
+        "When you are done, end with IMPLEMENTATION_SUMMARY: followed by one "
+        "sentence describing the fix."
+    )
+
+
+def _prepare_and_check(
+    ctx: IssueContext,
+    worktree_dir: Path,
+    logger: WorkerLogger,
+) -> tuple[bool, str]:
+    """Make the worktree buildable, then run its verify/test commands.
+
+    A fresh worktree has tracked source and nothing else — no `node_modules`,
+    no generated Prisma client, no gitignored env. Running checks without this
+    fails on a missing toolchain, which is indistinguishable from a real
+    failure and would blame the code for it.
+    """
+    setup = prepare_worktree(worktree_dir, ctx.repo_setup, logger)
+    if not setup.ok:
+        return False, (
+            "Worktree preparation failed — the verify commands were not run.\n\n"
+            + setup.transcript
+        )
+    return _run_pipeline_checks(ctx, worktree_dir, logger)
+
+
 def _post_issue_report(
     ctx: IssueContext,
     *,
@@ -625,6 +671,7 @@ def _post_issue_report(
     pr_url: str | None,
     outcome: str,
     logger: WorkerLogger,
+    notes_override: str | None = None,
 ) -> None:
     """Post the agent's plan, summary and notes back to the issue.
 
@@ -641,7 +688,7 @@ def _post_issue_report(
         body = _issue_report(
             plan=_extract_block(output, "IMPLEMENTATION_PLAN"),
             summary=summary,
-            notes=_extract_block(output, "IMPLEMENTATION_NOTES"),
+            notes=notes_override or _extract_block(output, "IMPLEMENTATION_NOTES"),
             attempt=attempt,
             model=ctx.dev_model,
             branch=branch,
@@ -1693,7 +1740,49 @@ def run_dev_worker(
         if not has_uncommitted and not has_commits:
             raise RuntimeError("No changes produced by Claude")
 
-        logger.info("Changes detected — committing and pushing")
+        logger.info("Changes detected — validating before push")
+
+        # [4b] Gate the push on the repo's own verify/test commands. Without
+        # this the first thing that ever compiles the code is the review
+        # worker, one full dev cycle and one attempt later — and its failure
+        # comment blames the implementation for what a 60-second typecheck
+        # would have caught here.
+        checks_ok, checks_transcript = _prepare_and_check(ctx, worktree_dir, logger)
+
+        if not checks_ok:
+            logger.warn("Checks failed — giving the agent one repair round")
+            repair_rc, repair_output, _budget, _rl = _run_claude(
+                prompt=_build_repair_prompt(checks_transcript),
+                cwd=worktree_dir,
+                ctx=ctx,
+                logger=logger,
+                abort_event=abort_event,
+                bypass_permissions=True,
+            )
+            if repair_rc == 0:
+                output += "\n" + repair_output
+            checks_ok, checks_transcript = _prepare_and_check(ctx, worktree_dir, logger)
+
+        if not checks_ok:
+            # Nothing broken gets pushed. The transcript goes to the issue so
+            # the next attempt starts from the actual failure.
+            logger.error("Checks still failing after repair — refusing to push")
+            _post_issue_report(
+                ctx,
+                output=output,
+                summary="",
+                branch=branch,
+                pr_url=None,
+                outcome="failed",
+                logger=logger,
+                notes_override=(
+                    "Verify/test commands failed and a repair round did not fix "
+                    f"them. Nothing was pushed.\n\n```\n{checks_transcript[-3000:]}\n```"
+                ),
+            )
+            raise RuntimeError("Verify/test checks failed — not pushing")
+
+        logger.info("Checks passed — committing and pushing")
 
         # [5-6] Push and create PR (or push to existing branch for rework)
         summary = _extract_summary(output)
@@ -2016,8 +2105,8 @@ def run_review_worker(
             logger.warn("Abort — exiting after worktree")
             return
 
-        # [3] Run verify then test commands from .claude/pipeline.json
-        checks_ok, checks_transcript = _run_pipeline_checks(ctx, worktree_dir, logger)
+        # [3] Prepare the worktree, then run verify/test from .claude/pipeline.json
+        checks_ok, checks_transcript = _prepare_and_check(ctx, worktree_dir, logger)
         if not checks_ok:
             logger.warn("Verify/test checks failed")
 

@@ -645,6 +645,55 @@ one. 27 tests in `tests/test_issue_report.py`.
 in the pipeline but does not drive it: a crashed or confused agent cannot
 strand an issue mid-stage, and stale-lock recovery stays trivial.
 
+**M. Worktree preparation + pre-push validation** — ✅ **DONE 2026-07-28.**
+Found by asking why the dev worker never tested anything. Two defects, the
+second one fatal.
+
+`_run_pipeline_checks` was called from exactly one place — `run_review_worker`.
+`run_dev_worker` went agent → detect changes → push → PR, with no build gate at
+all. A break cost a full extra dev cycle and an attempt to discover.
+
+Worse: **nothing prepared the worktree.** `git worktree add` yields tracked
+source and nothing else — no `node_modules`, no generated Prisma client, no
+gitignored env. Reproduced against the real clone:
+
+```
+> nextn@0.1.0 typecheck
+> tsc --noEmit
+'tsc' is not recognized as an internal or external command
+```
+
+Every `field_admin` PR would therefore have failed review on a missing
+toolchain, three times, landing at `ac-blocked` with feedback blaming the code.
+The sibling toolchain never hits this because `test-pr-agent` does the setup by
+hand; an unattended daemon has to do it itself.
+
+New `worktree_setup.py`: `detect_setup_commands` infers from the checkout
+(`package.json` → `npm install`; each depth-1 sibling package → `npm --prefix
+<dir> install`; `prisma/schema.prisma` → `npx prisma generate`;
+`requirements.txt`/`pyproject.toml` → pip; `gradlew` → nothing, it bootstraps
+itself). Overridable per-repo via `[repos.<name>]` in auto-claude's *own*
+config — deliberately not a new key in `pipeline.json`, whose schema the
+sibling toolchain owns.
+
+The depth-1 rule is load-bearing, not incidental: `field_admin`'s root
+`tsconfig.json` includes `**/*.ts` and excludes only `node_modules`, so it
+typechecks `functions/src` — whose dependencies live in
+`functions/package.json`. Root-only install left `Cannot find module
+'firebase-functions/v2/firestore'`, which reads as a code error.
+
+Both workers now go through `_prepare_and_check`. The dev worker runs it
+**before pushing**; on failure the agent gets one in-session repair round
+against the failure transcript, then a re-check. Still red → nothing is pushed,
+the transcript goes on the issue, and the attempt is bumped. The review worker
+becomes a second opinion rather than the first thing that ever compiles the
+code.
+
+Verified end-to-end on a fresh `origin/dev` worktree: env files copied, three
+setup commands green, then `npm run typecheck` exit 0 and `npm run build` exit
+0 in 2m13s — inside `_run_pipeline_command`'s 600s budget. 50 tests in
+`tests/test_worktree_setup.py`.
+
 ### Sequencing
 
 - ~~**A** (rate limits), **A2** (bot auth), **A3** (fail-closed gate)~~ ✅

@@ -2,7 +2,10 @@
 
 import tomllib
 from dataclasses import dataclass
+from dataclasses import field as dataclass_field
 from pathlib import Path
+
+from worktree_setup import RepoSetupConfig
 
 
 @dataclass(frozen=True)
@@ -79,6 +82,10 @@ class Config:
     paths: PathsConfig
     logging: LoggingConfig
     integrations: IntegrationsConfig
+    # repo name -> optional [repos.<name>] worktree-preparation overrides. A
+    # repo absent here is prepared by auto-detection, which is the intended
+    # default; the block exists for the cases detection gets wrong.
+    repo_setup: dict[str, "RepoSetupConfig"] = dataclass_field(default_factory=dict)
 
 
 def load_config(config_path: Path | None = None) -> Config:
@@ -127,7 +134,22 @@ def load_config(config_path: Path | None = None) -> Config:
         ),
     )
 
+    # [repos.<name>] — worktree preparation overrides. `setup` omitted stays
+    # None so detection still runs; an explicitly empty list means "this repo
+    # genuinely needs nothing" and is preserved as such.
+    repo_setup: dict[str, RepoSetupConfig] = {}
+    for name, block in (raw.get("repos") or {}).items():
+        if not isinstance(block, dict):
+            continue
+        env_source = block.get("env_source")
+        repo_setup[name] = RepoSetupConfig(
+            setup=tuple(block["setup"]) if "setup" in block else None,
+            env_files=tuple(block.get("env_files", ())),
+            env_source=_resolve_path(project_root, env_source) if env_source else None,
+        )
+
     return Config(
+        repo_setup=repo_setup,
         github=GithubConfig(**raw["github"]),
         claude=claude,
         workers=WorkersConfig(**raw["workers"]),

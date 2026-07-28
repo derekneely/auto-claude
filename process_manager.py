@@ -165,6 +165,7 @@ class ProcessManager:
             base_branch=base_branch,
             repos_dir=self._config.paths.repos_dir,
             worktrees_dir=self._config.paths.worktrees_dir,
+            repo_setup=getattr(self._config, "repo_setup", {}).get(record.repo),
             prompts_dir=self._config.paths.prompts_dir,
             dev_model=resolved_model,
             light_model=claude_cfg.light_model,
