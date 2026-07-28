@@ -614,6 +614,37 @@ protection is unavailable (§3 — free plan, private repos) and `accelevation-b
 holds `write`, so nothing on GitHub's side would have stopped it. This closes
 the last item under "Open questions".
 
+**L. Orchestrator framing + issue write-back** — ✅ **DONE 2026-07-28.** Two
+gaps, both invisible from outside.
+
+The worker's agent was a flat coder: `develop.txt` told it not to explore and
+never mentioned that a headless `claude --print` sees the entire
+`accelevation:*` plugin roster (verified — all 14 are available). The "varying
+models" the design called for existed only as Python picking one model per
+action. `prompts/_orchestration.txt` now frames the agent as an orchestrator
+and names the roster. It is one shared file injected as `{orchestration}` into
+`develop` / `test` / `continue` / `rework`, because a template that drifts out
+of sync silently reverts to a flat coder and nothing would catch it.
+
+**Only advisory agents are offered.** `accelevation:dev-agent`,
+`review-agent`, `triage-agent`, `pipeline-planner` and `test-pr-agent` are in
+an explicit never-delegate list: each self-locks `ac-*` labels, claims its own
+worktree slot, and opens its own PR. Delegating to one from inside a worker
+puts two systems on one issue — the exact collision §1 exists to remove. A test
+asserts all five stay named, so wiring one in means deleting the test that says
+not to.
+
+Write-back: the issue was read as source of truth (body and comments reach the
+prompt) but only ever received `PR created: <url>`. The agent now emits
+`IMPLEMENTATION_PLAN` / `_SUMMARY` / `_NOTES` and `_post_issue_report` posts
+them as one structured comment on success — non-fatal, since failing a worker
+that already opened a PR would re-queue a completed issue and produce a second
+one. 27 tests in `tests/test_issue_report.py`.
+
+**Labels stay in Python** (decided 2026-07-28). The agent is told where it sits
+in the pipeline but does not drive it: a crashed or confused agent cannot
+strand an issue mid-stage, and stale-lock recovery stays trivial.
+
 ### Sequencing
 
 - ~~**A** (rate limits), **A2** (bot auth), **A3** (fail-closed gate)~~ ✅
