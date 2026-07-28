@@ -1,5 +1,14 @@
 # auto-claude: System Overview
 
+> [!WARNING]
+> **Superseded in part by [11-taxonomy-consolidation.md](11-taxonomy-consolidation.md).**
+> This document describes the original MVP design. The `ac-*` label vocabulary,
+> the trigger contract, and the plan/review worker described below no longer
+> match the code: auto-claude now fires on `ac-dev-ready` **plus** assignment to
+> `accelevation-bot`, the plan/review worker was retired, and the canonical stage
+> machine lives in `stages.py`. Treat the architecture here as current and the
+> label/state details as history.
+
 ## What This Is
 
 A Python utility that monitors GitHub issues across the **Accelevation** org, automatically triages issues labeled `ac-[action]`, and spawns parallel AI coding agents to develop solutions and submit PRs.

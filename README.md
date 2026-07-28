@@ -79,20 +79,31 @@ Processes exactly one issue and exits. Combines with `--dry-run` to triage witho
 
 ## Label conventions
 
-Issues are driven by labels with the `ac-` prefix:
+An issue is picked up when **both** are true: it carries an `ac-` action label,
+**and** it is assigned to the account in `[github].bot_login`. Labelling alone is
+not enough — assignment is what marks the issue as auto-claude's rather than a
+human `/loop` runner's. auto-claude never assigns issues to itself.
 
 | Label | Action |
 |-------|--------|
 | `ac-fix` | Bug fix — worker writes code + opens PR |
 | `ac-implement` | New feature — worker writes code + opens PR |
 | `ac-test` | Write/improve tests — worker writes code + opens PR |
-| `ac-plan` | Analysis only — worker posts a plan comment, no code changes |
-| `ac-review` | Code review — worker posts review comment, no code changes |
+| `ac-rework` | Reviewer requested changes — worker updates the existing PR |
 | `ac-needs-info` | Triage decided more info is needed — waiting on human |
 | `ac-in-progress` | Worker is actively processing this issue |
 | `ac-pr-created` | Worker finished and a PR is open |
-| `ac-plan-posted` | Plan comment posted on the issue |
-| `ac-review-posted` | Review comment posted on the issue |
+
+To hand an issue to auto-claude:
+
+```bash
+gh issue edit <n> --repo <org>/<repo> \
+  --add-assignee <bot_login> --add-label ac-implement
+```
+
+> `ac-plan` and `ac-review` were retired — the read-only plan/review worker is
+> gone, subsumed by the `/loop` triage agent. This vocabulary is being replaced
+> wholesale by the shared stage machine; see `docs/plans/11-taxonomy-consolidation.md`.
 
 ## Configuration
 
