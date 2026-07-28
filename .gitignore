@@ -1,4 +1,6 @@
 config.toml
+.gh_token
+.env
 state/
 logs/
 repos/
