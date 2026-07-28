@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from config import Config
+from ghauth import build_env, current_token
 from github_client import GithubClient, GithubClientError
 from state import IssueRecord
 
@@ -106,6 +107,11 @@ class TriageEngine:
             text=True,
             capture_output=True,
             timeout=60,
+            env=build_env(current_token()),
+            # Explicit: text=True alone decodes with the Windows locale codec
+            # (cp1252), which dies on any non-ASCII byte in Claude's output.
+            encoding="utf-8",
+            errors="replace",
         )
 
         if result.returncode != 0:

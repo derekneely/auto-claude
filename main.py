@@ -2,13 +2,26 @@
 
 import argparse
 import multiprocessing
+import os
 import signal
 import sys
 import time
 from pathlib import Path
 
+import stages
 from config import load_config
+from ghauth import (
+    TOKEN_ENV_VAR,
+    load_dotenv,
+    check_access,
+    check_ownership_config,
+    format_report,
+    has_fatal,
+    load_token,
+    verify_identity,
+)
 from github_client import GithubClient, GithubClientError
+from integrations import METRICS_DB_ENV_VAR, sync_board
 from logger import MainLogger, enable_ansi_windows
 from poller import Poller
 from process_manager import ProcessManager
@@ -48,12 +61,33 @@ def parse_args() -> argparse.Namespace:
         help="Run poll + triage but do not spawn workers or modify GitHub",
     )
     parser.add_argument(
+        "--skip-preflight",
+        action="store_true",
+        help=(
+            "Skip the repo-permission and project-board checks. The identity "
+            "and ownership checks always run."
+        ),
+    )
+    parser.add_argument(
         "--issue",
         type=str,
         default=None,
         help="Process a single issue and exit (format: repo#number)",
     )
     return parser.parse_args()
+
+
+def _report(logger: MainLogger, checks) -> None:
+    """Log a block of preflight results at the severity each one carries."""
+    for line in format_report(checks).splitlines():
+        (logger.error if line.startswith("[FAIL]") else
+         logger.warn if line.startswith("[WARN]") else logger.info)(line)
+
+
+def _abort(logger: MainLogger, message: str) -> None:
+    logger.error(message)
+    logger.close()
+    sys.exit(1)
 
 
 def create_directories(config) -> None:
@@ -65,28 +99,110 @@ def create_directories(config) -> None:
 
 
 def _ensure_labels(config, github: GithubClient, logger: MainLogger) -> None:
-    """Ensure all ac-* labels exist on all monitored repos."""
-    all_labels = (
-        config.github.action_labels
-        + [
-            config.github.needs_info_label,
-            config.github.in_progress_label,
-            config.github.pr_created_label,
-            config.github.plan_posted_label,
-            config.github.review_posted_label,
-        ]
-    )
+    """Create any missing ac-* labels on the monitored repos.
+
+    Create-only: an existing label is left exactly as it is, so this never
+    repaints labels the sibling toolchain owns. Failures are per-label warnings
+    rather than fatal - a repo where we lack label scope should still be polled.
+    """
     for repo in config.github.repos:
-        for label in all_labels:
+        created = 0
+        for name, color, description in stages.LABEL_SPECS:
             try:
-                github.ensure_label_exists(repo, label)
+                if github.ensure_label_exists(repo, name, color, description):
+                    created += 1
             except GithubClientError as exc:
-                logger.warn(f"Could not ensure label {label} on {repo}: {exc}")
+                logger.warn(f"Could not ensure label {name} on {repo}: {exc}")
+        if created:
+            logger.info(f"Created {created} missing label(s) on {repo}")
+
+
+def _release_stale_locks(config, github: GithubClient, logger: MainLogger,
+                         dry_run: bool = False) -> int:
+    """Rewind locks left behind by a crashed or killed run.
+
+    At startup no worker of ours is alive, so any bot-assigned issue still
+    carrying `ac-in-progress` is stale by definition — no timeout needed. This
+    matters because the sibling toolchain's stale-lock sweep only covers issues
+    assigned to the human running it; nothing else will ever free ours, and a
+    stuck lock is invisible (the issue simply stops being picked up).
+    """
+    released = 0
+    for repo in config.github.repos:
+        try:
+            issues = github.list_issues(repo, assignee=config.github.bot_login)
+        except GithubClientError as exc:
+            logger.warn(f"Could not check {repo} for stale locks: {exc}")
+            continue
+
+        for issue in issues:
+            labels = [lbl["name"] for lbl in issue.get("labels", [])]
+            target = stages.stale_reset_target(labels)
+            if target is None:
+                continue
+
+            issue_id = f"{repo}#{issue['number']}"
+            if dry_run:
+                logger.info(f"DRY-RUN: would release stale lock on {issue_id} -> {target}")
+                released += 1
+                continue
+
+            add, remove = stages.transition(labels, target)
+            try:
+                for label in add:
+                    github.add_label(repo, issue["number"], label)
+                for label in remove:
+                    github.remove_label(repo, issue["number"], label)
+            except GithubClientError as exc:
+                logger.warn(f"Could not release stale lock on {issue_id}: {exc}")
+                continue
+
+            logger.warn(f"Released stale lock on {issue_id} -> {target}")
+            released += 1
+
+    return released
+
+
+def _sync_boards(config, logger: MainLogger) -> None:
+    """Mirror ac-* labels onto the shared Projects v2 board, per repo.
+
+    `project-sync.mjs` reads `.claude/pipeline.json` from its working directory,
+    so cwd must be the repo's own checkout - not auto-claude's. A repo that has
+    not been cloned yet is skipped rather than synced from the wrong directory.
+    """
+    root = config.integrations.claude_tools_root
+    if root is None:
+        return
+
+    for repo in config.github.repos:
+        repo_root = config.paths.repos_dir / repo
+        if not repo_root.is_dir():
+            continue
+        sync_board(
+            cwd=repo_root,
+            claude_tools_root=root,
+            repo=f"{config.github.org}/{repo}",
+            assignee=config.github.bot_login,
+            log=logger.warn,
+        )
 
 
 def _run_triage(record, state, github, triage_engine, config, logger,
                 dry_run: bool = False) -> None:
     """Triage a single issue and update state accordingly."""
+    # Triage answers "is this issue specified well enough to implement". That
+    # question is meaningless for a PR review, and a needs-info verdict would
+    # bounce the issue to ac-input-needed and strand an open PR. Queue directly.
+    if record.mode == "review":
+        # The poller usually lands these on QUEUED itself; --issue mode does
+        # not. Transitioning QUEUED -> QUEUED is not a legal move, so only
+        # move a record that has not arrived yet.
+        if record.status != IssueStatus.QUEUED:
+            state.transition(record.issue_id, IssueStatus.QUEUED)
+            state.save()
+        logger.info(f"{record.issue_id} -> queued for review (triage skipped)")
+        return
+
     logger.info(f"Triaging {record.issue_id}...")
     state.transition(record.issue_id, IssueStatus.TRIAGING)
     state.update(record.issue_id, triage_attempts=record.triage_attempts + 1)
@@ -98,10 +214,7 @@ def _run_triage(record, state, github, triage_engine, config, logger,
     )
 
     if decision.decision == "proceed":
-        if record.action in config.github.plan_actions:
-            state.transition(record.issue_id, IssueStatus.PLANNING)
-        else:
-            state.transition(record.issue_id, IssueStatus.QUEUED)
+        state.transition(record.issue_id, IssueStatus.QUEUED)
         state.save()
         logger.info(f"{record.issue_id} -> {state.get(record.issue_id).status}")
     else:
@@ -112,8 +225,14 @@ def _run_triage(record, state, github, triage_engine, config, logger,
             comment = format_clarifying_comment(decision, config)
             try:
                 github.post_comment(record.repo, record.number, comment)
-                github.add_label(record.repo, record.number,
-                                 config.github.needs_info_label)
+                # Move the stage backwards off ac-dev-ready: the issue is not
+                # ready after all, and leaving the trigger label on would make
+                # the next poll pick it straight back up.
+                add, remove = stages.transition(record.labels, "ac-input-needed")
+                for label in add:
+                    github.add_label(record.repo, record.number, label)
+                for label in remove:
+                    github.remove_label(record.repo, record.number, label)
                 # Re-fetch updated_at so the poller doesn't treat our own
                 # comment as a user response and immediately re-triage
                 try:
@@ -158,17 +277,30 @@ def _run_single_issue(args, config, state, github, triage_engine, logger,
             return
 
         label_names = [lbl["name"] for lbl in issue_data.get("labels", [])]
-        action_label = None
-        for lbl in label_names:
-            if lbl in config.github.action_labels:
-                action_label = lbl
-                break
 
-        if action_label is None:
-            logger.error(f"No ac-* action label found on {issue_id}")
+        # --issue is a manual override, so it deliberately bypasses the
+        # assignee half of the trigger contract - the operator naming an issue
+        # explicitly *is* the ownership decision. The stage half still applies:
+        # forcing a run on a terminal or already-locked issue would stomp
+        # whoever owns it.
+        if stages.is_terminal(label_names):
+            logger.error(
+                f"{issue_id} is in a terminal stage "
+                f"({stages.stage_of(label_names)}) — refusing to run"
+            )
+            return
+        if stages.stage_of(label_names) in stages.LOCKED:
+            logger.error(
+                f"{issue_id} is locked by another runner "
+                f"({stages.stage_of(label_names)}) — refusing to run"
+            )
             return
 
-        action = action_label[len(config.github.label_prefix):]
+        action = stages.kind_of(label_names)
+        # Mirror the poller's routing: the stage label decides which worker
+        # runs, so `--issue` on an ac-dev-review issue reviews the PR rather
+        # than re-triaging an issue that has already been implemented.
+        mode = "review" if stages.is_reviewable(label_names) else "dev"
         from state import IssueRecord
         record = IssueRecord(
             issue_id=issue_id,
@@ -182,6 +314,7 @@ def _run_single_issue(args, config, state, github, triage_engine, logger,
             discovered_at=issue_data.get("created_at", ""),
             updated_at=issue_data.get("updated_at", ""),
             issue_updated_at=issue_data.get("updated_at", ""),
+            mode=mode,
         )
         state.add(record)
         state.save()
@@ -191,8 +324,7 @@ def _run_single_issue(args, config, state, github, triage_engine, logger,
         _run_triage(record, state, github, triage_engine, config, logger)
         record = state.get(issue_id)
 
-    # Spawn worker if queued or planning
-    if record.status in (IssueStatus.QUEUED, IssueStatus.PLANNING):
+    if record.status == IssueStatus.QUEUED:
         process_manager.spawn(record)
 
         # Wait for worker to finish
@@ -231,6 +363,8 @@ def main() -> None:
     print(BANNER)
     logger.info(f"Loaded config for org: {config.github.org}")
     logger.info(f"Monitoring repos: {', '.join(config.github.repos)}")
+    if config.github.bot_login:
+        logger.info(f"Issue scope: only issues assigned to '{config.github.bot_login}'")
 
     if args.dry_run:
         logger.info("DRY-RUN mode — no workers will be spawned")
@@ -239,6 +373,56 @@ def main() -> None:
 
     create_directories(config)
     logger.info("Runtime directories ready")
+
+    # Authenticate as the bot account. The token is placed in os.environ under a
+    # private name so worker processes inherit it; it only becomes GH_TOKEN
+    # inside the subprocess environments ghauth builds.
+    project_root = Path(args.config).resolve().parent if args.config else Path.cwd()
+
+    # Secrets from the gitignored .env, before anything that might need them.
+    # Worker processes inherit os.environ, so this reaches them too.
+    for key, value in load_dotenv(project_root).items():
+        os.environ[key] = value
+
+    token = load_token(project_root)
+    if token:
+        os.environ[TOKEN_ENV_VAR] = token
+        logger.info("Loaded bot token")
+
+    if os.environ.get(METRICS_DB_ENV_VAR):
+        logger.info("Pipeline metrics DB configured")
+    else:
+        logger.warn(
+            f"No {METRICS_DB_ENV_VAR} - telemetry will be dropped. Set it in "
+            f".env to record pipeline events."
+        )
+
+    # The ownership gate is not skippable. Without a bot account and a token to
+    # act as it, auto-claude either poaches issues belonging to a human /loop
+    # runner or does the work under the operator's own name - both silent, both
+    # discovered after the fact.
+    _report(logger, gate := check_ownership_config(token, config.github.bot_login))
+    if has_fatal(gate):
+        _abort(logger, "Refusing to start without a bot identity.")
+
+    _report(logger, identity := verify_identity(token, config.github.bot_login))
+    if has_fatal(identity):
+        _abort(logger, "Refusing to start: not authenticated as the bot account.")
+
+    if not args.skip_preflight:
+        logger.info("Running preflight checks...")
+        checks = check_access(
+            token=token,
+            org=config.github.org,
+            repos=config.github.repos,
+        )
+        _report(logger, checks)
+        if has_fatal(checks):
+            _abort(
+                logger,
+                "Preflight failed — fix the above, or re-run with "
+                "--skip-preflight to proceed anyway.",
+            )
 
     # Register signal handlers
     signal.signal(signal.SIGINT, handle_signal)
@@ -265,9 +449,19 @@ def main() -> None:
         state_queue=state_queue,
     )
 
-    # Ensure all labels exist on monitored repos
-    logger.info("Ensuring labels exist on all repos...")
-    _ensure_labels(config, github, logger)
+    # Ensure all labels exist on monitored repos. Skipped under --dry-run:
+    # creating labels is a write, and a dry run that mutates GitHub is not one.
+    if args.dry_run:
+        logger.info("DRY-RUN: skipping label creation")
+    else:
+        logger.info("Ensuring labels exist on all repos...")
+        _ensure_labels(config, github, logger)
+
+    # Recover from a previous crash before polling, so a stuck lock does not
+    # silently remove an issue from circulation.
+    released = _release_stale_locks(config, github, logger, dry_run=args.dry_run)
+    if not released:
+        logger.info("No stale locks to release")
 
     # Single-issue mode
     if args.issue:
@@ -295,10 +489,14 @@ def main() -> None:
             # 2. Poll for new/retriage issues
             new_issues, retriage_issues = poller.poll()
 
-            # 3. Triage new issues
+            # 3. Triage new issues. Review records arrive already QUEUED —
+            #    the poller walks them there directly, since triage answers a
+            #    question that does not apply to an open PR.
             for record in new_issues:
                 if shutdown_requested:
                     break
+                if record.mode == "review":
+                    continue
                 _run_triage(record, state, github, triage_engine, config, logger,
                             dry_run=args.dry_run)
 
@@ -309,7 +507,7 @@ def main() -> None:
                 _run_triage(record, state, github, triage_engine, config, logger,
                             dry_run=args.dry_run)
 
-            # 5. Spawn workers for queued/planning issues
+            # 5. Spawn workers for queued issues
             if not args.dry_run:
                 for record in state.get_by_status(IssueStatus.QUEUED):
                     if shutdown_requested or not process_manager.can_spawn():
@@ -317,13 +515,14 @@ def main() -> None:
                     if record.issue_id not in process_manager.active_issue_ids:
                         process_manager.spawn(record)
 
-                for record in state.get_by_status(IssueStatus.PLANNING):
-                    if shutdown_requested or not process_manager.can_spawn():
-                        break
-                    if record.issue_id not in process_manager.active_issue_ids:
-                        process_manager.spawn(record)
+            # 6. Mirror label state onto the shared Projects v2 board. Runs
+            #    once per tick rather than per transition — the script syncs
+            #    every open issue it is given, so per-transition calls would be
+            #    redundant work. Never fatal; board drift is recoverable.
+            if not args.dry_run:
+                _sync_boards(config, logger)
 
-            # 6. Sleep in small increments so shutdown is responsive
+            # 7. Sleep in small increments so shutdown is responsive
             for _ in range(config.github.poll_interval_seconds):
                 if shutdown_requested:
                     break

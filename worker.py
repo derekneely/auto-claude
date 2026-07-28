@@ -8,12 +8,74 @@ import re
 import shutil
 import subprocess
 import threading
+import time
 from dataclasses import dataclass
 from multiprocessing import Event, Queue
 from pathlib import Path
 
+import stages
+from ghauth import apply_git_credentials, build_env, current_token
+from integrations import TelemetryEvent, log_event
 from logger import WorkerLogger
+from pipeline import load_pipeline_config
+from ratelimit import (
+    RateLimitInfo,
+    detect_rate_limit_in_stderr,
+    parse_rate_limit_event,
+    pause_seconds,
+)
 from redact import redact
+
+
+# ---------------------------------------------------------------------------
+# Push guard
+# ---------------------------------------------------------------------------
+
+# Shared branches auto-claude must never push to, on top of whatever the repo
+# configures as its PR base. `develop` and `trunk` are not used here today but
+# cost nothing to refuse and would be silently unprotected otherwise.
+PROTECTED_BRANCHES = frozenset({"main", "master", "dev", "develop", "trunk"})
+
+
+class ProtectedBranchError(RuntimeError):
+    """Raised when a worker is about to push to a shared branch."""
+
+
+def _normalize_branch(branch: str | None) -> str:
+    """Lowercase, trim, and strip a `refs/heads/` prefix for comparison."""
+    name = (branch or "").strip()
+    if name.lower().startswith("refs/heads/"):
+        name = name[len("refs/heads/"):]
+    return name.lower()
+
+
+def assert_pushable(branch: str | None, base_branch: str | None) -> None:
+    """Refuse to push to a shared branch. Raises `ProtectedBranchError`.
+
+    Called immediately before every `git push`. The branch name is not always
+    computed by us — `_setup_rework_worktree` reads it from local state and
+    `run_review_worker` reads it from a PR's `headRefName` — so a stale or
+    hostile value can otherwise reach `git push origin <branch>`. Server-side
+    branch protection is unavailable on the org's plan, which makes this the
+    only guard.
+    """
+    name = _normalize_branch(branch)
+    if not name:
+        raise ProtectedBranchError(
+            "Refusing to push: branch name is empty. `git push origin ''` "
+            "falls back to the push default, which on a base-branch checkout "
+            "pushes the base branch."
+        )
+    if name == "head":
+        raise ProtectedBranchError(
+            "Refusing to push: branch resolved to HEAD, which pushes whatever "
+            "the worktree happens to have checked out."
+        )
+    if name in PROTECTED_BRANCHES or name == _normalize_branch(base_branch):
+        raise ProtectedBranchError(
+            f"Refusing to push to protected branch '{(branch or '').strip()}'. "
+            f"Workers may only push their own ac/issue-* branches."
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -28,8 +90,10 @@ class IssueContext:
     number: int
     title: str
     body: str
-    action: str             # "fix", "implement", "test", "plan", "review", "rework"
+    action: str             # kind hint: "fix", "implement", "test", "rework"
     org: str
+    # Per-repo prBaseBranch from .claude/pipeline.json, falling back to the
+    # global [github].base_branch when the repo has no pipeline.json.
     base_branch: str
     # Paths
     repos_dir: Path
@@ -51,6 +115,11 @@ class IssueContext:
     rework_count: int = 0
     handoff_summary: str | None = None
     grace_budget_usd: float = 1.0
+    # Shared-telemetry wiring. `pipeline_project` is the metrics discriminator
+    # from pipeline.json (defaults to the repo name); both are None/absent when
+    # the toolchain is not configured, which disables telemetry silently.
+    claude_tools_root: Path | None = None
+    pipeline_project: str = ""
 
 
 @dataclass
@@ -63,6 +132,9 @@ class StateUpdate:
     pr_url: str | None = None
     worker_pid: int | None = None
     handoff_summary: str | None = None
+    # Epoch seconds until which the supervisor should stop spawning workers.
+    # Set when Claude reports a rate limit; see ratelimit.py.
+    rate_limited_until: float | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -111,8 +183,7 @@ def _post_crash_comment(
         f"> {error[:200]}{log_ref}\n\n"
         f"_Re-label to retry after investigating._"
     )
-    env = os.environ.copy()
-    env["MSYS_NO_PATHCONV"] = "1"
+    env = build_env(current_token())
     try:
         subprocess.run(
             [
@@ -124,6 +195,8 @@ def _post_crash_comment(
             capture_output=True,
             timeout=30,
             env=env,
+            encoding="utf-8",
+            errors="replace",
         )
     except Exception as exc:
         logger.error(f"Failed to post crash comment: {exc}")
@@ -146,10 +219,13 @@ def _run_cmd(
     env_extra: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess:
     """Run a subprocess command, log it, and return the result."""
-    env = os.environ.copy()
-    env["MSYS_NO_PATHCONV"] = "1"
+    env = build_env(current_token())
     if env_extra:
         env.update(env_extra)
+
+    # Network git commands must not fall through to the system credential
+    # helper, which holds the operator's credentials rather than the bot's.
+    cmd = apply_git_credentials(cmd)
 
     if logger:
         logger.info(f"$ {' '.join(cmd)}")
@@ -180,12 +256,14 @@ def _build_prompt(
     elif ctx.action == "rework" and review_comments:
         template_file = ctx.prompts_dir / "rework.txt"
     else:
+        # Kind hints only - `stages.kind_of` can return nothing else, and it
+        # defaults to "implement". The dev worker never uses review.txt; the
+        # review worker builds its own prompt.
         template_map = {
             "fix": "develop.txt",
             "implement": "develop.txt",
             "test": "test.txt",
-            "plan": "plan.txt",
-            "review": "review.txt",
+            "rework": "rework.txt",
         }
         template_file = ctx.prompts_dir / template_map.get(ctx.action, "develop.txt")
 
@@ -266,10 +344,14 @@ def _run_claude(
     budget_override: float | None = None,
     model_override: str | None = None,
     max_turns_override: int | None = None,
-) -> tuple[int, str, bool]:
+) -> tuple[int, str, bool, RateLimitInfo | None]:
     """Run Claude CLI via Popen, stream output to logger.
 
-    Returns (returncode, captured_output, budget_exceeded).
+    Returns (returncode, captured_output, budget_exceeded, rate_limit).
+
+    `rate_limit` is the last limiting rate_limit_event seen, or None. Under
+    subscription auth this — not the USD budget — is the constraint that
+    actually stops work.
     """
     model = model_override or ctx.dev_model
     max_turns = max_turns_override or ctx.max_turns
@@ -288,8 +370,9 @@ def _run_claude(
         cmd += ["--max-budget-usd", str(budget)]
     cmd.append(prompt)
 
-    env = os.environ.copy()
-    env["MSYS_NO_PATHCONV"] = "1"
+    # The agent runs `gh` itself (commits, PRs, comments), so it inherits the
+    # bot identity too — otherwise its calls would be attributed to the operator.
+    env = build_env(current_token())
 
     logger.info("Starting Claude CLI...")
     proc = subprocess.Popen(
@@ -313,6 +396,7 @@ def _run_claude(
     stderr_thread.start()
 
     captured_lines: list[str] = []
+    rate_limit: RateLimitInfo | None = None
     try:
         for line in proc.stdout:
             line = line.rstrip("\n\r")
@@ -320,6 +404,21 @@ def _run_claude(
                 continue
 
             captured_lines.append(line)
+
+            # Rate-limit events arrive inline on every run, usually "allowed".
+            # Keep only the limiting ones; log an overage warning once it starts.
+            event = parse_rate_limit_event(line)
+            if event is not None:
+                if event.is_limited:
+                    rate_limit = event
+                    logger.warn(
+                        f"Rate limited by Claude ({event.limit_type or 'unknown window'}, "
+                        f"status={event.status})"
+                    )
+                elif event.is_using_overage:
+                    logger.warn(
+                        f"Running on overage quota ({event.limit_type or 'unknown window'})"
+                    )
 
             # Try to parse stream-json and extract text content for logging
             display = _extract_display_text(line)
@@ -334,28 +433,46 @@ def _run_claude(
                     proc.wait(timeout=10)
                 except subprocess.TimeoutExpired:
                     proc.kill()
-                return (-1, "", False)
+                return (-1, "", False, rate_limit)
 
         proc.wait()
     except Exception as exc:
         logger.error(f"Error reading Claude output: {exc}")
         proc.kill()
         proc.wait()
-        return (-1, "", False)
+        return (-1, "", False, rate_limit)
 
     stderr_thread.join(timeout=5)
     stderr_output = "\n".join(stderr_lines).strip()
     budget_exceeded = "Exceeded USD budget" in stderr_output
+
+    # Fallback: a run can die from rate limiting before emitting a usable event.
+    # Budget exhaustion is deliberately excluded — it has its own recovery path.
+    if (
+        rate_limit is None
+        and proc.returncode != 0
+        and not budget_exceeded
+        and detect_rate_limit_in_stderr(stderr_output)
+    ):
+        rate_limit = RateLimitInfo(status="rejected")
+
     if proc.returncode != 0:
         logger.error(f"Claude exited with code {proc.returncode}")
         if budget_exceeded:
             logger.warn("Budget limit reached")
+        elif rate_limit is not None:
+            logger.warn("Rate limit reached")
         elif stderr_output:
             logger.error(f"Claude stderr: {stderr_output}")
         else:
             logger.warn("No stderr output from Claude")
 
-    return (proc.returncode, "\n".join(captured_lines), budget_exceeded)
+    return (proc.returncode, "\n".join(captured_lines), budget_exceeded, rate_limit)
+
+
+def _rate_limited_until(info: RateLimitInfo) -> float:
+    """Absolute epoch time until which the supervisor should stop spawning."""
+    return time.time() + pause_seconds(info, now=time.time())
 
 
 def _extract_display_text(line: str) -> str:
@@ -422,6 +539,43 @@ def _extract_result_text(output: str) -> str:
     return "\n".join(texts) if texts else output
 
 
+# The review prompt (prompts/review.txt) asks Claude to end its response with
+# exactly this marker. Matched case-insensitively since models are not
+# perfectly consistent about case, and the *last* occurrence wins so an
+# echoed copy of the prompt's own instructions doesn't get mistaken for the
+# actual verdict.
+_VERDICT_RE = re.compile(r"REVIEW_VERDICT:\s*(PASS|FAIL)", re.IGNORECASE)
+_FEEDBACK_RE = re.compile(r"REVIEW_FEEDBACK:\s*(.*?)(?=REVIEW_VERDICT:|\Z)", re.IGNORECASE | re.DOTALL)
+
+
+def _parse_review_verdict(text: str) -> bool:
+    """True only for an explicit PASS in the model's review output.
+
+    Anything else — an explicit FAIL, no marker at all, or a garbled value —
+    resolves to False. An unparseable review must never be treated as an
+    approval; the caller cannot tell "Claude said no" apart from "Claude's
+    output was truncated/malformed", so both must fail closed.
+    """
+    matches = _VERDICT_RE.findall(text)
+    if not matches:
+        return False
+    return matches[-1].upper() == "PASS"
+
+
+def _extract_review_feedback(text: str) -> str:
+    """Pull the REVIEW_FEEDBACK: section out of Claude's review output.
+
+    Falls back to the full (trimmed) text when the model didn't use the
+    marker, so a failed review never posts an empty --request-changes body.
+    """
+    matches = _FEEDBACK_RE.findall(text)
+    feedback = matches[-1].strip() if matches else ""
+    if feedback:
+        return feedback
+    fallback = text.strip()
+    return fallback[:4000] if fallback else "Review agent did not produce readable feedback."
+
+
 def _run_handoff_summary(
     ctx: IssueContext,
     cwd: Path,
@@ -453,7 +607,7 @@ def _run_handoff_summary(
     )
 
     logger.info(f"Running grace-budget handoff summary (model={ctx.light_model})...")
-    returncode, output, _ = _run_claude(
+    returncode, output, _, _ = _run_claude(
         prompt=prompt,
         cwd=cwd,
         ctx=ctx,
@@ -485,6 +639,14 @@ def _push_partial_work(
     logger: WorkerLogger,
 ) -> str | None:
     """Commit and push partial work after budget exhaustion. Returns pr_url or None."""
+    # This path is best-effort by contract — every other failure here returns
+    # None rather than raising, so the guard does the same.
+    try:
+        assert_pushable(branch, ctx.base_branch)
+    except ProtectedBranchError as exc:
+        logger.error(str(exc))
+        return None
+
     # Check for uncommitted changes
     status_result = _run_cmd(
         ["git", "status", "--porcelain"],
@@ -592,6 +754,73 @@ def _get_pr_reviews(ctx: IssueContext, logger: WorkerLogger) -> dict:
             pass
 
     return {"reviews": reviews, "inline": inline}
+
+
+def _candidate_prs_for_issue(
+    prs: list[dict],
+    number: int,
+    branch_prefix: str,
+) -> list[dict]:
+    """Open PRs that plausibly belong to this issue, most recently updated first.
+
+    Pure — no network. `IssueContext.pr_url`/`existing_branch` are only
+    populated when *this* daemon process ran the dev worker that opened the
+    PR; a restart, a human-labelled issue, or a PR opened by the sibling
+    toolchain's dev agent all leave them unset, so the review worker must be
+    able to relocate the PR from the issue number alone.
+
+    Matches on the `ac/issue-<n>-` branch prefix `sanitize_branch_name` uses
+    (the trailing hyphen matters — it stops issue 7 from matching issue 70),
+    or a closing keyword referencing `#<n>` in the PR body, since a PR opened
+    by the other toolchain won't use our branch naming at all.
+    """
+    closes_re = re.compile(
+        rf"\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\s+#{number}\b",
+        re.IGNORECASE,
+    )
+    matches = [
+        pr for pr in prs
+        if (pr.get("headRefName") or "").startswith(branch_prefix)
+        or closes_re.search(pr.get("body") or "")
+    ]
+    return sorted(matches, key=lambda p: p.get("updatedAt", ""), reverse=True)
+
+
+def _find_pr_for_issue(ctx: IssueContext, logger: WorkerLogger) -> dict | None:
+    """Look up the open PR for this issue via `gh`, when ctx carries none.
+
+    Returns None (not an exception) when no open PR matches — the caller
+    treats that as "cannot review yet", not a crash.
+    """
+    result = _run_cmd(
+        [
+            "gh", "pr", "list",
+            "--repo", f"{ctx.org}/{ctx.repo}",
+            "--state", "open",
+            "--json", "number,headRefName,url,body,title,updatedAt",
+        ],
+        logger=logger,
+        timeout=30,
+    )
+    if result.returncode != 0:
+        logger.warn(f"Failed to list PRs for review lookup: {result.stderr.strip()}")
+        return None
+    try:
+        prs = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        logger.warn("Failed to parse `gh pr list` output during review lookup")
+        return None
+
+    branch_prefix = f"ac/issue-{ctx.number}-"
+    candidates = _candidate_prs_for_issue(prs, ctx.number, branch_prefix)
+    if not candidates:
+        return None
+    if len(candidates) > 1:
+        logger.warn(
+            f"Multiple open PRs match issue #{ctx.number} — picking the most "
+            f"recently updated (#{candidates[0].get('number')})"
+        )
+    return candidates[0]
 
 
 def _cleanup_worktree(
@@ -734,6 +963,10 @@ def _push_rework(
     logger: WorkerLogger,
 ) -> str:
     """Commit and push rework changes to the existing branch. Returns pr_url."""
+    # `branch` here came from local state or a PR's headRefName — not from us.
+    # Fail before staging anything.
+    assert_pushable(branch, ctx.base_branch)
+
     # Stage and commit only if there are uncommitted changes
     # (Claude may have already committed)
     status_result = _run_cmd(
@@ -781,11 +1014,225 @@ def _push_rework(
         timeout=30,
     )
 
-    # Swap labels: remove rework + in-progress, add pr-created
-    _set_labels(ctx, logger, add=["ac-pr-created"], remove=["ac-rework", "ac-in-progress"])
+    # Hand off to review — this must not strip ac-rework, the kind hint.
+    _success_labels(ctx, logger)
 
     logger.info(f"Rework pushed to existing PR: {ctx.pr_url}")
     return ctx.pr_url
+
+
+def _labels_for_claim(labels: list[str]) -> tuple[list[str], list[str]]:
+    """Add/remove to move an issue from ac-dev-ready into ac-in-progress.
+
+    Pure — `stages.transition` already removes every stale stage label and
+    leaves kind hints (ac-fix, ac-implement, ...) and control labels alone.
+    """
+    return stages.transition(labels, "ac-in-progress")
+
+
+def _labels_for_success(labels: list[str]) -> tuple[list[str], list[str]]:
+    """Add/remove for a successful run: hand off to the review agent.
+
+    auto-claude does not review its own work, so success lands on
+    ac-dev-review, not ac-done — plus ac-pr-created so the PR is discoverable.
+    """
+    add, remove = stages.transition(labels, "ac-dev-review")
+    return add + ["ac-pr-created"], remove
+
+
+def _labels_for_failure(labels: list[str]) -> tuple[list[str], list[str], bool]:
+    """Add/remove for a failed run, plus whether attempts are now exhausted.
+
+    Bumps ac-attempt-N and returns to ac-dev-ready for a retry, unless the
+    bump exhausts MAX_ATTEMPTS, in which case the issue is blocked instead
+    (terminal — the caller must not re-queue it).
+    """
+    labels = list(labels)
+    current = stages.attempt_of(labels)
+    next_label = stages.attempt_label(current + 1)
+    bumped = [lbl for lbl in labels if lbl != stages.attempt_label(current)] + [next_label]
+    blocked = stages.attempts_exhausted(bumped)
+
+    target = "ac-blocked" if blocked else "ac-dev-ready"
+    add, remove = stages.transition(labels, target)
+    add = add + [next_label]
+    if current > 0:
+        remove = remove + [stages.attempt_label(current)]
+    return add, remove, blocked
+
+
+def _get_issue_labels(ctx: IssueContext, logger: WorkerLogger) -> list[str]:
+    """Fetch the issue's current labels from GitHub.
+
+    The worker does not carry live labels in IssueContext — they would go
+    stale the moment another actor (a human, the loop) edits the issue — so
+    every stage transition re-reads before computing add/remove.
+    """
+    result = _run_cmd(
+        ["gh", "api", f"/repos/{ctx.org}/{ctx.repo}/issues/{ctx.number}"],
+        logger=logger,
+        timeout=30,
+    )
+    if result.returncode != 0:
+        logger.warn(f"Failed to fetch labels: {result.stderr.strip()}")
+        return []
+    try:
+        data = json.loads(result.stdout)
+        return [lbl.get("name", "") for lbl in data.get("labels", [])]
+    except (json.JSONDecodeError, AttributeError, TypeError):
+        return []
+
+
+def _telemetry(
+    ctx: IssueContext,
+    logger: WorkerLogger,
+    action: str,
+    labels: list[str] | None = None,
+    stage: str = "dev",
+    **extra,
+) -> None:
+    """Report one pipeline event to the shared metrics DB.
+
+    `stage` defaults to "dev" for the dev worker's call sites; the review
+    worker passes stage="review" instead of duplicating this function.
+
+    Best-effort by construction: `integrations.log_event` swallows every
+    failure, and the underlying script exits 0 even when the DB is unreachable.
+    Telemetry must never be able to fail a worker that did real work.
+    """
+    log_event(
+        TelemetryEvent(
+            project=ctx.pipeline_project or ctx.repo,
+            issue=ctx.number,
+            stage=stage,
+            action=action,
+            attempt=stages.attempt_of(labels) if labels else None,
+            **extra,
+        ),
+        ctx.claude_tools_root,
+        log=logger.warn,
+    )
+
+
+def _claim_labels(ctx: IssueContext, logger: WorkerLogger) -> None:
+    """Transition the issue to ac-in-progress at worker start."""
+    labels = _get_issue_labels(ctx, logger)
+    add, remove = _labels_for_claim(labels)
+    _set_labels(ctx, logger, add=add, remove=remove)
+    _telemetry(ctx, logger, "picked_up", labels)
+
+
+def _success_labels(ctx: IssueContext, logger: WorkerLogger) -> None:
+    """Transition the issue to ac-dev-review + ac-pr-created after a PR lands."""
+    labels = _get_issue_labels(ctx, logger)
+    add, remove = _labels_for_success(labels)
+    _set_labels(ctx, logger, add=add, remove=remove)
+    _telemetry(ctx, logger, "pr_opened", labels, pr=_pr_number(ctx.pr_url))
+
+
+def _failure_labels(ctx: IssueContext, logger: WorkerLogger) -> bool:
+    """Transition the issue back to ac-dev-ready (or ac-blocked). Returns blocked."""
+    labels = _get_issue_labels(ctx, logger)
+    add, remove, blocked = _labels_for_failure(labels)
+    _set_labels(ctx, logger, add=add, remove=remove)
+    # The attempt counter is bumped by the transition, so report the new value
+    # rather than the stale one we read.
+    _telemetry(
+        ctx, logger,
+        "blocked" if blocked else "review_fail",
+        add,
+    )
+    return blocked
+
+
+def _labels_for_review_claim(labels: list[str]) -> tuple[list[str], list[str]]:
+    """Add/remove to move an issue from ac-dev-review into ac-review-in-progress.
+
+    The review worker's self-lock — mirrors `_labels_for_claim` and must run
+    before any expensive work so a concurrent runner cannot double-claim.
+    """
+    return stages.transition(labels, "ac-review-in-progress")
+
+
+def _labels_for_review_pass(labels: list[str]) -> tuple[list[str], list[str]]:
+    """Add/remove for an approving review: hand off to the human HITL gate."""
+    return stages.transition(labels, "ac-hitl")
+
+
+def _labels_for_review_fail(labels: list[str]) -> tuple[list[str], list[str], bool]:
+    """Add/remove for a failed review, plus whether attempts are now exhausted.
+
+    The bump-and-target logic (ac-attempt-N, then ac-dev-ready for a dev retry
+    or ac-blocked once MAX_ATTEMPTS is exhausted) is identical to a failed dev
+    run, and `stages.transition` removes every stage label present regardless
+    of which one it is — so this delegates to `_labels_for_failure` rather than
+    duplicating it. Named separately because the review worker's callers (and
+    tests) reason about it as a distinct outcome, per loop-review-agent.md
+    Step 10.
+    """
+    return _labels_for_failure(labels)
+
+
+def _labels_for_review_crash(labels: list[str]) -> tuple[list[str], list[str]]:
+    """Add/remove to release the self-lock after a crash mid-review.
+
+    A crash is an infra failure, not a review verdict, so it must not consume
+    an attempt. This rewinds to ac-dev-review — the same target
+    `stages.STALE_RESET["ac-review-in-progress"]` uses for an abandoned lock —
+    so a review is simply retried, not counted as a failed attempt.
+    """
+    return stages.transition(labels, stages.REVIEW_TRIGGER)
+
+
+def _pr_number(pr_url: str | None) -> int | None:
+    """Extract the PR number from a github.com/.../pull/N URL."""
+    if not pr_url:
+        return None
+    tail = pr_url.rstrip("/").rsplit("/", 1)[-1]
+    return int(tail) if tail.isdigit() else None
+
+
+def _claim_review_labels(ctx: IssueContext, logger: WorkerLogger) -> None:
+    """Transition the issue to ac-review-in-progress at review-worker start.
+
+    Called before any expensive work (clone, checkout, verify/test, Claude) so
+    a concurrent runner cannot double-claim the same review.
+    """
+    labels = _get_issue_labels(ctx, logger)
+    add, remove = _labels_for_review_claim(labels)
+    _set_labels(ctx, logger, add=add, remove=remove)
+
+
+def _review_pass_labels(ctx: IssueContext, logger: WorkerLogger) -> None:
+    """Transition the issue to ac-hitl after an approving review."""
+    labels = _get_issue_labels(ctx, logger)
+    add, remove = _labels_for_review_pass(labels)
+    _set_labels(ctx, logger, add=add, remove=remove)
+    _telemetry(ctx, logger, "review_pass", labels, stage="review", pr=_pr_number(ctx.pr_url))
+
+
+def _review_fail_labels(ctx: IssueContext, logger: WorkerLogger) -> bool:
+    """Transition the issue back to ac-dev-ready (or ac-blocked). Returns blocked."""
+    labels = _get_issue_labels(ctx, logger)
+    add, remove, blocked = _labels_for_review_fail(labels)
+    _set_labels(ctx, logger, add=add, remove=remove)
+    # The attempt counter is bumped by the transition, so report the new value
+    # rather than the stale one we read.
+    _telemetry(
+        ctx, logger,
+        "blocked" if blocked else "review_fail",
+        add,
+        stage="review",
+        pr=_pr_number(ctx.pr_url),
+    )
+    return blocked
+
+
+def _release_review_lock_after_crash(ctx: IssueContext, logger: WorkerLogger) -> None:
+    """Release the self-lock after a crash, without consuming an attempt."""
+    labels = _get_issue_labels(ctx, logger)
+    add, remove = _labels_for_review_crash(labels)
+    _set_labels(ctx, logger, add=add, remove=remove)
 
 
 def _set_labels(
@@ -865,6 +1312,8 @@ def _push_and_pr(
     logger: WorkerLogger,
 ) -> str:
     """Commit, push, create PR, comment on issue. Returns PR URL."""
+    assert_pushable(branch, ctx.base_branch)
+
     # Stage and commit only if there are uncommitted changes
     # (Claude may have already committed)
     status_result = _run_cmd(
@@ -931,8 +1380,8 @@ def _push_and_pr(
         timeout=30,
     )
 
-    # Swap in-progress for pr-created so the issue shows as done
-    _set_labels(ctx, logger, add=["ac-pr-created"], remove=["ac-in-progress"])
+    # Hand off to the review agent — auto-claude does not review its own work.
+    _success_labels(ctx, logger)
 
     return pr_url
 
@@ -959,15 +1408,14 @@ def run_dev_worker(
     logger.info(f"Dev worker started (PID {pid}) — action={ctx.action}"
                 + (f" [rework #{ctx.rework_count}]" if is_rework else ""))
 
-    action_label = f"ac-{ctx.action}"
-
-    # Signal that we're in progress + set GitHub label as distributed lock
+    # Signal that we're in progress + claim the stage label as a distributed
+    # lock. This never touches the kind hint (ac-fix, ac-implement, ...).
     state_queue.put(StateUpdate(
         issue_id=ctx.issue_id,
         status="in_progress",
         worker_pid=pid,
     ))
-    _set_labels(ctx, logger, add=["ac-in-progress"], remove=[action_label])
+    _claim_labels(ctx, logger)
 
     branch = sanitize_branch_name(ctx.title, ctx.number)
     worktree_dir = ctx.worktrees_dir / ctx.repo / f"issue-{ctx.number}"
@@ -1009,7 +1457,7 @@ def run_dev_worker(
         review_comments = _get_pr_reviews(ctx, logger) if is_rework else None
         prompt = _build_prompt(ctx, comments, review_comments)
 
-        returncode, output, budget_exceeded = _run_claude(
+        returncode, output, budget_exceeded, rate_limit = _run_claude(
             prompt=prompt,
             cwd=worktree_dir,
             ctx=ctx,
@@ -1020,6 +1468,31 @@ def run_dev_worker(
 
         if abort_event.is_set():
             logger.warn("Abort — exiting after Claude")
+            return
+
+        # [3a] Handle rate limiting — preserve work, re-queue, do NOT bill a
+        # continuation. Skip the handoff summary: it calls Claude, which is
+        # exactly what is currently refusing to serve us.
+        if rate_limit is not None:
+            logger.warn("Rate limited — pushing partial work and re-queueing")
+            partial_pr = _push_partial_work(ctx, branch, worktree_dir, logger)
+
+            _run_cmd(
+                ["git", "worktree", "remove", str(worktree_dir), "--force"],
+                cwd=repo_dir, logger=logger,
+            )
+            if worktree_dir.exists():
+                shutil.rmtree(worktree_dir, ignore_errors=True)
+            _run_cmd(["git", "worktree", "prune"], cwd=repo_dir, logger=logger)
+
+            state_queue.put(StateUpdate(
+                issue_id=ctx.issue_id,
+                status="failed",
+                error="rate_limited",
+                branch=branch,
+                pr_url=partial_pr or ctx.pr_url,
+                rate_limited_until=_rate_limited_until(rate_limit),
+            ))
             return
 
         # [3b] Handle budget exhaustion — graceful handoff
@@ -1125,9 +1598,12 @@ def run_dev_worker(
             error=str(exc),
         ))
 
-        # Remove in-progress label on failure
+        # Bump the attempt counter and return to ac-dev-ready — or, on the
+        # third failure, land on the terminal ac-blocked so it is not re-queued.
         try:
-            _set_labels(ctx, logger, remove=["ac-in-progress"])
+            blocked = _failure_labels(ctx, logger)
+            if blocked:
+                logger.warn("Attempts exhausted — issue moved to ac-blocked")
         except Exception:
             pass
 
@@ -1146,105 +1622,339 @@ def run_dev_worker(
 
 
 # ---------------------------------------------------------------------------
-# Plan Worker (plan / review)
+# Review Worker (ac-dev-review -> ac-hitl / ac-dev-ready / ac-blocked)
 # ---------------------------------------------------------------------------
+#
+# Mirrors accelevation-claude-tools' agents/loop-review-agent.md. auto-claude
+# reviews its own PRs because that agent scopes itself with
+# `gh issue list --assignee @me` and so never sees an issue assigned to the
+# bot — see stages.REVIEW_TRIGGER's docstring.
 
-def run_plan_worker(
+def _setup_review_worktree(
+    ctx: IssueContext,
+    repo_dir: Path,
+    worktree_dir: Path,
+    logger: WorkerLogger,
+) -> str:
+    """Check out the PR branch for review into its own worktree.
+
+    Unlike dev's rework flow, review does not merge base_branch in — it
+    reviews the PR exactly as pushed, matching loop-review-agent.md Step 6.
+    """
+    branch = ctx.existing_branch
+    if not branch:
+        raise RuntimeError("No PR branch to review (existing_branch is unset)")
+
+    _run_cmd(["git", "fetch", "origin", branch], cwd=repo_dir, logger=logger)
+
+    result = _run_cmd(
+        ["git", "ls-remote", "--heads", "origin", branch],
+        cwd=repo_dir, logger=logger,
+    )
+    if not result.stdout.strip():
+        raise RuntimeError(f"Remote branch {branch} not found for review")
+
+    _cleanup_worktree(repo_dir, worktree_dir, branch, logger)
+
+    worktree_dir.parent.mkdir(parents=True, exist_ok=True)
+    result = _run_cmd(
+        ["git", "worktree", "add", str(worktree_dir), "-b", branch, f"origin/{branch}"],
+        cwd=repo_dir, logger=logger,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"Worktree creation for review failed: {result.stderr.strip()}")
+
+    logger.info(f"Review worktree ready on branch {branch}")
+    return branch
+
+
+def _run_pipeline_command(
+    command: str,
+    cwd: Path,
+    logger: WorkerLogger,
+    timeout: int = 600,
+) -> subprocess.CompletedProcess:
+    """Run one pipeline.json verify/test command through the shell.
+
+    These are opaque shell strings from `.claude/pipeline.json` (e.g.
+    "npm run typecheck"), not argv lists — so this shells out directly rather
+    than going through `_run_cmd`'s list-based interface.
+    """
+    env = build_env(current_token())
+    logger.info(f"$ {command}")
+    return subprocess.run(
+        command,
+        shell=True,
+        cwd=str(cwd),
+        text=True,
+        capture_output=True,
+        timeout=timeout,
+        env=env,
+        encoding="utf-8",
+        errors="replace",
+    )
+
+
+def _run_pipeline_checks(
+    ctx: IssueContext,
+    worktree_dir: Path,
+    logger: WorkerLogger,
+) -> tuple[bool, str]:
+    """Run pipeline.json's verify then test commands. Returns (ok, transcript).
+
+    A repo with no `.claude/pipeline.json` — or one with empty verify/test —
+    has nothing to run. That is not a failure; the transcript says so
+    explicitly so the review prompt and any FAIL feedback are honest about the
+    absence of checks rather than silent about it.
+    """
+    config = load_pipeline_config(worktree_dir, logger=logger)
+    commands = list(config.verify) + list(config.test) if config else []
+
+    if not commands:
+        logger.info("No pipeline.json verify/test commands — skipping checks")
+        return True, "No verify/test commands configured for this repo — none were run."
+
+    ok = True
+    sections: list[str] = []
+    for command in commands:
+        try:
+            result = _run_pipeline_command(command, cwd=worktree_dir, logger=logger)
+        except subprocess.TimeoutExpired:
+            ok = False
+            sections.append(f"$ {command}\n[FAIL, timed out]")
+            logger.error(f"Pipeline command timed out: {command}")
+            continue
+
+        status = "PASS" if result.returncode == 0 else "FAIL"
+        if result.returncode != 0:
+            ok = False
+            logger.warn(f"Pipeline command failed ({result.returncode}): {command}")
+        section = f"$ {command}\n[{status}, exit {result.returncode}]"
+        tail = ((result.stdout or "") + (result.stderr or "")).strip()
+        if tail:
+            section += "\n" + tail[-4000:]
+        sections.append(section)
+
+    return ok, "\n\n".join(sections)
+
+
+def _build_review_prompt(
+    ctx: IssueContext,
+    comments: list[dict],
+    checks_ok: bool,
+    checks_transcript: str,
+) -> str:
+    """Build the review prompt from prompts/review.txt."""
+    template = (ctx.prompts_dir / "review.txt").read_text(encoding="utf-8")
+
+    comments_section = ""
+    if comments:
+        lines = ["Comments:"]
+        for c in comments:
+            user = c.get("user", {}).get("login", "unknown")
+            body = c.get("body", "")
+            lines.append(f"  @{user}: {body}")
+        comments_section = "\n".join(lines)
+
+    checks_status = "PASS" if checks_ok else "FAIL"
+    checks_section = f"[{checks_status}]\n{checks_transcript}"
+
+    return template.format(
+        number=ctx.number,
+        org=ctx.org,
+        repo=ctx.repo,
+        title=ctx.title,
+        body=ctx.body or "(no body)",
+        base_branch=ctx.base_branch,
+        pr_url=ctx.pr_url or "(unknown)",
+        checks_section=checks_section,
+        comments_section=comments_section,
+    )
+
+
+def _post_pr_review(
+    ctx: IssueContext,
+    logger: WorkerLogger,
+    *,
+    approve: bool,
+    body: str,
+) -> None:
+    """Post an approving or changes-requested review on the PR via gh."""
+    pr_number = _pr_number(ctx.pr_url)
+    if pr_number is None:
+        logger.warn("No PR number to review — skipping gh pr review")
+        return
+    args = [
+        "gh", "pr", "review", str(pr_number),
+        "--repo", f"{ctx.org}/{ctx.repo}",
+        "--approve" if approve else "--request-changes",
+        "--body", redact(body),
+    ]
+    _run_cmd(args, logger=logger, timeout=30)
+
+
+def run_review_worker(
     ctx: IssueContext,
     log_queue: Queue,
     state_queue: Queue,
     abort_event: Event,
 ) -> None:
-    """Worker process entry point for plan/review actions.
+    """Worker process entry point for reviewing a PR (ac-dev-review stage).
 
-    Read-only: clone → Claude analysis → post comment → swap labels.
+    Full lifecycle: self-lock -> checkout PR branch -> verify/test -> Claude
+    review (correctness + security) -> pass (ac-hitl) or fail (ac-dev-ready
+    retry, or ac-blocked on the third failure).
     """
     logger = WorkerLogger(log_queue, ctx.issue_id, ctx.color_name, ctx.color_code, ctx.repo)
     pid = os.getpid()
+    logger.info(f"Review worker started (PID {pid}) — PR {ctx.pr_url}")
 
-    logger.info(f"Plan worker started (PID {pid}) — action={ctx.action}")
-
-    action_label = f"ac-{ctx.action}"
-
-    # Signal that we're in progress + set GitHub label as distributed lock
     state_queue.put(StateUpdate(
         issue_id=ctx.issue_id,
-        status="planning",
+        status="in_progress",
         worker_pid=pid,
     ))
-    _set_labels(ctx, logger, add=["ac-in-progress"], remove=[action_label])
+
+    # [1] Self-lock FIRST, before any expensive work, so a concurrent runner
+    # cannot double-claim this review.
+    _claim_review_labels(ctx, logger)
+
+    worktree_dir = ctx.worktrees_dir / ctx.repo / f"issue-{ctx.number}-review"
+    repo_dir = ctx.repos_dir / ctx.repo
 
     try:
-        # [1] Clone / fetch (read-only — no worktree)
+        # `ctx.pr_url`/`existing_branch` are only populated when this same
+        # daemon process ran the dev worker that opened the PR — a restart, a
+        # human-applied ac-dev-review label, or a PR from the sibling
+        # toolchain's dev agent all leave them unset. Relocate the PR from the
+        # issue number in that case rather than assuming there's nothing to
+        # review; prefer the free/exact values already on ctx when present.
+        if not ctx.pr_url or not ctx.existing_branch:
+            match = _find_pr_for_issue(ctx, logger)
+            if match is None:
+                raise RuntimeError(
+                    f"No open PR found for issue #{ctx.number} — cannot review"
+                )
+            ctx.pr_url = match.get("url") or ctx.pr_url
+            ctx.existing_branch = match.get("headRefName") or ctx.existing_branch
+            logger.info(
+                f"Resolved PR from issue lookup: #{match.get('number')} "
+                f"({ctx.existing_branch})"
+            )
+
+        if not ctx.pr_url or not ctx.existing_branch:
+            raise RuntimeError("PR lookup returned an incomplete match — cannot review")
+
+        # [2] Clone/fetch, then checkout the PR branch into a worktree
         repo_dir = _clone_or_fetch(ctx, logger)
 
         if abort_event.is_set():
             logger.warn("Abort — exiting after clone")
             return
 
-        # [2] Build prompt and run Claude (no bypassPermissions — read-only)
-        comments = _get_issue_comments(ctx, logger)
-        prompt = _build_prompt(ctx, comments)
+        _setup_review_worktree(ctx, repo_dir, worktree_dir, logger)
 
-        returncode, output, _budget_exceeded = _run_claude(
+        if abort_event.is_set():
+            logger.warn("Abort — exiting after worktree")
+            return
+
+        # [3] Run verify then test commands from .claude/pipeline.json
+        checks_ok, checks_transcript = _run_pipeline_checks(ctx, worktree_dir, logger)
+        if not checks_ok:
+            logger.warn("Verify/test checks failed")
+
+        if abort_event.is_set():
+            logger.warn("Abort — exiting after checks")
+            return
+
+        # [4] Review the diff against the issue requirements, via Claude
+        comments = _get_issue_comments(ctx, logger)
+        prompt = _build_review_prompt(ctx, comments, checks_ok, checks_transcript)
+
+        returncode, output, budget_exceeded, rate_limit = _run_claude(
             prompt=prompt,
-            cwd=repo_dir,
+            cwd=worktree_dir,
             ctx=ctx,
             logger=logger,
             abort_event=abort_event,
-            bypass_permissions=False,
+            bypass_permissions=True,
         )
 
         if abort_event.is_set():
             logger.warn("Abort — exiting after Claude")
             return
 
+        if rate_limit is not None:
+            raise RuntimeError("Rate limited while reviewing")
+        if budget_exceeded:
+            raise RuntimeError("Budget exceeded while reviewing")
         if returncode != 0:
             raise RuntimeError(f"Claude exited with code {returncode}")
 
-        # [3] Extract result text and post as comment
         result_text = _extract_result_text(output)
-        if not result_text.strip():
-            raise RuntimeError("Claude produced no output for plan/review")
+        claude_pass = _parse_review_verdict(result_text)
+        # A failing verify/test check is an automatic FAIL — never approve a
+        # broken build, regardless of what Claude's verdict says.
+        review_pass = claude_pass and checks_ok
+        if claude_pass and not checks_ok:
+            logger.warn(
+                "Claude returned PASS but verify/test checks failed — overriding to FAIL"
+            )
 
-        if ctx.action == "plan":
-            heading = "## Implementation Plan"
-            footer = "\n\n---\n_To proceed, replace `ac-plan` with `ac-fix` or `ac-implement`._"
-            posted_label = "ac-plan-posted"
-        else:
-            heading = "## Code Review"
-            footer = ""
-            posted_label = "ac-review-posted"
-
-        comment_body = f"{heading}\n\n{redact(result_text)}{footer}"
-
-        logger.info("Posting comment on issue...")
+        # [5] Cleanup worktree before acting on the outcome
         _run_cmd(
-            [
-                "gh", "issue", "comment", str(ctx.number),
-                "--repo", f"{ctx.org}/{ctx.repo}",
-                "--body", comment_body,
-            ],
-            logger=logger,
-            timeout=30,
+            ["git", "worktree", "remove", str(worktree_dir), "--force"],
+            cwd=repo_dir, logger=logger,
         )
+        if worktree_dir.exists():
+            shutil.rmtree(worktree_dir, ignore_errors=True)
+        _run_cmd(["git", "worktree", "prune"], cwd=repo_dir, logger=logger)
 
-        # Swap labels: remove in-progress, add posted label
-        _set_labels(ctx, logger, add=[posted_label], remove=["ac-in-progress"])
+        # [6] Outcome
+        if review_pass:
+            logger.info("Review pass — approving and handing off to ac-hitl")
+            approve_body = (
+                "Agent review: build passes, diff satisfies acceptance criteria, "
+                "security pass clean. Handing to human for final test (HITL gate)."
+            )
+            _post_pr_review(ctx, logger, approve=True, body=approve_body)
+            _review_pass_labels(ctx, logger)
 
-        # Success
-        logger.info(f"Plan/review posted successfully")
+            state_queue.put(StateUpdate(
+                issue_id=ctx.issue_id,
+                status="completed",
+                pr_url=ctx.pr_url,
+            ))
+            return
+
+        feedback = _extract_review_feedback(result_text)
+        if not checks_ok:
+            feedback = f"Verify/test checks failed:\n{checks_transcript}\n\n{feedback}"
+
+        blocked = _review_fail_labels(ctx, logger)
+        if blocked:
+            logger.warn("Attempts exhausted — issue moved to ac-blocked")
+            request_body = (
+                "Agent review: circuit breaker — this issue has failed review 3 "
+                f"or more times and cannot converge automatically.\n\n{feedback}"
+            )
+        else:
+            logger.info("Review fail — requesting changes and returning to ac-dev-ready")
+            request_body = f"Agent review: changes needed.\n\n{feedback}"
+        _post_pr_review(ctx, logger, approve=False, body=request_body)
+
         state_queue.put(StateUpdate(
             issue_id=ctx.issue_id,
-            status="plan_posted",
+            status="failed",
+            error="blocked" if blocked else "review_fail",
+            pr_url=ctx.pr_url,
         ))
 
     except Exception as exc:
         import traceback
         error_detail = f"{exc}\n\n{traceback.format_exc()}"
-        logger.error(f"Plan worker failed: {exc}")
+        logger.error(f"Review worker failed: {exc}")
 
-        # Write crash log and post comment
         log_path = _write_crash_log(ctx, error_detail, logger)
         _post_crash_comment(ctx, str(exc), log_path, logger)
 
@@ -1254,8 +1964,23 @@ def run_plan_worker(
             error=str(exc),
         ))
 
-        # Remove in-progress label on failure
+        # Release the self-lock so the issue is not stranded on
+        # ac-review-in-progress. A crash is not a review verdict, so this must
+        # not consume an attempt — see _labels_for_review_crash.
         try:
-            _set_labels(ctx, logger, remove=["ac-in-progress"])
+            _release_review_lock_after_crash(ctx, logger)
         except Exception:
             pass
+
+        # Try to clean up the worktree on failure
+        try:
+            _run_cmd(
+                ["git", "worktree", "remove", str(worktree_dir), "--force"],
+                cwd=repo_dir,
+            )
+            if worktree_dir.exists():
+                shutil.rmtree(worktree_dir, ignore_errors=True)
+            _run_cmd(["git", "worktree", "prune"], cwd=repo_dir)
+        except Exception:
+            pass
+

@@ -15,12 +15,12 @@ class GithubConfig:
     needs_info_label: str
     pr_created_label: str
     in_progress_label: str
-    plan_posted_label: str
-    review_posted_label: str
     action_labels: list[str]
     dev_actions: list[str]
-    plan_actions: list[str]
     rework_label: str
+    # GitHub account auto-claude acts as. Preflight fails if the configured
+    # token authenticates as anyone else. None disables the identity check.
+    bot_login: str | None = None
 
 
 @dataclass(frozen=True)
@@ -33,7 +33,6 @@ class ClaudeConfig:
     output_format: str
     grace_budget_usd: float
     max_turns_dev: int
-    max_turns_plan: int
     action_models: dict[str, str]  # action -> model override
 
 
@@ -62,12 +61,24 @@ class LoggingConfig:
 
 
 @dataclass(frozen=True)
+class IntegrationsConfig:
+    """Optional cross-toolchain wiring. Absent [integrations] -> all-None,
+    which downstream consumers (e.g. telemetry/board-sync) treat as disabled.
+    """
+
+    # Checkout of accelevation-claude-tools, whose Node scripts (log-event.mjs,
+    # project-sync.mjs) back shared telemetry and board sync. None disables both.
+    claude_tools_root: Path | None = None
+
+
+@dataclass(frozen=True)
 class Config:
     github: GithubConfig
     claude: ClaudeConfig
     workers: WorkersConfig
     paths: PathsConfig
     logging: LoggingConfig
+    integrations: IntegrationsConfig
 
 
 def load_config(config_path: Path | None = None) -> Config:
@@ -105,8 +116,15 @@ def load_config(config_path: Path | None = None) -> Config:
         output_format=claude_raw["output_format"],
         grace_budget_usd=claude_raw.get("grace_budget_usd", 1.0),
         max_turns_dev=claude_raw.get("max_turns_dev", 50),
-        max_turns_plan=claude_raw.get("max_turns_plan", 20),
         action_models=claude_raw.get("action_models", {}),
+    )
+
+    integrations_raw = raw.get("integrations", {})
+    claude_tools_root = integrations_raw.get("claude_tools_root")
+    integrations = IntegrationsConfig(
+        claude_tools_root=(
+            _resolve_path(project_root, claude_tools_root) if claude_tools_root else None
+        ),
     )
 
     return Config(
@@ -115,6 +133,7 @@ def load_config(config_path: Path | None = None) -> Config:
         workers=WorkersConfig(**raw["workers"]),
         paths=paths,
         logging=LoggingConfig(**raw["logging"]),
+        integrations=integrations,
     )
 
 

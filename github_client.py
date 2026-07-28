@@ -2,10 +2,14 @@
 
 from __future__ import annotations
 
+import base64
 import json
 import os
 import subprocess
 from pathlib import Path
+from urllib.parse import quote
+
+from ghauth import build_env, current_token
 
 
 class GithubClientError(Exception):
@@ -33,9 +37,8 @@ class GithubClient:
         Raises GithubClientError on non-zero exit, timeout, or missing gh CLI.
         """
         cmd = ["gh"] + args
-        # Prevent MSYS/Git Bash from converting /repos/... paths to filesystem paths
-        env = os.environ.copy()
-        env["MSYS_NO_PATHCONV"] = "1"
+        # Also prevents MSYS/Git Bash converting /repos/... into filesystem paths
+        env = build_env(current_token())
         try:
             result = subprocess.run(
                 cmd,
@@ -43,6 +46,11 @@ class GithubClient:
                 capture_output=True,
                 timeout=timeout,
                 env=env,
+                # Issue titles and bodies routinely contain smart quotes and
+                # emoji. text=True alone decodes with cp1252 on Windows, which
+                # kills the reader thread and leaves stdout as None.
+                encoding="utf-8",
+                errors="replace",
             )
         except subprocess.TimeoutExpired:
             raise GithubClientError(
@@ -81,6 +89,14 @@ class GithubClient:
 
         result = self._run_gh(args, timeout=timeout)
 
+        # stdout is None when the reader thread died (historically: a decode
+        # error). Fail with something diagnosable rather than AttributeError.
+        if result.stdout is None:
+            raise GithubClientError(
+                f"gh api {endpoint} produced no readable output - the output "
+                f"stream could not be decoded."
+            )
+
         if not result.stdout.strip():
             return {}
 
@@ -97,10 +113,45 @@ class GithubClient:
     # Public methods
     # ------------------------------------------------------------------
 
-    def list_issues(self, repo: str, state: str = "open") -> list[dict]:
-        """Return open issues for a repo, excluding pull requests."""
-        items = self._gh_api(f"/repos/{self.org}/{repo}/issues?state={state}&per_page=100")
+    def list_issues(
+        self,
+        repo: str,
+        state: str = "open",
+        assignee: str | None = None,
+    ) -> list[dict]:
+        """Return issues for a repo, excluding pull requests.
+
+        `assignee` scopes the query to one account - auto-claude's ownership
+        boundary. Omitting it returns every issue regardless of owner, which is
+        only correct when no bot account is configured.
+        """
+        query = f"state={state}&per_page=100"
+        if assignee:
+            query += f"&assignee={quote(assignee, safe='')}"
+        items = self._gh_api(f"/repos/{self.org}/{repo}/issues?{query}")
         return [item for item in items if "pull_request" not in item]
+
+    def get_file(self, repo: str, path: str, ref: str | None = None) -> str | None:
+        """Return a file's contents from the repo, or None if it does not exist.
+
+        Reads from GitHub rather than a local clone: auto-claude's clones are
+        only refreshed when a worker runs, so a clone can be arbitrarily stale
+        and report a file as missing long after it was added.
+        """
+        endpoint = f"/repos/{self.org}/{repo}/contents/{path}"
+        if ref:
+            endpoint += f"?ref={quote(ref, safe='')}"
+        try:
+            payload = self._gh_api(endpoint)
+        except GithubClientError as exc:
+            if "404" in exc.stderr or "Not Found" in exc.stderr:
+                return None
+            raise
+
+        content = payload.get("content") if isinstance(payload, dict) else None
+        if not content:
+            return None
+        return base64.b64decode(content).decode("utf-8", errors="replace")
 
     def get_issue(self, repo: str, number: int) -> dict:
         """Return a single issue by number."""
@@ -146,18 +197,24 @@ class GithubClient:
         label: str,
         color: str = "c2e0c6",
         description: str = "",
-    ) -> None:
-        """Create a label if it doesn't already exist (422 means it already exists)."""
+    ) -> bool:
+        """Create a label if absent. Returns True if it was created.
+
+        Never updates an existing label: a 422 is success, not an error. The
+        sibling toolchain stamps the same names with `--force`, and silently
+        repainting its colours on every startup would be a nasty surprise.
+        """
         try:
             self._gh_api(
                 f"/repos/{self.org}/{repo}/labels",
                 method="POST",
                 fields={"name": label, "color": color, "description": description},
             )
+            return True
         except GithubClientError as exc:
             # gh returns exit 1 with "HTTP 422" when the label already exists.
             if "422" in exc.stderr:
-                return
+                return False
             raise
 
     def create_pr(

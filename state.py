@@ -24,8 +24,6 @@ from pathlib import Path
 class IssueStatus(str, Enum):
     DISCOVERED = "discovered"
     TRIAGING = "triaging"
-    PLANNING = "planning"
-    PLAN_POSTED = "plan_posted"
     NEEDS_INFO = "needs_info"
     QUEUED = "queued"
     IN_PROGRESS = "in_progress"
@@ -41,9 +39,7 @@ class IssueStatus(str, Enum):
 
 VALID_TRANSITIONS: dict[str, list[str]] = {
     IssueStatus.DISCOVERED:  [IssueStatus.TRIAGING, IssueStatus.SKIPPED],
-    IssueStatus.TRIAGING:    [IssueStatus.QUEUED, IssueStatus.NEEDS_INFO, IssueStatus.PLANNING, IssueStatus.SKIPPED],
-    IssueStatus.PLANNING:    [IssueStatus.PLAN_POSTED, IssueStatus.FAILED, IssueStatus.SKIPPED],
-    IssueStatus.PLAN_POSTED: [IssueStatus.DISCOVERED, IssueStatus.SKIPPED],
+    IssueStatus.TRIAGING:    [IssueStatus.QUEUED, IssueStatus.NEEDS_INFO, IssueStatus.SKIPPED],
     IssueStatus.NEEDS_INFO:  [IssueStatus.TRIAGING, IssueStatus.QUEUED, IssueStatus.SKIPPED],
     IssueStatus.QUEUED:      [IssueStatus.IN_PROGRESS, IssueStatus.SKIPPED],
     IssueStatus.IN_PROGRESS: [IssueStatus.COMPLETED, IssueStatus.FAILED, IssueStatus.INTERRUPTED, IssueStatus.SKIPPED],
@@ -88,7 +84,7 @@ class IssueRecord:
     title: str
     body: str
     labels: list[str]
-    action: str             # "fix", "implement", "test", "plan", "review"
+    action: str             # kind hint: "fix", "implement", "test", "rework"
     status: str             # IssueStatus value
     discovered_at: str      # ISO datetime
     updated_at: str         # ISO datetime — last state change
@@ -101,6 +97,10 @@ class IssueRecord:
     rework_count: int = 0
     continuation_count: int = 0
     handoff_summary: str | None = None
+    # Which worker handles this record: "dev" writes code and opens a PR,
+    # "review" checks an open PR. Both use the same queue and status values;
+    # only the spawn target and the label transitions differ.
+    mode: str = "dev"
 
 
 def _now_iso() -> str:

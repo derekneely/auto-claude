@@ -2,10 +2,22 @@
 
 from __future__ import annotations
 
+import stages
 from config import Config
 from github_client import GithubClient, GithubClientError
 from logger import MainLogger
 from state import IssueRecord, IssueStatus, StateStore
+
+# Statuses `StateStore.transition()` can reach QUEUED from in a single hop.
+# DISCOVERED is one hop further (via TRIAGING) — see the ac-dev-review branch
+# of `_poll_repo` below.
+_DIRECT_TO_QUEUED = frozenset({
+    IssueStatus.TRIAGING,
+    IssueStatus.NEEDS_INFO,
+    IssueStatus.COMPLETED,
+    IssueStatus.FAILED,
+    IssueStatus.INTERRUPTED,
+})
 
 
 class Poller:
@@ -17,17 +29,6 @@ class Poller:
         self._github = github
         self._state = state
         self._logger = logger
-
-        # Status labels that indicate auto-claude is already handling the issue.
-        # Issues carrying only these labels (no action label) are excluded.
-        gh = config.github
-        self._status_labels = {
-            gh.needs_info_label,
-            gh.in_progress_label,
-            gh.pr_created_label,
-            gh.plan_posted_label,
-            gh.review_posted_label,
-        }
 
     def poll(self) -> tuple[list[IssueRecord], list[IssueRecord]]:
         """Poll all repos and return (new_issues, retriage_issues)."""
@@ -49,43 +50,82 @@ class Poller:
         new_issues: list[IssueRecord] = []
         retriage_issues: list[IssueRecord] = []
 
-        issues = self._github.list_issues(repo)
-        prefix = self._config.github.label_prefix
+        # Scope to the bot's own issues. The human /loop runners already scope
+        # themselves with `--assignee @me`; without the mirror image here,
+        # auto-claude would pick up a labelled issue owned by a human and both
+        # would work it at once.
+        issues = self._github.list_issues(
+            repo, assignee=self._config.github.bot_login
+        )
 
         for issue in issues:
             label_names = [lbl["name"] for lbl in issue.get("labels", [])]
 
-            # Find action labels (ac-fix, ac-implement, etc.)
-            action_label = self._find_action_label(label_names)
-
-            # Skip issues that have no ac-* action label
-            if action_label is None:
+            # Terminal stages are hands-off, unconditionally. A human who set
+            # ac-blocked/ac-hitl/ac-merged/ac-done must have that stick even
+            # if local state still thinks the issue is FAILED and retriable —
+            # the label, not state/issues.json, is the source of truth here.
+            if stages.is_terminal(label_names):
                 continue
 
             issue_id = f"{repo}#{issue['number']}"
-            action = action_label[len(prefix):]  # strip "ac-" prefix
+            # Verb labels are hints only now; default "implement" covers
+            # loop-created issues that carry no verb label at all.
+            action = stages.kind_of(label_names)
 
             if not self._state.is_known(issue_id):
-                # New issue — add to state as discovered
-                record = IssueRecord(
-                    issue_id=issue_id,
-                    repo=repo,
-                    number=issue["number"],
-                    title=issue["title"],
-                    body=issue.get("body", "") or "",
-                    labels=label_names,
-                    action=action,
-                    status=IssueStatus.DISCOVERED,
-                    discovered_at=issue.get("created_at", ""),
-                    updated_at=issue.get("updated_at", ""),
-                    issue_updated_at=issue.get("updated_at", ""),
-                )
-                self._state.add(record)
-                self._state.save()
-                new_issues.append(record)
-                self._logger.info(
-                    f"New issue: {issue_id} \"{issue['title']}\" [{action_label}]"
-                )
+                # ac-dev-ready and ac-dev-review are the only two triggers. A
+                # verb label alone (or any other stage, e.g. ac-in-progress
+                # owned by a runner already working it) does not queue
+                # anything.
+                if stages.is_claimable(label_names):
+                    record = IssueRecord(
+                        issue_id=issue_id,
+                        repo=repo,
+                        number=issue["number"],
+                        title=issue["title"],
+                        body=issue.get("body", "") or "",
+                        labels=label_names,
+                        action=action,
+                        status=IssueStatus.DISCOVERED,
+                        discovered_at=issue.get("created_at", ""),
+                        updated_at=issue.get("updated_at", ""),
+                        issue_updated_at=issue.get("updated_at", ""),
+                        mode="dev",
+                    )
+                    self._state.add(record)
+                    self._state.save()
+                    new_issues.append(record)
+                    self._logger.info(
+                        f"New issue: {issue_id} \"{issue['title']}\" [{stages.TRIGGER}, kind={action}]"
+                    )
+                elif stages.is_reviewable(label_names):
+                    # Review issues skip triage entirely — "is this issue
+                    # well-specified" is meaningless for a PR review — so the
+                    # record is created directly at QUEUED, the same way the
+                    # claimable branch above creates directly at DISCOVERED.
+                    record = IssueRecord(
+                        issue_id=issue_id,
+                        repo=repo,
+                        number=issue["number"],
+                        title=issue["title"],
+                        body=issue.get("body", "") or "",
+                        labels=label_names,
+                        action=action,
+                        status=IssueStatus.QUEUED,
+                        discovered_at=issue.get("created_at", ""),
+                        updated_at=issue.get("updated_at", ""),
+                        issue_updated_at=issue.get("updated_at", ""),
+                        mode="review",
+                    )
+                    self._state.add(record)
+                    self._state.save()
+                    new_issues.append(record)
+                    self._logger.info(
+                        f"New reviewable issue: {issue_id} \"{issue['title']}\" "
+                        f"[{stages.REVIEW_TRIGGER}]"
+                    )
+                # else: neither trigger label is present — ignored entirely.
             else:
                 record = self._state.get(issue_id)
 
@@ -102,72 +142,93 @@ class Poller:
                         f"Re-triage candidate: {issue_id} (updated since needs_info)"
                     )
 
-                # Plan-to-action: issue was plan_posted, user added a new action label
-                elif record.status == IssueStatus.PLAN_POSTED:
-                    self._state.transition(issue_id, IssueStatus.DISCOVERED)
-                    self._state.update(
-                        issue_id,
-                        action=action,
-                        labels=label_names,
-                        issue_updated_at=issue.get("updated_at", ""),
-                    )
-                    self._state.save()
-                    updated = self._state.get(issue_id)
-                    new_issues.append(updated)
-                    self._logger.info(
-                        f"Plan→action: {issue_id} relabeled [{action_label}]"
-                    )
+                # Rework and retry both resurrect a finished issue. Local
+                # status (FAILED/COMPLETED/INTERRUPTED) is execution history,
+                # not permission — only the label can authorize resuming, so
+                # neither branch below fires without ac-dev-ready present.
+                elif stages.is_claimable(label_names):
 
-                # Rework: reviewer requested changes on a completed issue's PR
-                # Skip triage — go directly to QUEUED, preserving branch/pr_url
-                elif (action == "rework"
-                      and record.status == IssueStatus.COMPLETED
-                      and record.branch and record.pr_url):
-                    self._state.transition(issue_id, IssueStatus.QUEUED)
-                    self._state.update(
-                        issue_id,
-                        action="rework",
-                        labels=label_names,
-                        error=None,
-                        rework_count=record.rework_count + 1,
-                        worker_pid=None,
-                        issue_updated_at=issue.get("updated_at", ""),
-                    )
-                    self._state.save()
-                    self._logger.info(
-                        f"Rework: {issue_id} — branch={record.branch}, PR={record.pr_url}"
-                    )
+                    # Rework: reviewer requested changes on a completed
+                    # issue's PR. Skip triage — go directly to QUEUED,
+                    # preserving branch/pr_url.
+                    if (action == "rework"
+                          and record.status == IssueStatus.COMPLETED
+                          and record.branch and record.pr_url):
+                        self._state.transition(issue_id, IssueStatus.QUEUED)
+                        self._state.update(
+                            issue_id,
+                            action="rework",
+                            labels=label_names,
+                            mode="dev",
+                            error=None,
+                            rework_count=record.rework_count + 1,
+                            worker_pid=None,
+                            issue_updated_at=issue.get("updated_at", ""),
+                        )
+                        self._state.save()
+                        self._logger.info(
+                            f"Rework: {issue_id} — branch={record.branch}, PR={record.pr_url}"
+                        )
 
-                # Retry: user relabeled a failed/completed/interrupted issue
-                elif record.status in (
-                    IssueStatus.FAILED,
-                    IssueStatus.COMPLETED,
-                    IssueStatus.INTERRUPTED,
+                    # Retry: user relabeled a failed/completed/interrupted issue
+                    elif record.status in (
+                        IssueStatus.FAILED,
+                        IssueStatus.COMPLETED,
+                        IssueStatus.INTERRUPTED,
+                    ):
+                        self._state.transition(issue_id, IssueStatus.DISCOVERED)
+                        self._state.update(
+                            issue_id,
+                            action=action,
+                            labels=label_names,
+                            mode="dev",
+                            error=None,
+                            branch=None,
+                            pr_url=None,
+                            worker_pid=None,
+                            issue_updated_at=issue.get("updated_at", ""),
+                        )
+                        self._state.save()
+                        updated = self._state.get(issue_id)
+                        new_issues.append(updated)
+                        self._logger.info(
+                            f"Retry: {issue_id} relabeled [{stages.TRIGGER}] — resetting from {record.status}"
+                        )
+
+                # An issue that swings around to ac-dev-review — either fresh
+                # off a dev worker's PR, or re-labelled by a human — must be
+                # (re)marked mode="review" and pushed to QUEUED without
+                # triage. Skipped when already staged (mode="review" and
+                # QUEUED) so a poll that sees no real change is a no-op.
+                elif stages.is_reviewable(label_names) and not (
+                    record.mode == "review" and record.status == IssueStatus.QUEUED
                 ):
-                    self._state.transition(issue_id, IssueStatus.DISCOVERED)
+                    current = record.status
+                    if current == IssueStatus.DISCOVERED:
+                        self._state.transition(issue_id, IssueStatus.TRIAGING)
+                        current = IssueStatus.TRIAGING
+                    if current in _DIRECT_TO_QUEUED:
+                        self._state.transition(issue_id, IssueStatus.QUEUED)
+                    elif current != IssueStatus.QUEUED:
+                        # IN_PROGRESS (a worker still owns it) or SKIPPED
+                        # (terminal) — neither can reach QUEUED from here.
+                        # Leave it; a future poll resolves the mismatch once
+                        # the owning worker reports back.
+                        continue
+
                     self._state.update(
                         issue_id,
                         action=action,
                         labels=label_names,
+                        mode="review",
                         error=None,
-                        branch=None,
-                        pr_url=None,
-                        worker_pid=None,
                         issue_updated_at=issue.get("updated_at", ""),
                     )
                     self._state.save()
                     updated = self._state.get(issue_id)
                     new_issues.append(updated)
                     self._logger.info(
-                        f"Retry: {issue_id} relabeled [{action_label}] — resetting from {record.status}"
+                        f"Review: {issue_id} -> QUEUED [{stages.REVIEW_TRIGGER}]"
                     )
 
         return new_issues, retriage_issues
-
-    def _find_action_label(self, labels: list[str]) -> str | None:
-        """Return the first ac-* action label found, or None."""
-        action_labels = set(self._config.github.action_labels)
-        for label in labels:
-            if label in action_labels:
-                return label
-        return None
