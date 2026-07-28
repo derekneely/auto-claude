@@ -15,5 +15,4 @@ IMPORTANT — work efficiently:
 - Cover the described behavior, edge cases, and error paths.
 - Run the test suite to verify your tests pass.
 
-When complete, output a line starting with IMPLEMENTATION_SUMMARY:
-followed by a one-sentence description of what tests you wrote and their results.
+{orchestration}

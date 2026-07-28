@@ -7,13 +7,16 @@ Issue Body:
 
 {comments_section}
 
-IMPORTANT — work efficiently:
-- If the issue mentions specific files or paths, start there. Do NOT explore the whole codebase.
-- Read the CLAUDE.md file first if one exists — it has build/test commands and project structure.
-- Make targeted, minimal changes. Do not refactor surrounding code.
-- Run tests only if CLAUDE.md or package.json/pyproject.toml tells you how.
+Scope discipline — the change should be as small as the issue allows:
+- If the issue names specific files or paths, start there.
+- Read CLAUDE.md first if one exists — it has build/test commands and structure.
+- Make targeted changes. Do not refactor surrounding code.
 - Do not add comments, docstrings, or type annotations to code you didn't change.
 - Do not install new dependencies unless the issue specifically requires them.
+- Run the repo's own verify/test commands before you finish.
 
-When complete, output a line starting with IMPLEMENTATION_SUMMARY:
-followed by a one-sentence description of what you did.
+Scope discipline is about the *diff*, not about how much you investigate. Send
+broad reading out to a subagent rather than skipping it — that is what the
+roster below is for.
+
+{orchestration}

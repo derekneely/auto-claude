@@ -21,5 +21,4 @@ IMPORTANT — work efficiently:
 - Read CLAUDE.md first if one exists — it has build/test commands.
 - Do not refactor, add comments, or clean up the previous agent's code.
 
-When complete, output a line starting with IMPLEMENTATION_SUMMARY:
-followed by a one-sentence description of what you did.
+{orchestration}

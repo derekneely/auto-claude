@@ -284,6 +284,14 @@ def _build_prompt(
     if review_comments:
         review_section = _format_review_section(review_comments)
 
+    # Shared orchestration framing. Kept in one file rather than duplicated
+    # across four templates: a prompt that drifts out of sync silently reverts
+    # its agent to a flat coder, which is invisible until you read the logs.
+    try:
+        orchestration = (ctx.prompts_dir / "_orchestration.txt").read_text(encoding="utf-8")
+    except OSError:
+        orchestration = ""
+
     format_vars = dict(
         number=ctx.number,
         org=ctx.org,
@@ -292,6 +300,7 @@ def _build_prompt(
         body=ctx.body or "(no body)",
         action=ctx.action,
         comments_section=comments_section,
+        orchestration=orchestration,
     )
     if ctx.action == "rework":
         format_vars["pr_url"] = ctx.pr_url or ""
@@ -517,6 +526,141 @@ def _extract_summary(output: str) -> str:
         except (json.JSONDecodeError, TypeError):
             pass
     return ""
+
+
+#: Markers the agent emits, in the order they appear. A block runs until the
+#: next marker or the end of the text.
+OUTPUT_MARKERS = (
+    "IMPLEMENTATION_PLAN",
+    "IMPLEMENTATION_SUMMARY",
+    "IMPLEMENTATION_NOTES",
+)
+
+#: Markers the prompt specifies as a single line. Without this, a summary
+#: absorbs every trailing line the agent emits after it.
+SINGLE_LINE_MARKERS = frozenset({"IMPLEMENTATION_SUMMARY"})
+
+
+def _extract_block(output: str, marker: str) -> str:
+    """Pull one `MARKER:` section out of the agent's output.
+
+    Handles both raw text and stream-json. Takes the **last** occurrence: the
+    prompt names each marker when it asks for them, and that echo would
+    otherwise win over the real emission.
+    """
+    text = _extract_result_text(output) or output
+    needle = f"{marker}:"
+
+    idx = text.rfind(needle)
+    if idx == -1:
+        return ""
+    body = text[idx + len(needle):]
+
+    # Stop at whichever other marker comes first.
+    end = len(body)
+    for other in OUTPUT_MARKERS:
+        if other == marker:
+            continue
+        found = body.find(f"{other}:")
+        if found != -1:
+            end = min(end, found)
+    block = body[:end].strip()
+
+    if marker in SINGLE_LINE_MARKERS:
+        return block.split("\n", 1)[0].strip()
+    return block
+
+
+def _issue_report(
+    *,
+    plan: str,
+    summary: str,
+    notes: str,
+    attempt: int | None,
+    model: str,
+    branch: str,
+    pr_url: str | None,
+    outcome: str,
+) -> str:
+    """Build the comment auto-claude posts back to the issue.
+
+    The issue is the pipeline's source of truth for a human reading it later,
+    but until now it only ever received "PR created: <url>". Everything the
+    agent decided lived in a log file nobody opens. Empty sections are omitted
+    rather than printed as bare headers.
+    """
+    ok = outcome == "success"
+    lines = [f"## 🤖 auto-claude — {'implementation complete' if ok else 'attempt failed'}"]
+
+    meta = [f"**Model:** `{model}`", f"**Branch:** `{branch}`"]
+    if attempt:
+        meta.insert(0, f"**Attempt:** {attempt}")
+    if pr_url:
+        meta.append(f"**PR:** {pr_url}")
+    lines.append(" · ".join(meta))
+
+    for heading, body in (
+        ("Plan", plan),
+        ("Summary", summary),
+        ("Notes", notes),
+    ):
+        if body and body.strip() and body.strip().lower() != "none.":
+            lines.append(f"\n### {heading}\n\n{redact(body.strip())}")
+
+    if not ok:
+        lines.append(
+            "\n_The daemon has bumped the attempt counter and returned this "
+            "issue to `ac-dev-ready`, or moved it to `ac-blocked` on the third "
+            "failure._"
+        )
+    return "\n".join(lines)
+
+
+def _post_issue_report(
+    ctx: IssueContext,
+    *,
+    output: str,
+    summary: str,
+    branch: str,
+    pr_url: str | None,
+    outcome: str,
+    logger: WorkerLogger,
+) -> None:
+    """Post the agent's plan, summary and notes back to the issue.
+
+    Never fatal. A worker that wrote the code, pushed it and opened a PR has
+    done its job; failing it over a comment would send a completed issue back
+    round the retry loop and produce a second PR.
+    """
+    try:
+        try:
+            attempt = stages.attempt_of(_get_issue_labels(ctx, logger))
+        except Exception:
+            attempt = None
+
+        body = _issue_report(
+            plan=_extract_block(output, "IMPLEMENTATION_PLAN"),
+            summary=summary,
+            notes=_extract_block(output, "IMPLEMENTATION_NOTES"),
+            attempt=attempt,
+            model=ctx.dev_model,
+            branch=branch,
+            pr_url=pr_url,
+            outcome=outcome,
+        )
+        result = _run_cmd(
+            [
+                "gh", "issue", "comment", str(ctx.number),
+                "--repo", f"{ctx.org}/{ctx.repo}",
+                "--body", body,
+            ],
+            logger=logger,
+            timeout=30,
+        )
+        if result.returncode != 0:
+            logger.warn(f"Could not post issue report: {result.stderr.strip()}")
+    except Exception as exc:
+        logger.warn(f"Could not post issue report: {exc}")
 
 
 def _extract_result_text(output: str) -> str:
@@ -1573,6 +1717,20 @@ def run_dev_worker(
         if worktree_dir.exists():
             shutil.rmtree(worktree_dir, ignore_errors=True)
         _run_cmd(["git", "worktree", "prune"], cwd=repo_dir, logger=logger)
+
+        # [8] Write the record back to the issue. The issue is the pipeline's
+        # source of truth for anyone reading it later, and it previously
+        # received only "PR created: <url>" — everything the agent decided
+        # lived in a log nobody opens.
+        _post_issue_report(
+            ctx,
+            output=output,
+            summary=summary,
+            branch=branch,
+            pr_url=pr_url,
+            outcome="success",
+            logger=logger,
+        )
 
         # Success
         logger.info(f"Completed successfully — PR: {pr_url}")
