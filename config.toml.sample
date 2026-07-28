@@ -23,7 +23,7 @@ rework_label = "ac-rework"
 
 [claude]
 triage_model = "claude-haiku-4-5"
-dev_model = "claude-sonnet-4-6"          # default model for dev actions
+dev_model = "claude-sonnet-5"          # default model for dev actions
 light_model = "claude-haiku-4-5"         # used for handoff summaries
 permission_mode = "bypassPermissions"
 max_budget_usd = 10.0
@@ -33,10 +33,10 @@ max_turns_dev = 50                       # max tool-use turns for dev workers
 
 # Per-action model overrides (optional). Actions not listed use dev_model.
 [claude.action_models]
-implement = "claude-opus-4-6"            # complex features get Opus
-fix = "claude-sonnet-4-6"
-test = "claude-sonnet-4-6"
-rework = "claude-sonnet-4-6"
+implement = "claude-opus-5"            # complex features get Opus
+fix = "claude-sonnet-5"
+test = "claude-sonnet-5"
+rework = "claude-sonnet-5"
 
 [workers]
 max_parallel = 3
