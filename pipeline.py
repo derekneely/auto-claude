@@ -74,6 +74,14 @@ class PipelineConfig:
     test: tuple[str, ...] = ()
     concurrency: int = _DEFAULT_CONCURRENCY
     stale_lock_hours: float = _DEFAULT_STALE_LOCK_HOURS
+    #: Parsed for schema fidelity, **deliberately never honoured.** The sibling
+    #: toolchain puts its worktrees at `.claude/worktrees/slot-N` inside the
+    #: consuming repo; auto-claude keeps every worktree under its own
+    #: `[paths].worktrees_dir` as `worktrees/<repo>/issue-<n>`. Acting on this
+    #: field would scatter working trees inside `repos/*/.claude/`, where they
+    #: are hard to find, easy to lose to a `git clean`, and liable to collide
+    #: with the loop's own slots on a repo both systems touch.
+    #: Pinned by `tests/test_worktree_location.py`.
     worktree_base: str = _DEFAULT_WORKTREE_BASE
     project_board: ProjectBoardConfig | None = None
 
