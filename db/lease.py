@@ -88,6 +88,17 @@ def acquire(db: Database, issue_id: str, harness_id: str,
     reported as False. A swallowed exception here would be indistinguishable
     from "someone else holds it", and the two demand different responses
     from a caller - retry shortly, versus move on to the next issue.
+
+    `owner_harness_id` carries a real FK to `auto_claude.harness(id)`.
+    Claiming for a `harness_id` nobody registered raises the database's own
+    integrity error (`psycopg.errors.ForeignKeyViolation` against a real
+    Postgres) - not `DbUnavailable`, and not a quiet False. That is
+    deliberate, not an oversight: an unregistered harness id is a
+    programming error (the caller must register with `db.harness.register`
+    before ever touching `issue_state` - see Task 11's startup sequence in
+    `main`), not a lost race, and it should surface as loudly as it would in
+    production rather than be mistaken for "someone else holds the lease".
+    See tests/test_db_lease.py::TestAcquireOnUnregisteredHarness.
     """
     rows = db.execute(_ACQUIRE_SQL, (harness_id, ttl_seconds, issue_id))
     return len(rows) == 1

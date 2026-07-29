@@ -221,6 +221,33 @@ class TestReleaseExpired:
         assert db.rows["r#2"]["owner"] == "harness-b", "must not touch a live lease"
 
 
+class TestAcquireOnUnregisteredHarness:
+    """`owner_harness_id` carries a real FK to `auto_claude.harness(id)`
+    (`ON DELETE SET NULL`) - discovered when the controller ran
+    tests/test_lease_concurrency.py against a real database and every
+    lease.acquire call for a bare uuid4 harness id failed with
+    `psycopg.errors.ForeignKeyViolation`, because nothing had registered
+    that id in auto_claude.harness first.
+
+    That FK is correct and load-bearing, not a bug: db/lease.py itself never
+    registers harnesses (db/harness.py does, at startup - Task 11), so an
+    unregistered harness id reaching acquire() is a caller error, not a lost
+    race. This pins that `acquire` lets such an error propagate rather than
+    reporting it as False (indistinguishable from "someone else holds the
+    lease") or as DbUnavailable (would trigger a retry that can never
+    succeed)."""
+
+    def test_an_integrity_error_propagates_rather_than_being_reported_as_false(self):
+        class _IntegrityErrorDb:
+            def execute(self, sql, params=()):
+                raise Exception(
+                    "simulated ForeignKeyViolation: harness id not registered"
+                )
+
+        with pytest.raises(Exception, match="ForeignKeyViolation"):
+            lease.acquire(_IntegrityErrorDb(), "r#1", "unregistered-harness")
+
+
 class TestOwnerAndExpiryAreAlwaysWrittenTogether:
     """Pins the resolution to the two-readings conflict between reconcile.py
     (treats owner-set/expiry-NULL as reclaimable) and the design doc's
