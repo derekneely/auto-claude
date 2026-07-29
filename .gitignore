@@ -7,3 +7,5 @@ repos/
 worktrees/
 __pycache__/
 *.pyc
+.venv/
+state/journal.jsonl

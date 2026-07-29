@@ -4,10 +4,13 @@ Monitors GitHub issues across the [Accelevation](https://github.com/Accelevation
 
 ## Prerequisites
 
-- **Python 3.11+** (uses `tomllib` from stdlib — no pip packages needed)
+- **Python 3.11+** (development uses **3.14**)
 - **Git** on PATH
 - **GitHub CLI (`gh`)** on PATH, authenticated (`gh auth status` should show logged in)
 - **Claude CLI (`claude`)** on PATH, authenticated
+- **PostgreSQL** reachable via `PIPELINE_METRICS_DATABASE_URL` (optional — see
+  `[database]` in `config.toml.sample`; auto-claude runs in degraded,
+  local-only mode without it)
 
 ## Setup
 
@@ -26,15 +29,20 @@ Monitors GitHub issues across the [Accelevation](https://github.com/Accelevation
    claude --version    # must be installed
    ```
 
-3. Copy the sample config and edit it for your environment:
+3. Create a virtual environment and install dependencies:
+
+   ```bash
+   python -m venv .venv
+   .venv\Scripts\python -m pip install -r requirements.txt   # Windows
+   ```
+
+4. Copy the sample config and edit it for your environment:
 
    ```bash
    cp config.toml.sample config.toml
    ```
 
    At minimum, set `org` and `repos` under `[github]` to match your GitHub organization. `config.toml` is gitignored — your real settings stay local.
-
-That's it — zero dependencies to install.
 
 ## Usage
 

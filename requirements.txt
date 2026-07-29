@@ -1,0 +1,10 @@
+# requirements.txt — runtime + test deps. Wheels confirmed available for
+# cp314/win_amd64 (see CONTRACT.md "Environment").
+
+# Runtime — Postgres access and schema migrations.
+psycopg[binary]==3.3.4
+SQLAlchemy==2.0.51
+alembic==1.18.5
+
+# Test
+pytest==9.1.1
