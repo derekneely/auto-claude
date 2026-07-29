@@ -79,3 +79,16 @@ log_to_file = true
 # without it.
 [integrations]
 claude_tools_root = "../accelevation-claude-tools"
+
+# Optional. Shares issue state, lease and run history across harnesses via the
+# `auto_claude` schema on PIPELINE_METRICS_DATABASE_URL (see docs/plans/
+# 12-shared-state-in-postgres.md). Omit this section entirely to use every
+# default below. State stays purely local — degraded, not dead — whenever the
+# url_env variable is unset, regardless of `enabled`.
+[database]
+enabled = true
+url_env = "PIPELINE_METRICS_DATABASE_URL"
+lease_ttl_seconds = 1800
+heartbeat_interval_seconds = 60
+journal_file = "state/journal.jsonl"
+connect_timeout_seconds = 10

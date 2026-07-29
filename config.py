@@ -77,6 +77,28 @@ class IntegrationsConfig:
 
 
 @dataclass(frozen=True)
+class DatabaseConfig:
+    """Optional Postgres-backed shared state (docs/plans/
+    12-shared-state-in-postgres.md). Has a default so `[database]` being
+    absent from config.toml — true of the current file — and Config being
+    constructed positionally in existing tests both keep working.
+    """
+
+    enabled: bool = True
+    url_env: str = "PIPELINE_METRICS_DATABASE_URL"
+    lease_ttl_seconds: int = 1800
+    heartbeat_interval_seconds: int = 60
+    journal_file: Path = Path("state/journal.jsonl")
+    connect_timeout_seconds: int = 10
+
+    def url(self) -> str | None:
+        """The connection string, read lazily so a value main() places in
+        os.environ from .env before load_config() is visible. Never logged —
+        callers must not put this in a log line."""
+        return os.environ.get(self.url_env) or None
+
+
+@dataclass(frozen=True)
 class Config:
     github: GithubConfig
     claude: ClaudeConfig
@@ -88,6 +110,7 @@ class Config:
     # repo absent here is prepared by auto-detection, which is the intended
     # default; the block exists for the cases detection gets wrong.
     repo_setup: dict[str, "RepoSetupConfig"] = dataclass_field(default_factory=dict)
+    database: DatabaseConfig = dataclass_field(default_factory=DatabaseConfig)
 
 
 def load_config(config_path: Path | None = None) -> Config:
@@ -151,6 +174,26 @@ def load_config(config_path: Path | None = None) -> Config:
             env_source=_resolve_path(project_root, env_source) if env_source else None,
         )
 
+    database_raw = raw.get("database", {})
+    _db_defaults = DatabaseConfig()
+    database = DatabaseConfig(
+        enabled=database_raw.get("enabled", _db_defaults.enabled),
+        url_env=database_raw.get("url_env", _db_defaults.url_env),
+        lease_ttl_seconds=database_raw.get(
+            "lease_ttl_seconds", _db_defaults.lease_ttl_seconds
+        ),
+        heartbeat_interval_seconds=database_raw.get(
+            "heartbeat_interval_seconds", _db_defaults.heartbeat_interval_seconds
+        ),
+        journal_file=_resolve_path(
+            project_root,
+            database_raw.get("journal_file", str(_db_defaults.journal_file)),
+        ),
+        connect_timeout_seconds=database_raw.get(
+            "connect_timeout_seconds", _db_defaults.connect_timeout_seconds
+        ),
+    )
+
     return Config(
         repo_setup=repo_setup,
         github=GithubConfig(**raw["github"]),
@@ -159,6 +202,7 @@ def load_config(config_path: Path | None = None) -> Config:
         paths=paths,
         logging=LoggingConfig(**raw["logging"]),
         integrations=integrations,
+        database=database,
     )
 
 
