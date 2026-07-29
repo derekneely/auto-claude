@@ -108,7 +108,17 @@ Step 6   the interface — a separate project, out of scope here
 
 Tasks 1-15 deliver resilience and are independently testable end to end on `field_admin#215`. Tasks 16-21 deliver the history the interface will read.
 
-**Degraded operation is a first-class path.** With `[database].enabled = false`, no URL set, or Postgres simply unreachable, the daemon must still start and work exactly as it does today — single-harness, `issues.json`-backed, no leases. Every task that touches startup tests this explicitly.
+**Degraded operation is a first-class path — but only when Postgres is deliberately absent, not when it is broken.** Startup and runtime are governed by different rules, and conflating them is a defect:
+
+| Condition | Startup | Runtime (daemon already up) |
+|---|---|---|
+| `[database].enabled = false`, or no URL set | **Start.** Single-harness, `issues.json`-backed, no leases — exactly as today. | Unchanged; nothing ever calls Postgres. |
+| Postgres **unreachable** | **Refuse to start.** Log the reason and exit non-zero. | **Never abort a running agent.** Durable writes log-and-drop (later, journal); the daemon keeps working. |
+| Postgres reachable, schema **stale or missing** | **Refuse to start**, printing the exact upgrade command. The daemon never migrates. | n/a |
+
+The startup refusal is a deliberate ruling (2026-07-29): an unreachable database at boot means this harness cannot take a lease, and a harness that cannot take a lease could double-claim an issue another box is already working. A blip that stops autonomous work until a human looks is preferred over two harnesses on one issue. Runtime is the opposite trade — work already in flight is never thrown away for a database problem, which the spec states outright.
+
+Every task that touches startup tests both halves of this explicitly.
 
 ---
 
