@@ -112,6 +112,51 @@ class TestStrandedInProgressIsResurrected:
         assert "field_admin#215" in report.resurrected
         assert "field_admin#215" in report.leases_released
 
+    def test_ac_review_in_progress_with_an_expired_lease_is_also_resurrected(self, tmp_path):
+        # Regression for a review-fix: derive_status() already treats
+        # ac-review-in-progress the same as ac-in-progress (both are in
+        # stages.LOCKED), but the resurrected list used to be keyed off a
+        # literal "ac-in-progress" string comparison, so a stranded review
+        # issue was moved to QUEUED without ever appearing in
+        # report.resurrected — silently dropping the logger.warn() and
+        # undercounting anything Task 11 keys off that list.
+        state = StateStore(tmp_path / "issues.json")
+        db_rows = {"field_admin#216": _lease_row("old-harness", _PAST, branch="fix/216")}
+        report = reconcile(
+            state=state, db_rows=db_rows,
+            gh_issues={"field_admin#216": _gh("ac-review-in-progress", number=216)},
+            harness_id="me", logger=_logger(),
+        )
+        assert state.get("field_admin#216").status == IssueStatus.QUEUED
+        assert "field_admin#216" in report.resurrected
+        assert "field_admin#216" in report.leases_released
+
+
+class TestNullExpiryLeaseShape:
+    def test_owner_set_with_null_expiry_is_treated_as_reclaimable(self, tmp_path):
+        # Pins the chosen interpretation of an owner_harness_id set alongside
+        # a NULL lease_expires_at — a shape that should be unreachable once
+        # db/lease.py (Task 12) always writes both columns together, but is
+        # not ruled out by this module's own contract.
+        #
+        # This encodes "NULL expiry == no live lease == reclaimable", i.e.
+        # the *opposite* reading from the design doc's illustrative SQL
+        # (`owner_harness_id IS NULL OR lease_expires_at < now()`), where
+        # `NULL < now()` is unknown in SQL and so a NULL-expiry row would
+        # *not* match that WHERE clause. Task 12 is expected to make this
+        # shape unreachable by having acquire/release always write both
+        # columns together, rather than reconciling the two readings here.
+        state = StateStore(tmp_path / "issues.json")
+        db_rows = {"field_admin#217": _lease_row("old-harness", None, branch="fix/217")}
+        report = reconcile(
+            state=state, db_rows=db_rows,
+            gh_issues={"field_admin#217": _gh("ac-in-progress", number=217)},
+            harness_id="me", logger=_logger(),
+        )
+        assert state.get("field_admin#217").status == IssueStatus.QUEUED
+        assert "field_admin#217" in report.resurrected
+        assert "field_admin#217" in report.leases_released
+
 
 class TestLeaseHeldByAnotherHarnessIsNotResurrected:
     def test_an_unexpired_lease_owned_by_someone_else_stays_in_progress(self, tmp_path):

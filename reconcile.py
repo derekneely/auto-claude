@@ -21,6 +21,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
+from stages import LOCKED
 from state import IssueRecord, IssueStatus, StateStore
 
 STAGE_TO_STATUS: dict[str, str] = {
@@ -36,10 +37,6 @@ STAGE_TO_STATUS: dict[str, str] = {
     "ac-blocked": IssueStatus.SKIPPED,
 }
 
-# The only two stages where auto-claude self-locks by writing the label —
-# every other stage's status is identical whether or not a lease exists.
-_LOCKED_STAGES = frozenset({"ac-in-progress", "ac-review-in-progress"})
-
 # Both queue the review worker, per poller.py's own routing.
 _REVIEW_STAGES = frozenset({"ac-dev-review", "ac-review-in-progress"})
 
@@ -47,7 +44,7 @@ _REVIEW_STAGES = frozenset({"ac-dev-review", "ac-review-in-progress"})
 def derive_status(stage: str | None, *, lease_held_by_other: bool) -> str:
     """The IssueStatus a stage + lease state maps to — the table in
     docs/plans/12-shared-state-in-postgres.md / CONTRACT.md."""
-    if stage in _LOCKED_STAGES and lease_held_by_other:
+    if stage in LOCKED and lease_held_by_other:
         return IssueStatus.IN_PROGRESS
     return STAGE_TO_STATUS.get(stage, IssueStatus.SKIPPED)
 
@@ -100,7 +97,7 @@ def reconcile(*, state: StateStore, db_rows: dict[str, dict],
         status = derive_status(stage, lease_held_by_other=held_by_other)
         mode = "review" if stage in _REVIEW_STAGES else "dev"
 
-        if stage == "ac-in-progress" and not held_by_other:
+        if stage in LOCKED and not held_by_other:
             resurrected.append(issue_id)
         if _lease_expired(db_row, now):
             leases_released.append(issue_id)
