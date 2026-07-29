@@ -395,6 +395,16 @@ def main() -> None:
     enable_ansi_windows()
 
     args = parse_args()
+
+    # Secrets and locations from the gitignored .env. This runs *before*
+    # load_config because config path values may reference ${VARS} defined
+    # here - `env_source = "${ACCELEVATION_ROOT}/field_admin"` resolves at load
+    # time, so the environment has to be populated first. Worker processes
+    # inherit os.environ, so this reaches them too.
+    project_root = Path(args.config).resolve().parent if args.config else Path.cwd()
+    for key, value in load_dotenv(project_root).items():
+        os.environ[key] = value
+
     config = load_config(args.config)
 
     logger = MainLogger(
@@ -420,14 +430,8 @@ def main() -> None:
 
     # Authenticate as the bot account. The token is placed in os.environ under a
     # private name so worker processes inherit it; it only becomes GH_TOKEN
-    # inside the subprocess environments ghauth builds.
-    project_root = Path(args.config).resolve().parent if args.config else Path.cwd()
-
-    # Secrets from the gitignored .env, before anything that might need them.
-    # Worker processes inherit os.environ, so this reaches them too.
-    for key, value in load_dotenv(project_root).items():
-        os.environ[key] = value
-
+    # inside the subprocess environments ghauth builds. `.env` was already
+    # loaded above, before config.
     token = load_token(project_root)
     if token:
         os.environ[TOKEN_ENV_VAR] = token

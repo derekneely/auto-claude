@@ -48,6 +48,18 @@ max_parallel = 3
 max_continuations = 2            # max continuation runs after budget exhaustion (3 total)
 shutdown_grace_seconds = 30
 
+# Every path key in this file - here, [integrations], and each [repos.*]
+# env_source - supports `${VAR}` and `~` expansion. Values come from the
+# environment, including the gitignored .env, which is loaded before this file.
+#
+# Relative paths resolve against the directory holding config.toml, so a value
+# like "../accelevation/field_admin" silently repoints if you move the harness.
+# Name the location instead and moving becomes a one-line env change:
+#
+#   env_source = "${ACCELEVATION_ROOT}/field_admin"
+#
+# An undefined variable is a startup error, not a directory literally named
+# "${VAR}".
 [paths]
 repos_dir = "repos"
 worktrees_dir = "worktrees"

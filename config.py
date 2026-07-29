@@ -1,5 +1,7 @@
 """Configuration loading and typed dataclasses for auto-claude."""
 
+import os
+import re
 import tomllib
 from dataclasses import dataclass
 from dataclasses import field as dataclass_field
@@ -161,8 +163,34 @@ def load_config(config_path: Path | None = None) -> Config:
 
 
 def _resolve_path(project_root: Path, value: str) -> Path:
-    """Resolve a path relative to the project root, or return as-is if absolute."""
-    p = Path(value)
+    """Resolve a config path, expanding `${VARS}` and `~` before resolving.
+
+    Relative values resolve against the project root, which means moving the
+    harness silently repoints every one of them - `env_source` pointed at a
+    sibling checkout via `../`, and `claude_tools_root` was an absolute path
+    that existed on exactly one machine. Expansion lets a config name a location
+    independently of where auto-claude happens to live:
+
+        env_source = "${ACCELEVATION_ROOT}/field_admin"
+
+    Values come from the environment, which `main` populates from the gitignored
+    `.env` *before* loading config for this reason.
+
+    An undefined variable raises rather than passing through: `expandvars`
+    leaves `${MISSING}` untouched, which would otherwise become a directory
+    literally named `${MISSING}` and surface much later as a baffling
+    "no such file or directory".
+    """
+    expanded = os.path.expanduser(os.path.expandvars(value))
+
+    undefined = re.findall(r"\$\{([^}]+)\}", expanded)
+    if undefined:
+        raise ValueError(
+            f"config path {value!r} references undefined environment "
+            f"variable(s): {', '.join(undefined)}"
+        )
+
+    p = Path(expanded)
     if p.is_absolute():
         return p
     return project_root / p
