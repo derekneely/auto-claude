@@ -48,14 +48,53 @@ def _logger():
     )
 
 
-def _config(repos=("field_admin",), tools_root=None, repos_dir=Path("/nope")):
+def _config(repos=("field_admin",), tools_root=None, repos_dir=Path("/nope"),
+            base_branch="dev"):
     return SimpleNamespace(
         github=SimpleNamespace(
             org="Accelevation", repos=list(repos), bot_login="accelevation-bot",
+            base_branch=base_branch,
         ),
         integrations=SimpleNamespace(claude_tools_root=tools_root),
         paths=SimpleNamespace(repos_dir=repos_dir),
     )
+
+
+# A minimal pipeline.json with a valid projectBoard block, as GitHub would
+# return it. Board sync only ever reads `projectBoard`.
+BOARD_JSON = (
+    '{"project": "field_admin", "prBaseBranch": "dev", "projectBoard": '
+    '{"projectId": "PVT_1", "statusFieldId": "F_1", '
+    '"columns": {"ac-dev-ready": "OPT_1"}}}'
+)
+
+
+class FakeGithubFiles:
+    """GithubClient stand-in exposing just `get_file`, recording every ref asked
+    for. `by_ref` maps a ref (None = the repo's default branch) to file text;
+    a missing key means "that ref has no such file", which is what
+    GithubClient.get_file returns as None."""
+
+    def __init__(self, by_ref=None):
+        self.by_ref = {"dev": BOARD_JSON} if by_ref is None else by_ref
+        self.asked: list[tuple[str, str, str | None]] = []
+
+    def get_file(self, repo, path, ref=None):
+        self.asked.append((repo, path, ref))
+        return self.by_ref.get(ref)
+
+
+def _recording_sync_board(called):
+    """Capture what sync_board was handed, including the state of the cwd at
+    call time — the cwd is temporary and gone by the time the test asserts."""
+    def fake(**kw):
+        pj = Path(kw["cwd"]) / ".claude" / "pipeline.json"
+        called.append({
+            **kw,
+            "pipeline_exists": pj.is_file(),
+            "pipeline_text": pj.read_text(encoding="utf-8") if pj.is_file() else None,
+        })
+    return fake
 
 
 def _issue(number, labels):
@@ -113,31 +152,98 @@ class TestReleaseStaleLocks:
 class TestSyncBoards:
     def test_noop_without_a_configured_toolchain(self, monkeypatch):
         called = []
-        monkeypatch.setattr(main, "sync_board", lambda **kw: called.append(kw))
-        main._sync_boards(_config(tools_root=None), _logger())
+        monkeypatch.setattr(main, "sync_board", _recording_sync_board(called))
+        main._sync_boards(_config(tools_root=None), FakeGithubFiles(), _logger())
         assert not called
 
-    def test_skips_repos_that_are_not_cloned(self, monkeypatch, tmp_path):
+    def test_runs_from_a_directory_holding_the_current_pipeline_json(
+        self, monkeypatch, tmp_path
+    ):
+        # project-sync.mjs reads a literal relative `.claude/pipeline.json` from
+        # its cwd, so the cwd must contain that file or the sync dies exit 1.
         called = []
-        monkeypatch.setattr(main, "sync_board", lambda **kw: called.append(kw))
+        monkeypatch.setattr(main, "sync_board", _recording_sync_board(called))
         main._sync_boards(
-            _config(tools_root=tmp_path, repos_dir=tmp_path / "missing"), _logger()
-        )
-        assert not called
-
-    def test_runs_with_cwd_set_to_the_repo_checkout(self, monkeypatch, tmp_path):
-        # project-sync.mjs reads a literal relative `.claude/pipeline.json`, so
-        # the wrong cwd makes it silently sync nothing.
-        (tmp_path / "repos" / "field_admin").mkdir(parents=True)
-        called = []
-        monkeypatch.setattr(main, "sync_board", lambda **kw: called.append(kw))
-        main._sync_boards(
-            _config(tools_root=tmp_path, repos_dir=tmp_path / "repos"), _logger()
+            _config(tools_root=tmp_path), FakeGithubFiles(), _logger()
         )
         assert len(called) == 1
-        assert called[0]["cwd"] == tmp_path / "repos" / "field_admin"
+        assert called[0]["pipeline_exists"], "cwd had no .claude/pipeline.json"
+        assert called[0]["pipeline_text"] == BOARD_JSON
         assert called[0]["assignee"] == "accelevation-bot"
         assert called[0]["repo"] == "Accelevation/field_admin"
+
+    def test_syncs_a_repo_whose_local_checkout_is_absent_or_on_a_stale_branch(
+        self, monkeypatch, tmp_path
+    ):
+        # The regression: repos/field_admin sat on `main`, which has no
+        # .claude/pipeline.json (it lives only on `dev`), so every sync exited 1
+        # until a worker happened to move the checkout. Board sync must not
+        # depend on the shared checkout's branch — or on it existing at all.
+        called = []
+        monkeypatch.setattr(main, "sync_board", _recording_sync_board(called))
+        main._sync_boards(
+            _config(tools_root=tmp_path, repos_dir=tmp_path / "never-cloned"),
+            FakeGithubFiles(),
+            _logger(),
+        )
+        assert len(called) == 1
+        assert called[0]["pipeline_exists"]
+
+    def test_prefers_the_base_branch_over_the_default_branch(
+        self, monkeypatch, tmp_path
+    ):
+        # `main` trails `dev` by a release cycle; reading the default branch is
+        # how auto-claude once picked up a prBaseBranch that was days stale.
+        called = []
+        gh = FakeGithubFiles({"dev": BOARD_JSON, None: '{"project": "stale"}'})
+        monkeypatch.setattr(main, "sync_board", _recording_sync_board(called))
+        main._sync_boards(_config(tools_root=tmp_path), gh, _logger())
+        assert gh.asked[0][2] == "dev", "base branch must be tried first"
+        assert called[0]["pipeline_text"] == BOARD_JSON
+
+    def test_falls_back_to_the_default_branch(self, monkeypatch, tmp_path):
+        called = []
+        gh = FakeGithubFiles({None: BOARD_JSON})  # nothing on `dev`
+        monkeypatch.setattr(main, "sync_board", _recording_sync_board(called))
+        main._sync_boards(_config(tools_root=tmp_path), gh, _logger())
+        assert len(called) == 1
+        assert called[0]["pipeline_text"] == BOARD_JSON
+
+    def test_skips_a_repo_with_no_pipeline_json_on_any_branch(
+        self, monkeypatch, tmp_path
+    ):
+        called = []
+        monkeypatch.setattr(main, "sync_board", _recording_sync_board(called))
+        main._sync_boards(
+            _config(tools_root=tmp_path), FakeGithubFiles({}), _logger()
+        )
+        assert not called, "nothing to sync against — must not invoke the script"
+
+    def test_a_repo_that_cannot_be_read_does_not_stop_the_others(
+        self, monkeypatch, tmp_path
+    ):
+        class Exploding(FakeGithubFiles):
+            def get_file(self, repo, path, ref=None):
+                if repo == "boom":
+                    raise GithubClientError("boom")
+                return super().get_file(repo, path, ref=ref)
+
+        called = []
+        monkeypatch.setattr(main, "sync_board", _recording_sync_board(called))
+        main._sync_boards(
+            _config(repos=("boom", "field_admin"), tools_root=tmp_path),
+            Exploding(),
+            _logger(),
+        )
+        assert [c["repo"] for c in called] == ["Accelevation/field_admin"]
+
+    def test_removes_the_scratch_directory_afterwards(self, monkeypatch, tmp_path):
+        called = []
+        monkeypatch.setattr(main, "sync_board", _recording_sync_board(called))
+        main._sync_boards(
+            _config(tools_root=tmp_path), FakeGithubFiles(), _logger()
+        )
+        assert not Path(called[0]["cwd"]).exists(), "scratch dir leaked"
 
 
 class FakeState:

@@ -5,6 +5,7 @@ import multiprocessing
 import os
 import signal
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -23,6 +24,7 @@ from ghauth import (
 from github_client import GithubClient, GithubClientError
 from integrations import METRICS_DB_ENV_VAR, sync_board
 from logger import MainLogger, enable_ansi_windows
+from pipeline import PIPELINE_JSON_RELATIVE_PATH
 from poller import Poller
 from process_manager import ProcessManager
 from state import IssueStatus, StateStore
@@ -163,28 +165,70 @@ def _release_stale_locks(config, github: GithubClient, logger: MainLogger,
     return released
 
 
-def _sync_boards(config, logger: MainLogger) -> None:
+def _pipeline_json_text(config, github, repo: str, logger: MainLogger) -> str | None:
+    """The repo's current `.claude/pipeline.json`, read from GitHub.
+
+    Same rule as `ProcessManager.pipeline_for`: prefer the configured base
+    branch over the repo's default branch, since GitHub's contents API defaults
+    to the latter and `main` can trail the active integration branch by a
+    release cycle. Returns None when no branch carries the file.
+    """
+    base_branch = getattr(config.github, "base_branch", None)
+    refs: list[str | None] = [base_branch, None] if base_branch else [None]
+
+    for ref in refs:
+        try:
+            text = github.get_file(repo, PIPELINE_JSON_RELATIVE_PATH, ref=ref)
+        except Exception as exc:  # noqa: BLE001 - board drift is never fatal
+            logger.warn(
+                f"board sync: could not read {repo}/{PIPELINE_JSON_RELATIVE_PATH}"
+                f"{f'@{ref}' if ref else ''}: {exc}"
+            )
+            return None
+        if text is not None:
+            return text
+    return None
+
+
+def _sync_boards(config, github, logger: MainLogger) -> None:
     """Mirror ac-* labels onto the shared Projects v2 board, per repo.
 
-    `project-sync.mjs` reads `.claude/pipeline.json` from its working directory,
-    so cwd must be the repo's own checkout - not auto-claude's. A repo that has
-    not been cloned yet is skipped rather than synced from the wrong directory.
+    `project-sync.mjs` reads a literal relative `.claude/pipeline.json` from its
+    cwd, so it needs a directory holding that file. That directory is
+    deliberately *not* the repo's local checkout: `repos/<repo>` is shared with
+    the workers and sits on whatever branch one of them last left it on.
+    field_admin's clone sat on `main` from the day it was cloned, and
+    `.claude/pipeline.json` exists only on `dev` — so every sync exited 1 until
+    a worker incidentally checked out `dev`. Serving the file from GitHub into a
+    scratch directory decouples board sync from checkout state entirely, and
+    lets a repo that was never cloned still sync its board.
+
+    cwd is the script's *only* dependency on the filesystem — every `gh` call it
+    makes either passes `--repo` (which we always supply) or is `gh api graphql`.
     """
     root = config.integrations.claude_tools_root
     if root is None:
         return
 
     for repo in config.github.repos:
-        repo_root = config.paths.repos_dir / repo
-        if not repo_root.is_dir():
+        text = _pipeline_json_text(config, github, repo, logger)
+        if text is None:
+            # No pipeline.json anywhere means no board to sync. Silent by
+            # design: this runs every tick, and the script itself treats a
+            # missing projectBoard block as "disabled", not as an error.
             continue
-        sync_board(
-            cwd=repo_root,
-            claude_tools_root=root,
-            repo=f"{config.github.org}/{repo}",
-            assignee=config.github.bot_login,
-            log=logger.warn,
-        )
+
+        with tempfile.TemporaryDirectory(prefix="ac-board-sync-") as scratch:
+            pipeline_json = Path(scratch) / PIPELINE_JSON_RELATIVE_PATH
+            pipeline_json.parent.mkdir(parents=True, exist_ok=True)
+            pipeline_json.write_text(text, encoding="utf-8")
+            sync_board(
+                cwd=Path(scratch),
+                claude_tools_root=root,
+                repo=f"{config.github.org}/{repo}",
+                assignee=config.github.bot_login,
+                log=logger.warn,
+            )
 
 
 def _run_triage(record, state, github, triage_engine, config, logger,
@@ -520,7 +564,7 @@ def main() -> None:
             #    every open issue it is given, so per-transition calls would be
             #    redundant work. Never fatal; board drift is recoverable.
             if not args.dry_run:
-                _sync_boards(config, logger)
+                _sync_boards(config, github, logger)
 
             # 7. Sleep in small increments so shutdown is responsive
             for _ in range(config.github.poll_interval_seconds):
