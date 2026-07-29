@@ -16,16 +16,33 @@ Two things this file must get right (docs/plans/12-shared-state-in-postgres.md,
 
 Connection string: PIPELINE_METRICS_DATABASE_URL — the same variable
 `integrations.py` and `config.DatabaseConfig.url_env`'s default read. Moving
-that database moves auto-claude's operational state with it.
+that database moves auto-claude's operational state with it. It is normally
+kept in a gitignored `.env` beside `config.toml`, not exported in the shell,
+so this file loads it the same way `main.py` does via
+`ghauth.load_dotenv()` before anything tries to read it.
 """
 
 from __future__ import annotations
 
 import os
+import sys
 from logging.config import fileConfig
+from pathlib import Path
 
 from alembic import context
 from sqlalchemy import create_engine, text
+from sqlalchemy.engine import make_url
+
+ROOT = Path(__file__).resolve().parent.parent
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from ghauth import load_dotenv  # noqa: E402
+
+# Same pattern as main.py: an already-exported value always wins, .env only
+# fills in what is missing.
+for _key, _value in load_dotenv(ROOT).items():
+    os.environ[_key] = _value
 
 config = context.config
 
@@ -45,8 +62,23 @@ def _database_url() -> str:
     return url
 
 
+def _engine_url(raw_url: str) -> str:
+    """Force the psycopg3 dialect for SQLAlchemy's engine.
+
+    A bare `postgresql://` scheme resolves to the **psycopg2** dialect in
+    SQLAlchemy's dialect registry (sqlalchemy/dialects/postgresql/__init__.py),
+    but requirements.txt pins psycopg 3 only — do not add psycopg2. `db/pool.py`
+    is unaffected by this because it drives psycopg3 directly and needs no
+    driver hint; only SQLAlchemy's URL-based dialect lookup does.
+    """
+    url = make_url(raw_url)
+    if url.drivername == "postgresql":
+        url = url.set(drivername="postgresql+psycopg")
+    return str(url)
+
+
 def run_migrations_online() -> None:
-    engine = create_engine(_database_url())
+    engine = create_engine(_engine_url(_database_url()))
     with engine.connect() as connection:
         # Must run before context.configure(): configure() immediately tries
         # to read the version table out of `auto_claude`, which does not
@@ -66,6 +98,11 @@ def run_migrations_online() -> None:
 
 
 def run_migrations_offline() -> None:
+    # `--sql` output is not meant to be piped at a virgin database as-is:
+    # Alembic auto-emits `CREATE TABLE auto_claude.alembic_version` before
+    # revision 0001's own `CREATE SCHEMA IF NOT EXISTS auto_claude` runs, so
+    # `auto_claude` must already exist for the emitted SQL to apply cleanly.
+    # This is Alembic-internal ordering; the online path above is correct.
     context.configure(
         url=_database_url(),
         target_metadata=target_metadata,

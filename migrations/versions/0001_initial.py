@@ -100,4 +100,17 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
-    op.execute("DROP SCHEMA auto_claude CASCADE")
+    # Deliberately do NOT drop the `auto_claude` schema itself: with
+    # version_table_schema="auto_claude", Alembic's own bookkeeping
+    # (`auto_claude.alembic_version`) lives inside it too, and after
+    # downgrade() returns, Alembic issues a DELETE against that table in the
+    # *same* transaction. Postgres makes DDL catalog changes visible to later
+    # statements in the same transaction, so a DROP SCHEMA ... CASCADE here
+    # would drop alembic_version out from under that DELETE and abort the
+    # whole downgrade. Drop only what this revision created, in dependency
+    # order (children before parents), and leave the empty schema in place
+    # for Alembic to finish its own bookkeeping against.
+    op.execute("DROP TABLE auto_claude.summary")
+    op.execute("DROP TABLE auto_claude.run")
+    op.execute("DROP TABLE auto_claude.issue_state")
+    op.execute("DROP TABLE auto_claude.harness")
