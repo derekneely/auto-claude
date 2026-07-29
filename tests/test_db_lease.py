@@ -235,7 +235,12 @@ class TestAcquireOnUnregisteredHarness:
     race. This pins that `acquire` lets such an error propagate rather than
     reporting it as False (indistinguishable from "someone else holds the
     lease") or as DbUnavailable (would trigger a retry that can never
-    succeed)."""
+    succeed).
+
+    Note this is documentation, not a regression guard: `acquire` has no
+    `except` clause at all, so *any* exception from `db.execute` propagates
+    by construction - this test cannot fail short of someone adding a
+    swallowing `try/except` to `acquire` itself."""
 
     def test_an_integrity_error_propagates_rather_than_being_reported_as_false(self):
         class _IntegrityErrorDb:
@@ -297,3 +302,58 @@ class TestOwnerAndExpiryAreAlwaysWrittenTogether:
         lease.release(db, "r#1", "harness-a")
         for row in db.rows.values():
             assert not (row["owner"] is not None and row["expires_at"] is None)
+
+
+def _set_clause(sql: str) -> str:
+    return sql[sql.index("SET"): sql.index("WHERE")]
+
+
+def _where_clause(sql: str) -> str:
+    start = sql.index("WHERE")
+    end = sql.index("RETURNING") if "RETURNING" in sql else len(sql)
+    return sql[start:end]
+
+
+class TestLeaseColumnInvariantIsPinnedInSQL:
+    """`TestOwnerAndExpiryAreAlwaysWrittenTogether`, above, only proves that
+    `_FakeDb`'s hand-written simulation keeps `owner`/`expires_at` in
+    lockstep - it dispatches on `sql == lease._ACQUIRE_SQL` by *identity*
+    and then runs its own hardcoded logic, completely independent of what
+    that SQL text actually sets. A future edit that dropped
+    `lease_expires_at = ...` from `_ACQUIRE_SQL`'s SET clause would leave
+    every test in that class still green, because the fake never re-parses
+    the real statement - exactly the kind of silent regression this
+    invariant exists to prevent (review finding, fix round 2).
+
+    These assert directly against the SQL constants' text instead, so
+    dropping either column from a SET or WHERE clause trips a hermetic test
+    with no database required - the same style of protection
+    tests/test_db_issue_state.py already relies on for `issue_state.upsert`.
+    """
+
+    def test_acquire_sets_owner_and_expiry_together(self):
+        set_clause = _set_clause(lease._ACQUIRE_SQL)
+        assert "owner_harness_id" in set_clause
+        assert "lease_expires_at" in set_clause
+
+    def test_release_clears_owner_and_expiry_together(self):
+        set_clause = _set_clause(lease._RELEASE_SQL)
+        assert "owner_harness_id" in set_clause
+        assert "lease_expires_at" in set_clause
+
+    def test_release_expired_clears_owner_and_expiry_together(self):
+        set_clause = _set_clause(lease._RELEASE_EXPIRED_SQL)
+        assert "owner_harness_id" in set_clause
+        assert "lease_expires_at" in set_clause
+
+    def test_heartbeat_guards_on_both_owner_and_unexpired_lease(self):
+        # heartbeat never writes owner_harness_id - it only extends the
+        # expiry of a lease that already has an owner - so its protection
+        # against the disputed shape lives in its WHERE guard, not a SET
+        # clause: it can only touch a row that already has owner_harness_id
+        # set AND an unexpired lease_expires_at, which is what stops it
+        # from ever resurrecting (or producing) the owner-set/expiry-NULL
+        # shape.
+        where_clause = _where_clause(lease._HEARTBEAT_SQL)
+        assert "owner_harness_id = %s" in where_clause
+        assert "lease_expires_at >= now()" in where_clause
