@@ -350,11 +350,7 @@ class ProcessManager:
                 proc.terminate()
                 proc.join(timeout=5)
 
-            # Mark interrupted
-            record = self._state.get(issue_id)
-            if record and record.status == IssueStatus.IN_PROGRESS:
-                self._state.transition(issue_id, IssueStatus.INTERRUPTED)
-                self._state.save()
+            self._mark_interrupted(issue_id)
 
         self._workers.clear()
 
@@ -387,6 +383,21 @@ class ProcessManager:
             f"{self.rate_limit_remaining / 60:.1f} min (resuming ~{resume})"
         )
 
+    def _mark_interrupted(self, issue_id: str) -> None:
+        """Leave an aborted worker's issue in a status the poller can resurrect.
+
+        `poller` only re-queues a known issue from FAILED/COMPLETED/INTERRUPTED,
+        so a record left at IN_PROGRESS is stranded for good: relabelling it
+        ac-dev-ready does nothing, and `_release_stale_locks` only rewinds
+        GitHub labels, never the state store. Guarded on IN_PROGRESS so a worker
+        that reported a terminal status before the abort landed keeps it —
+        callers must drain the state queue first, which both do.
+        """
+        record = self._state.get(issue_id)
+        if record and record.status == IssueStatus.IN_PROGRESS:
+            self._state.transition(issue_id, IssueStatus.INTERRUPTED)
+            self._state.save()
+
     def _drain_and_reap_during_shutdown(self) -> None:
         """Drain queues and remove dead workers during shutdown."""
         self.drain_state_queue()
@@ -401,6 +412,11 @@ class ProcessManager:
             proc, _ = self._workers.pop(issue_id)
             self._color_assigner.release(issue_id)
             proc.join(timeout=5)
+            # A worker that obeys abort and exits inside the grace period is
+            # reaped here, which pops it before shutdown_all's force-terminate
+            # loop can see it. Without this the "mark interrupted" pass there
+            # ran over an empty dict and every clean Ctrl+C stranded its issue.
+            self._mark_interrupted(issue_id)
 
     def _post_budget_comment(self, record: IssueRecord) -> None:
         """Post a comment when budget was exceeded across max continuation runs."""
