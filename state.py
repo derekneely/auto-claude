@@ -11,6 +11,7 @@ import json
 import os
 import shutil
 import tempfile
+from collections.abc import Callable
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
@@ -123,10 +124,25 @@ def _record_from_dict(data: dict) -> IssueRecord:
 class StateStore:
     """JSON-backed flat-file store for IssueRecord objects."""
 
-    def __init__(self, state_file: Path) -> None:
+    def __init__(self, state_file: Path,
+                 on_change: Callable[[IssueRecord], None] | None = None) -> None:
         self._state_file = Path(state_file)
         self._records: dict[str, IssueRecord] = {}  # issue_id -> IssueRecord
+        self._on_change = on_change
         self._load()
+
+    def _notify(self, record: IssueRecord) -> None:
+        """Fire the on_change hook. Never lets it raise into the caller — a
+        state mutation failing because a database is unreachable is exactly
+        the coupling issues.json-as-cache is meant to avoid (docs/plans/
+        12-shared-state-in-postgres.md, design decision #6). DbSync itself
+        already swallows internally; this is the second line of defense."""
+        if self._on_change is None:
+            return
+        try:
+            self._on_change(record)
+        except Exception:
+            pass
 
     # ------------------------------------------------------------------
     # Internal I/O
@@ -189,6 +205,7 @@ class StateStore:
                 "Use update() to modify existing records."
             )
         self._records[record.issue_id] = record
+        self._notify(record)
 
     def get(self, issue_id: str) -> IssueRecord | None:
         """Return the IssueRecord for the given issue_id, or None if not found."""
@@ -212,6 +229,7 @@ class StateStore:
             setattr(record, key, value)
 
         record.updated_at = _now_iso()
+        self._notify(record)
 
     def transition(self, issue_id: str, new_status: str) -> None:
         """
@@ -239,6 +257,7 @@ class StateStore:
 
         record.status = new_status
         record.updated_at = _now_iso()
+        self._notify(record)
 
     def get_by_status(self, status: str) -> list[IssueRecord]:
         """Return all IssueRecords with the given status."""
