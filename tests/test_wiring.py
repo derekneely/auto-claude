@@ -18,6 +18,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import main  # noqa: E402
 import worker  # noqa: E402
+from db.schema import SchemaOutOfDate  # noqa: E402
 from github_client import GithubClientError  # noqa: E402
 
 
@@ -45,6 +46,7 @@ def _logger():
         info=lambda *_a, **_k: None,
         warn=lambda *_a, **_k: None,
         error=lambda *_a, **_k: None,
+        close=lambda *_a, **_k: None,
     )
 
 
@@ -323,6 +325,21 @@ class TestSpawnRouting:
         # The routing expression must key off record.mode, not action/status.
         assert worker.run_review_worker is not worker.run_dev_worker
         assert hasattr(process_manager, "run_review_worker")
+
+
+class TestSchemaGate:
+    def test_aborts_when_schema_is_out_of_date(self, monkeypatch):
+        monkeypatch.setattr(
+            main, "check_schema_current",
+            lambda _db: (_ for _ in ()).throw(SchemaOutOfDate("run: alembic upgrade head")),
+        )
+        with pytest.raises(SystemExit) as excinfo:
+            main._check_schema_gate(object(), _logger())
+        assert excinfo.value.code == 1
+
+    def test_does_nothing_when_schema_is_current(self, monkeypatch):
+        monkeypatch.setattr(main, "check_schema_current", lambda _db: None)
+        main._check_schema_gate(object(), _logger())  # must not raise
 
 
 class TestPrNumber:

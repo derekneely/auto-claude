@@ -11,6 +11,8 @@ from pathlib import Path
 
 import stages
 from config import load_config
+from db.pool import DbUnavailable
+from db.schema import SchemaOutOfDate, check_schema_current
 from ghauth import (
     TOKEN_ENV_VAR,
     load_dotenv,
@@ -90,6 +92,18 @@ def _abort(logger: MainLogger, message: str) -> None:
     logger.error(message)
     logger.close()
     sys.exit(1)
+
+
+def _check_schema_gate(db, logger: MainLogger) -> None:
+    """Refuse to start against a Postgres schema behind EXPECTED_REVISION.
+    The daemon never migrates itself — see db/schema.py and docs/plans/
+    12-shared-state-in-postgres.md, "Migrations"."""
+    try:
+        check_schema_current(db)
+    except SchemaOutOfDate as exc:
+        _abort(logger, str(exc))
+    except DbUnavailable as exc:
+        _abort(logger, f"Cannot reach Postgres to verify the schema: {exc}")
 
 
 def create_directories(config) -> None:
