@@ -149,6 +149,17 @@ The assignee wins on every count:
 `project`, `prBaseBranch`, `verify`, `test`, and `projectBoard` from it — it just
 carries no ownership field.
 
+**Scheduling is auto-claude's, not the loop's** (decided 2026-07-29). The file's
+`concurrency` key is parsed into `PipelineConfig` and **deliberately not
+honoured**: `field_admin` declares `"concurrency": 1`, but auto-claude is meant
+to work several issues at once, and the goal was to align on the *label
+taxonomy*, not to reproduce the loop's execution model. `[workers].max_parallel`
+in `config.toml` is the single authority on how many workers run at once, with
+the rate-limit pause in `ProcessManager.can_spawn` outranking free capacity.
+Same treatment as `worktreeBase`. `staleLockHours` and `defaultBranch` are
+likewise parsed and unused — `_release_stale_locks` rewinds every lock at
+startup rather than ageing them out.
+
 ### The handoff protocol
 
 **An issue enters auto-claude's queue when, and only when, both are true:**
@@ -539,9 +550,31 @@ wrapping both Node scripts. `log_event(TelemetryEvent(...), root)` emits
 `--actor auto-claude` (the discriminator against the loop's `loop-dev-agent`);
 called from the worker's three transition points as `picked_up` / `pr_opened` /
 `blocked`|`review_fail`. `sync_board(cwd, root, ...)` runs once per repo per
-poll tick from `main`, with **cwd set to that repo's checkout** —
-`project-sync.mjs` reads a literal relative `.claude/pipeline.json`, so the wrong
-cwd makes it silently no-op. 26 + 17 tests.
+poll tick from `main`. `project-sync.mjs` reads a literal relative
+`.claude/pipeline.json`, so cwd must be a directory holding that file — see the
+correction below for where that directory comes from. 26 + 17 tests.
+
+**Correction 2026-07-29 — board sync no longer uses the repo checkout.** cwd was
+originally `repos/<repo>`, which is wrong for a reason that took a live run to
+surface: that checkout is shared with the workers and sits on whatever branch one
+of them last left it on. `repos/field_admin` was cloned 2026-04-16 and sat on
+`main` until the first real worker ran; `.claude/pipeline.json` exists **only on
+`dev`** (`git merge-base --is-ancestor 4b6a322 main` → false). So every sync
+exited 1 with `pipeline.json not found` until the dev worker for #215
+incidentally ran `git checkout dev` — 16 seconds after the failed sync.
+
+`_sync_boards` now fetches the file from GitHub (base branch first, then the
+default branch — the same rule `ProcessManager.pipeline_for` follows and for the
+same reason) and writes it into a `tempfile.TemporaryDirectory`, which becomes
+cwd. cwd is the script's only filesystem dependency: every `gh` call it makes
+either passes `--repo`, which auto-claude always supplies, or is
+`gh api graphql`. Consequences: board sync no longer depends on checkout state,
+cannot race a worker mutating that checkout, and works for a repo that has never
+been cloned — so the `repo_root.is_dir()` skip is gone. Costs one API call per
+repo per tick; deliberately uncached so a `pipeline.json` edit is picked up
+without a restart. `TestSyncBoards` went 3 → 8 tests; the two that pinned
+"cwd is the local checkout" and "skip repos that are not cloned" encoded the bug
+and were removed.
 
 Both are unconditionally non-fatal: every exception, `FileNotFoundError` (no
 `node`), and timeout is swallowed. Verified 2026-07-28 that `log-event.mjs` with
