@@ -31,7 +31,7 @@ from pathlib import Path
 
 from alembic import context
 from sqlalchemy import create_engine, text
-from sqlalchemy.engine import make_url
+from sqlalchemy.engine import URL, make_url
 
 ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
@@ -62,7 +62,7 @@ def _database_url() -> str:
     return url
 
 
-def _engine_url(raw_url: str) -> str:
+def _engine_url(raw_url: str) -> URL:
     """Force the psycopg3 dialect for SQLAlchemy's engine.
 
     A bare `postgresql://` scheme resolves to the **psycopg2** dialect in
@@ -70,11 +70,21 @@ def _engine_url(raw_url: str) -> str:
     but requirements.txt pins psycopg 3 only — do not add psycopg2. `db/pool.py`
     is unaffected by this because it drives psycopg3 directly and needs no
     driver hint; only SQLAlchemy's URL-based dialect lookup does.
+
+    Returns a `URL` object, NOT a string. `URL.__str__`/`str(url)` deliberately
+    masks the password as `***` (it's meant for logging), so round-tripping
+    through `str()` here would hand `create_engine()` a URL whose password is
+    the literal text `***` - a real, previously-live bug: SQLAlchemy connected
+    with the correct username and a broken password while raw psycopg3
+    (db/pool.py, unaffected) worked fine against the same credential.
+    `create_engine()` accepts a `URL` object directly, so there is no need to
+    ever serialize this one - which also means no risk of a plaintext
+    credential ending up in a log line or traceback via this function.
     """
     url = make_url(raw_url)
     if url.drivername == "postgresql":
         url = url.set(drivername="postgresql+psycopg")
-    return str(url)
+    return url
 
 
 def run_migrations_online() -> None:
@@ -103,6 +113,15 @@ def run_migrations_offline() -> None:
     # revision 0001's own `CREATE SCHEMA IF NOT EXISTS auto_claude` runs, so
     # `auto_claude` must already exist for the emitted SQL to apply cleanly.
     # This is Alembic-internal ordering; the online path above is correct.
+    #
+    # Passes the raw url= string here, not _engine_url()'s URL object: offline
+    # mode never opens a DBAPI connection (it only uses the url to pick a SQL
+    # dialect for rendering), so the psycopg2-vs-psycopg3 driver distinction
+    # that _engine_url() exists to fix is a no-op here either way. Keeping
+    # this path on the plain string (rather than routing it through
+    # _engine_url() only to immediately need it stringified again, which is
+    # the exact str(URL) masking bug _engine_url() was written to avoid) is
+    # deliberate, not an inconsistency.
     context.configure(
         url=_database_url(),
         target_metadata=target_metadata,

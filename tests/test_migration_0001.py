@@ -9,12 +9,22 @@ auto_claude` has to run in migrations/env.py *before* `context.configure(...)`
 executes — not inside revision 0001, where it would be too late for
 `context.configure` itself.
 
-Also guards three bugs a controller-run live migration surfaced in review
-(structural checks only — still no real database, see module note above):
+Also guards bugs a controller-run live migration surfaced in review
+(structural checks only unless noted — still no real database, see module
+note above):
 
 1. A bare `postgresql://` URL resolves to the psycopg2 dialect in
    SQLAlchemy's dialect registry, but this project pins psycopg 3 only —
-   `create_engine()` needs the driver forced to `postgresql+psycopg`.
+   `create_engine()` needs the driver forced to `postgresql+psycopg`. The
+   first fix attempt did this by round-tripping through `str(url)`, which is
+   a real, previously-live bug: `URL.__str__` deliberately masks the
+   password as `***`, so `create_engine()` received a URL whose password was
+   the literal text `***` and authentication failed even though the real
+   credential was fine (confirmed independently via raw psycopg3, which
+   worked). `TestEngineUrlPreservesThePassword` below runs the *actual*
+   `_engine_url` function extracted from env.py against a fake URL with a
+   known password, so a regression back to `str(url)` fails this test
+   immediately instead of only failing a live migration.
 2. `downgrade()` must not `DROP SCHEMA auto_claude` outright: with
    `version_table_schema="auto_claude"`, Alembic deletes its own
    `alembic_version` row in that schema in the same transaction right after
@@ -29,12 +39,43 @@ Also guards three bugs a controller-run live migration surfaced in review
 
 from __future__ import annotations
 
+import ast
 import sys
 from pathlib import Path
+from typing import Callable
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from sqlalchemy.engine import URL, make_url  # noqa: E402
+
 ROOT = Path(__file__).resolve().parent.parent
+
+
+def _load_engine_url_function() -> Callable[[str], URL]:
+    """Extract and execute the real `_engine_url` function body out of
+    migrations/env.py, in isolation from the rest of that file.
+
+    env.py is a script, not an importable module: its top level loads .env
+    and, at the very bottom, dispatches into a real Alembic migration run
+    (`if context.is_offline_mode(): ... else: ...`), which errors or tries to
+    connect outside of an actual `alembic` invocation. Pulling just this one
+    function's AST out and exec'ing it runs the genuine production code - not
+    a reimplementation a fix could silently drift away from - without
+    triggering any of that.
+    """
+    source = (ROOT / "migrations" / "env.py").read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    func_node = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == "_engine_url"
+    )
+    module = ast.Module(body=[func_node], type_ignores=[])
+    ast.fix_missing_locations(module)
+    code = compile(module, filename=str(ROOT / "migrations" / "env.py"), mode="exec")
+    namespace: dict[str, object] = {"make_url": make_url, "URL": URL}
+    exec(code, namespace)  # noqa: S102 - extracting real prod code, not untrusted input
+    return namespace["_engine_url"]
 
 
 class TestEnvCreatesSchemaBeforeConfigure:
@@ -122,6 +163,56 @@ class TestEnvForcesThePsycopg3Dialect:
     def test_create_engine_uses_the_forced_url_not_the_raw_one(self):
         text = (ROOT / "migrations" / "env.py").read_text(encoding="utf-8")
         assert "create_engine(_engine_url(_database_url()))" in text
+
+
+class TestEngineUrlPreservesThePassword:
+    """Regression test for a real, previously-live authentication failure.
+
+    A first fix attempt implemented the psycopg3-driver rewrite as
+    `return str(url)`. `URL.__str__` deliberately renders the password as
+    `***`, so SQLAlchemy connected with the right username and a password of
+    literal `***`, while raw psycopg3 (db/pool.py) worked fine against the
+    same real credential. A text-only check of "drivername" ==
+    "postgresql+psycopg" would have passed on that broken version - only
+    running the real function against a URL with a known password catches
+    this class of bug. Uses a fake host/user/password - never the real
+    credential.
+    """
+
+    FAKE_URL = "postgresql://user.ref:SECRETPW@host:5432/postgres"
+
+    def test_password_survives_the_driver_rewrite(self):
+        engine_url = _load_engine_url_function()
+        result = engine_url(self.FAKE_URL)
+        assert result.password == "SECRETPW"
+
+    def test_drivername_is_rewritten_to_psycopg3(self):
+        engine_url = _load_engine_url_function()
+        result = engine_url(self.FAKE_URL)
+        assert result.drivername == "postgresql+psycopg"
+
+    def test_returns_a_url_object_not_a_masked_string(self):
+        # The bug class this guards: any code path that turns the URL into a
+        # string before create_engine() sees it risks the `***` masking,
+        # because str(URL) is meant for safe logging, not for reconnecting.
+        engine_url = _load_engine_url_function()
+        result = engine_url(self.FAKE_URL)
+        assert isinstance(result, URL)
+
+    def test_other_url_fields_are_untouched(self):
+        engine_url = _load_engine_url_function()
+        result = engine_url(self.FAKE_URL)
+        assert result.username == "user.ref"
+        assert result.host == "host"
+        assert result.port == 5432
+        assert result.database == "postgres"
+
+    def test_an_already_driver_qualified_url_is_left_alone(self):
+        engine_url = _load_engine_url_function()
+        already_qualified = "postgresql+psycopg://user.ref:SECRETPW@host:5432/postgres"
+        result = engine_url(already_qualified)
+        assert result.drivername == "postgresql+psycopg"
+        assert result.password == "SECRETPW"
 
 
 class TestEnvLoadsTheGitignoredDotenv:
