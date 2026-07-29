@@ -1,6 +1,7 @@
 """auto-claude — monitors GitHub issues and spawns Claude workers to solve them."""
 
 import argparse
+import dataclasses
 import multiprocessing
 import os
 import signal
@@ -10,9 +11,14 @@ import time
 from pathlib import Path
 
 import stages
+import version
 from config import load_config
-from db.pool import DbUnavailable
+from db import harness as db_harness
+from db import issue_state as db_issue_state
+from db.harness import new_harness
+from db.pool import Database, DbUnavailable
 from db.schema import SchemaOutOfDate, check_schema_current
+from dbsync import DbSync
 from ghauth import (
     TOKEN_ENV_VAR,
     load_dotenv,
@@ -29,6 +35,7 @@ from logger import MainLogger, enable_ansi_windows
 from pipeline import PIPELINE_JSON_RELATIVE_PATH
 from poller import Poller
 from process_manager import ProcessManager
+from reconcile import reconcile
 from state import IssueStatus, StateStore
 from triage import TriageEngine, format_clarifying_comment
 
@@ -104,6 +111,131 @@ def _check_schema_gate(db, logger: MainLogger) -> None:
         _abort(logger, str(exc))
     except DbUnavailable as exc:
         _abort(logger, f"Cannot reach Postgres to verify the schema: {exc}")
+
+
+def _register_harness(db, harness, logger: MainLogger) -> None:
+    """Best-effort harness registration. A registration that cannot reach
+    Postgres is logged and dropped, not journaled — db/journal.py does not
+    exist until Task 20, and the harness attempts registration again on the
+    next restart regardless. Task 21 revisits this once a real Journal
+    exists."""
+    if db is None:
+        return
+    try:
+        db_harness.register(db, harness)
+    except DbUnavailable as exc:
+        logger.warn(f"Postgres unreachable while registering the harness: {exc}")
+
+
+def _init_db_layer(config, logger: MainLogger):
+    """Construct the Postgres-backed layer main() writes through, or a fully
+    degraded stand-in when it is disabled/unreachable. Returns
+    (db, harness, dbsync) — db is None in degraded mode; harness and dbsync
+    always exist so callers never branch on "did this construct".
+
+    Startup is deliberately stricter than runtime (ruling, 2026-07-29): a
+    harness that cannot confirm it reaches a current-schema Postgres could
+    double-claim an issue another box already holds a lease on, so both an
+    unreachable Postgres and a stale/missing schema abort the daemon here via
+    `_check_schema_gate` -> `_abort`. Only "database not configured at all"
+    (disabled, or no URL) is exempt — that is single-harness mode, which
+    never takes a lease to begin with, and runs exactly as the daemon does
+    today. This is the opposite of runtime behaviour, where a database
+    problem must never abort a running agent.
+    """
+    harness = new_harness(version.__version__)
+
+    db = None
+    url = config.database.url() if config.database.enabled else None
+    if url:
+        db = Database(url, connect_timeout=config.database.connect_timeout_seconds)
+        _check_schema_gate(db, logger)
+        _register_harness(db, harness, logger)
+    else:
+        logger.info(
+            "Database sync disabled or PIPELINE_METRICS_DATABASE_URL unset — "
+            "running on local state only"
+        )
+
+    dbsync = DbSync(db, harness, logger, ttl_seconds=config.database.lease_ttl_seconds)
+    return db, harness, dbsync
+
+
+def _collect_gh_issues_for_reconcile(config, github, logger: MainLogger) -> dict:
+    """The `gh_issues` shape reconcile.reconcile() expects — see reconcile.py.
+    A repo that cannot be read is skipped, not fatal; a poll a few seconds
+    later behaves the same way already."""
+    gh_issues: dict[str, dict] = {}
+    for repo in config.github.repos:
+        try:
+            issues = github.list_issues(repo, assignee=config.github.bot_login)
+        except GithubClientError as exc:
+            logger.warn(f"Could not read {repo} for reconciliation: {exc}")
+            continue
+        for issue in issues:
+            label_names = [lbl["name"] for lbl in issue.get("labels", [])]
+            issue_id = f"{repo}#{issue['number']}"
+            gh_issues[issue_id] = {
+                "stage": stages.stage_of(label_names),
+                "repo": repo,
+                "number": issue["number"],
+                "title": issue["title"],
+                "body": issue.get("body", "") or "",
+                "labels": label_names,
+                "action": stages.kind_of(label_names),
+                "issue_updated_at": issue.get("updated_at", ""),
+                "discovered_at": issue.get("created_at", ""),
+            }
+    return gh_issues
+
+
+def _reconcile_at_startup(config, github, state, db, harness, dbsync, logger: MainLogger):
+    """Rebuild `state` from GitHub + Postgres before the poll loop starts.
+    See reconcile.py and docs/plans/12-shared-state-in-postgres.md, "Startup
+    reconciliation". db=None (disabled or unreachable) reconciles against an
+    empty db_rows dict — identical to a genuinely empty database on the very
+    first run, which the design already treats as the normal case.
+
+    Expired leases are released in Postgres FIRST, before `db_rows` is
+    fetched: `dbsync.release_expired()` issues the actual `UPDATE` that
+    clears them (db/lease.py, Task 12), so by the time `db_rows` is read
+    below those rows already show a free lease, and `reconcile()`'s own
+    db_rows-derived `leases_released` can no longer tell "just freed" apart
+    from "never held". The ids `release_expired()` actually returned are
+    substituted into the report afterwards, which is what keeps
+    `ReconcileReport.leases_released` true rather than merely informational.
+    `release_expired` does not exist on `dbsync` until Task 13 wires
+    db/lease.py into it — `getattr(..., None)` makes the call a no-op until
+    then, and DbSync.release_expired is itself a no-op whenever Postgres is
+    disabled or unreachable (it fails closed and returns `[]`), so this
+    call is safe in every configuration.
+    """
+    release_expired = getattr(dbsync, "release_expired", None)
+    released = release_expired() if release_expired is not None else []
+
+    gh_issues = _collect_gh_issues_for_reconcile(config, github, logger)
+
+    db_rows: dict = {}
+    if db is not None:
+        try:
+            db_rows = db_issue_state.fetch_all(db)
+        except DbUnavailable as exc:
+            logger.warn(f"Could not fetch issue_state for reconciliation: {exc}")
+
+    report = reconcile(state=state, db_rows=db_rows, gh_issues=gh_issues,
+                        harness_id=harness.id, logger=logger)
+    if released:
+        report = dataclasses.replace(report, leases_released=released)
+    return report
+
+
+def _make_on_change(dbsync):
+    """Bridges StateStore's single-record hook to DbSync.upsert_issue, which
+    additionally wants the GitHub stage label — not part of IssueRecord
+    itself, but derivable from record.labels via stages.stage_of."""
+    def _handler(record) -> None:
+        dbsync.upsert_issue(record, stages.stage_of(record.labels))
+    return _handler
 
 
 def create_directories(config) -> None:
@@ -494,8 +626,13 @@ def main() -> None:
         signal.signal(signal.SIGBREAK, handle_signal)
 
     # Initialize core components
-    state = StateStore(config.paths.state_file)
     github = GithubClient(config.github.org)
+
+    db, harness, dbsync = _init_db_layer(config, logger)
+
+    state = StateStore(config.paths.state_file, on_change=_make_on_change(dbsync))
+    _reconcile_at_startup(config, github, state, db, harness, dbsync, logger)
+
     poller = Poller(config, github, state, logger)
     triage_engine = TriageEngine(config, github)
 
