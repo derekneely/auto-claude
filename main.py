@@ -386,22 +386,28 @@ def _lease_is_free(db, issue_id: str, logger: MainLogger) -> bool:
 
 
 def _warn_stale_lock_hours(config, github, repo: str, logger: MainLogger) -> None:
-    """Log if a repo's `staleLockHours` promises a shorter window than the
-    real Postgres lease TTL can deliver.
+    """Log if a repo's `staleLockHours` disagrees with the real Postgres
+    lease TTL, in either direction.
 
     `staleLockHours` (`pipeline.json`, parsed at `pipeline.py:76,157`) used
     to be auto-claude's only staleness signal and was never read. Now
     `lease_expires_at` (`config.database.lease_ttl_seconds`, Task 11 —
     global to the harness, the same for every repo; `DbSync.acquire_lease`'s
     frozen signature takes no per-repo override) is what actually determines
-    staleness. A repo whose `staleLockHours` claims a *shorter* window than
-    the harness's configured TTL is promising something the lease system
-    cannot keep: a legitimate, still-running worker can look "stuck" to a
-    human reading pipeline.json for up to the difference. This changes no
-    behaviour - it is a diagnostic only - which is deliberate: it makes the
-    field read and acted upon rather than silently discarded, without
-    inventing per-repo TTL plumbing the frozen `DbSync` surface does not
-    support. Compares against `config.database.lease_ttl_seconds`, not the
+    staleness. Any disagreement between the two is worth surfacing, not just
+    a `staleLockHours` that claims a *shorter* window than the TTL: the
+    disagreement that actually exists under stock configuration is the
+    opposite one — `pipeline.json`'s 2-hour default advertises a far longer
+    stale window than a 1800s (30-minute) TTL actually enforces, which is
+    exactly the "two sources of truth for when a lease expires" this
+    diagnostic exists to surface. A shorter `staleLockHours` makes a live
+    worker look stuck to a human for up to the difference; a longer one
+    means a lock is already free for up to the difference while
+    pipeline.json still calls it in-progress. This changes no behaviour - it
+    is a diagnostic only - which is deliberate: it makes the field read and
+    acted upon rather than silently discarded, without inventing per-repo
+    TTL plumbing the frozen `DbSync` surface does not support. Compares
+    against `config.database.lease_ttl_seconds`, not the
     `db.lease.LEASE_TTL_SECONDS` module default, since Task 13 lets an
     operator override that default — this diagnostic must reflect whatever
     is actually running, not the fallback.
@@ -416,14 +422,29 @@ def _warn_stale_lock_hours(config, github, repo: str, logger: MainLogger) -> Non
 
     ttl_seconds = config.database.lease_ttl_seconds
     configured_seconds = pipeline.stale_lock_hours * 3600
+    if configured_seconds == ttl_seconds:
+        return
+
     if configured_seconds < ttl_seconds:
-        short_by_minutes = (ttl_seconds - configured_seconds) / 60
-        logger.warn(
-            f"{repo}: staleLockHours={pipeline.stale_lock_hours}h "
-            f"({configured_seconds:.0f}s) is shorter than the harness lease "
-            f"TTL ({ttl_seconds}s) — a legitimate in-progress "
-            f"run may appear stuck for up to {short_by_minutes:.0f} more minute(s)"
+        direction = "shorter than"
+        diff_minutes = (ttl_seconds - configured_seconds) / 60
+        consequence = (
+            f"a legitimate in-progress run may appear stuck for up to "
+            f"{diff_minutes:.0f} more minute(s)"
         )
+    else:
+        direction = "longer than"
+        diff_minutes = (configured_seconds - ttl_seconds) / 60
+        consequence = (
+            f"a lock may already be free for up to {diff_minutes:.0f} "
+            f"minute(s) while pipeline.json still calls it in-progress"
+        )
+
+    logger.warn(
+        f"{repo}: staleLockHours={pipeline.stale_lock_hours}h "
+        f"({configured_seconds:.0f}s) is {direction} the harness lease "
+        f"TTL ({ttl_seconds}s) — {consequence}"
+    )
 
 
 def _maybe_heartbeat(dbsync, last_at: float, interval: float, logger: MainLogger,

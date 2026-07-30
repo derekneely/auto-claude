@@ -23,9 +23,14 @@ from github_client import GithubClientError  # noqa: E402
 
 
 class FakeGithub:
-    def __init__(self, issues=None, fail=False):
+    def __init__(self, issues=None, fail=False, files=None):
         self._issues = issues or {}
         self._fail = fail
+        # repo -> pipeline.json text. Missing key means "no file on any
+        # ref", matching GithubClient.get_file's real return of None -
+        # the common case for every existing caller of this fake that
+        # never passes `files`.
+        self._files = files or {}
         self.added: list[tuple[str, int, str]] = []
         self.removed: list[tuple[str, int, str]] = []
 
@@ -40,6 +45,9 @@ class FakeGithub:
     def remove_label(self, repo, number, label):
         self.removed.append((repo, number, label))
 
+    def get_file(self, repo, path, ref=None):
+        return self._files.get(repo)
+
 
 def _logger():
     return SimpleNamespace(
@@ -50,8 +58,22 @@ def _logger():
     )
 
 
+def _warn_recording_logger():
+    """A logger stand-in that records every `.warn(...)` message verbatim,
+    for tests that need to assert on the message content rather than just
+    that *something* happened."""
+    warnings: list[str] = []
+    logger = SimpleNamespace(
+        info=lambda *_a, **_k: None,
+        warn=lambda msg, *_a, **_k: warnings.append(msg),
+        error=lambda *_a, **_k: None,
+        close=lambda *_a, **_k: None,
+    )
+    return logger, warnings
+
+
 def _config(repos=("field_admin",), tools_root=None, repos_dir=Path("/nope"),
-            base_branch="dev"):
+            base_branch="dev", lease_ttl_seconds=1800):
     return SimpleNamespace(
         github=SimpleNamespace(
             org="Accelevation", repos=list(repos), bot_login="accelevation-bot",
@@ -59,6 +81,7 @@ def _config(repos=("field_admin",), tools_root=None, repos_dir=Path("/nope"),
         ),
         integrations=SimpleNamespace(claude_tools_root=tools_root),
         paths=SimpleNamespace(repos_dir=repos_dir),
+        database=SimpleNamespace(lease_ttl_seconds=lease_ttl_seconds),
     )
 
 
@@ -249,6 +272,69 @@ class TestReleaseStaleLocksWithLease:
         # db is None by default - the degraded/no-Postgres path, unchanged.
         gh = FakeGithub({"field_admin": [_issue(7, ["ac-in-progress"])]})
         assert main._release_stale_locks(_config(), gh, _logger()) == 1
+
+
+class TestWarnStaleLockHours:
+    """Direct coverage for the staleLockHours-vs-lease-TTL diagnostic.
+
+    Regression guard for a Task 15 review finding: this helper shipped with
+    zero direct test coverage. It only ran inside
+    TestReleaseStaleLocksWithLease's fakes, which lacked both `get_file` on
+    FakeGithub and `config.database` - so every invocation there raised
+    AttributeError, silently swallowed by `_pipeline_json_text`'s broad
+    `except Exception`, before a single line of this function's real logic
+    ran. "653 passed" said nothing about whether this ever fires correctly.
+    """
+
+    def test_fires_when_stale_lock_hours_is_shorter_than_the_ttl(self):
+        logger, warnings = _warn_recording_logger()
+        gh = FakeGithub(files={
+            "field_admin": '{"project": "field_admin", "staleLockHours": 0.1}',
+        })
+
+        main._warn_stale_lock_hours(_config(lease_ttl_seconds=1800), gh, "field_admin", logger)
+
+        assert len(warnings) == 1
+        assert "shorter than" in warnings[0]
+        assert "field_admin" in warnings[0]
+
+    def test_fires_when_stale_lock_hours_is_longer_than_the_ttl(self):
+        # The disagreement that actually exists under stock config today:
+        # pipeline.json's 2h default vastly outlasts a 1800s (30 min) TTL.
+        logger, warnings = _warn_recording_logger()
+        gh = FakeGithub(files={"field_admin": '{"project": "field_admin"}'})
+
+        main._warn_stale_lock_hours(_config(lease_ttl_seconds=1800), gh, "field_admin", logger)
+
+        assert len(warnings) == 1
+        assert "longer than" in warnings[0]
+
+    def test_does_not_fire_when_they_agree(self):
+        logger, warnings = _warn_recording_logger()
+        # 0.5h * 3600 == 1800s == the configured TTL exactly.
+        gh = FakeGithub(files={
+            "field_admin": '{"project": "field_admin", "staleLockHours": 0.5}',
+        })
+
+        main._warn_stale_lock_hours(_config(lease_ttl_seconds=1800), gh, "field_admin", logger)
+
+        assert warnings == []
+
+    def test_silent_on_unparseable_pipeline_json(self):
+        logger, warnings = _warn_recording_logger()
+        gh = FakeGithub(files={"field_admin": "not json"})
+
+        main._warn_stale_lock_hours(_config(), gh, "field_admin", logger)
+
+        assert warnings == []
+
+    def test_silent_when_no_pipeline_json_exists_on_any_branch(self):
+        logger, warnings = _warn_recording_logger()
+        gh = FakeGithub()  # no files registered at all
+
+        main._warn_stale_lock_hours(_config(), gh, "field_admin", logger)
+
+        assert warnings == []
 
 
 class TestSyncBoards:
