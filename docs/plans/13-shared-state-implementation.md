@@ -8117,10 +8117,16 @@ no-op in both cases):
 
 ```python
             last_heartbeat = _maybe_heartbeat(
-                dbsync, last_heartbeat, config.database.heartbeat_interval_seconds
+                dbsync, last_heartbeat, config.database.heartbeat_interval_seconds, logger
             )
             dbsync.replay_pending()
 ```
+
+(The trailing `logger` argument is not a typo and is not optional: Task 13's
+fix round added it as a required 4th positional parameter so `_maybe_heartbeat`
+can warn when Postgres is unreachable instead of letting `DbUnavailable` kill
+the poll loop. Match the live signature in `main.py`, not any earlier draft of
+this document.)
 
 (applies to both the top-of-loop call site and the per-second sleep-loop call
 site Task 13 added.)
