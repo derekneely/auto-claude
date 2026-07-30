@@ -26,6 +26,7 @@ from db import issue_state
 from db import lease
 from db.harness import Harness
 from db.pool import Database, DbUnavailable
+from redact import redact
 from state import IssueRecord
 
 if TYPE_CHECKING:
@@ -100,7 +101,20 @@ class DbSync:
         summary_id = history.new_id()
         payload = dict(
             summary_id=summary_id, issue_id=issue_id, run_id=run_id,
-            kind=kind, body=body, comment_url=comment_url,
+            # Redacted HERE rather than trusting each caller, because Postgres
+            # is a second destination this content escapes to and the callers
+            # do not agree about it. `worker._post_pr_review` redacts only its
+            # `--body` argument, so GitHub got the scrubbed copy while the
+            # caller kept the raw `request_body` for its summary row — and on
+            # the request-changes path that body carries `checks_transcript`,
+            # raw verify/test output, which is exactly where a leaked env var
+            # surfaces. The other five kinds arrive already redacted (see
+            # `_issue_report`, `_post_crash_comment`, `_post_budget_comment`,
+            # `triage.format_clarifying_comment`); `redact` is idempotent, so
+            # scrubbing them again is a no-op. Doing it at this single seam
+            # makes the property structural: a future summary kind cannot
+            # forget.
+            kind=kind, body=redact(body), comment_url=comment_url,
         )
         self._durable(
             "history.add_summary", payload, lambda: history.add_summary(self._db, **payload)

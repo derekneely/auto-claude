@@ -282,6 +282,57 @@ class TestAddSummary:
         assert db.calls
 
 
+class TestSummaryBodiesAreRedactedAtThisSeam:
+    """Postgres is a second destination summary text escapes to, and the six
+    callers do not agree about scrubbing it.
+
+    The real gap this guards: `worker._post_pr_review` passes `redact(body)`
+    as its `--body` argument but hands the caller back nothing, so the
+    request-changes path appends the RAW `request_body` to
+    `pending_summaries` — and that body carries `checks_transcript`, raw
+    verify/test output, which is exactly where a leaked env var surfaces. The
+    scrubbed copy went to GitHub while the unscrubbed one went to Postgres.
+    Redacting here rather than in each caller makes it structural: a future
+    summary kind cannot forget.
+    """
+
+    def _body_written(self, db):
+        # FakeDatabase records (sql, params); the body is whichever param
+        # carries the marker text, so this does not depend on column order.
+        return "\n".join(str(p) for _sql, params in db.calls for p in params)
+
+    def test_a_secret_in_raw_review_feedback_never_reaches_postgres(self):
+        db = FakeDatabase()
+        sync = DbSync(db, HARNESS, FakeLogger(), journal=_unused_journal())
+        sync.add_summary(
+            issue_id="repo#1", run_id="r1", kind="review",
+            body="Verify/test checks failed:\nAUTH_SECRET=hunter2supersecret\n",
+        )
+        written = self._body_written(db)
+        assert "hunter2supersecret" not in written
+        assert "[REDACTED]" in written
+
+    def test_a_github_token_in_a_transcript_never_reaches_postgres(self):
+        db = FakeDatabase()
+        sync = DbSync(db, HARNESS, FakeLogger(), journal=_unused_journal())
+        sync.add_summary(
+            issue_id="repo#1", run_id="r1", kind="review",
+            body="the call used ghp_" + "A" * 36 + " and failed",
+        )
+        written = self._body_written(db)
+        assert "ghp_" + "A" * 36 not in written
+        assert "[REDACTED]" in written
+
+    def test_already_redacted_bodies_are_unchanged_because_redact_is_idempotent(self):
+        # dev/crash/budget/triage arrive already scrubbed; double-scrubbing
+        # them must not mangle the text a human will read.
+        db = FakeDatabase()
+        sync = DbSync(db, HARNESS, FakeLogger(), journal=_unused_journal())
+        clean = "### Summary\n\nImplemented the thing. No secrets here."
+        sync.add_summary(issue_id="repo#1", run_id="r1", kind="dev", body=clean)
+        assert clean in self._body_written(db)
+
+
 class TestDurableWritesNowJournalInsteadOfBeingDropped:
     """The Task 8 -> Task 21 upgrade: every durable write already routed
     through `_durable`; its DbUnavailable failure branch changes here, from
