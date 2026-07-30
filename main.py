@@ -15,6 +15,7 @@ import version
 from config import load_config
 from db import harness as db_harness
 from db import issue_state as db_issue_state
+from db import lease as db_lease
 from db.harness import new_harness
 from db.pool import Database, DbUnavailable
 from db.schema import SchemaOutOfDate, check_schema_current
@@ -32,7 +33,7 @@ from ghauth import (
 from github_client import GithubClient, GithubClientError
 from integrations import METRICS_DB_ENV_VAR, sync_board
 from logger import MainLogger, enable_ansi_windows
-from pipeline import PIPELINE_JSON_RELATIVE_PATH
+from pipeline import PIPELINE_JSON_RELATIVE_PATH, PipelineConfigError, parse_pipeline_config
 from poller import Poller
 from process_manager import ProcessManager
 from reconcile import reconcile
@@ -277,17 +278,52 @@ def _ensure_labels(config, github: GithubClient, logger: MainLogger) -> None:
 
 
 def _release_stale_locks(config, github: GithubClient, logger: MainLogger,
-                         dry_run: bool = False) -> int:
+                         dry_run: bool = False, db=None) -> int:
     """Rewind locks left behind by a crashed or killed run.
 
-    At startup no worker of ours is alive, so any bot-assigned issue still
-    carrying `ac-in-progress` is stale by definition — no timeout needed. This
-    matters because the sibling toolchain's stale-lock sweep only covers issues
-    assigned to the human running it; nothing else will ever free ours, and a
-    stuck lock is invisible (the issue simply stops being picked up).
+    Expiry-driven, not startup-driven: this can no longer assume no worker
+    of ours is alive elsewhere - a second harness may hold a perfectly live
+    lease on an issue this box also sees carrying `ac-in-progress`. A label
+    is only rewound once its Postgres lease is confirmed free or expired
+    (see docs/plans/12-shared-state-in-postgres.md, "The blocker this
+    removes").
+
+    `db` is the raw Postgres handle (`db.pool.Database`), not `DbSync` -
+    this is a one-time startup sweep across every repo's issues, not a
+    per-issue write on the worker hot path, so it goes straight at
+    `db.lease`/`db.issue_state` rather than through the single-writer seam
+    those modules exist to protect.
+
+    Degraded path: `db is None` means Postgres is disabled, or was
+    unreachable when `main` tried to construct it - in which case there
+    cannot be a second harness (no shared database to coordinate through)
+    and every bot-assigned locked issue is stale by definition, exactly as
+    before this task. If Postgres *is* configured but `release_expired`
+    fails right here (a transient outage), this fails CLOSED instead of
+    falling back to that assumption: nothing is rewound for the rest of
+    this call, because a configured-but-currently-unreachable database
+    might still have a live second harness we simply cannot see, and
+    rewinding blind is the exact bug this function exists to prevent.
     """
+    lease_verified = db is not None
+    if lease_verified:
+        try:
+            freed = db_lease.release_expired(db)
+            if freed:
+                logger.info(f"Postgres: {len(freed)} expired lease(s) released")
+        except DbUnavailable as exc:
+            logger.warn(
+                f"Postgres unreachable at startup — cannot verify which "
+                f"locks are genuinely stale, so none will be rewound this "
+                f"run: {exc}"
+            )
+            lease_verified = False
+
     released = 0
     for repo in config.github.repos:
+        if lease_verified:
+            _warn_stale_lock_hours(config, github, repo, logger)
+
         try:
             issues = github.list_issues(repo, assignee=config.github.bot_login)
         except GithubClientError as exc:
@@ -301,6 +337,16 @@ def _release_stale_locks(config, github: GithubClient, logger: MainLogger,
                 continue
 
             issue_id = f"{repo}#{issue['number']}"
+
+            if db is None:
+                pass  # degraded path: no shared database, no second harness
+            elif not lease_verified:
+                logger.info(f"{issue_id}: cannot verify lease — leaving it")
+                continue
+            elif not _lease_is_free(db, issue_id, logger):
+                logger.info(f"{issue_id}: lease still held by another harness — leaving it")
+                continue
+
             if dry_run:
                 logger.info(f"DRY-RUN: would release stale lock on {issue_id} -> {target}")
                 released += 1
@@ -320,6 +366,64 @@ def _release_stale_locks(config, github: GithubClient, logger: MainLogger,
             released += 1
 
     return released
+
+
+def _lease_is_free(db, issue_id: str, logger: MainLogger) -> bool:
+    """True if `issue_id` has no live Postgres lease.
+
+    Fails closed: an unreachable database counts as "cannot verify", which
+    this reports as *not* free so the caller leaves the label alone rather
+    than guessing - one transient fetch failure should not blind the whole
+    sweep the way a `release_expired` failure does, so this degrades
+    per-issue instead of aborting the loop.
+    """
+    try:
+        row = db_issue_state.fetch(db, issue_id)
+    except DbUnavailable as exc:
+        logger.warn(f"Could not verify lease for {issue_id}: {exc}")
+        return False
+    return row is None or row.get("owner_harness_id") is None
+
+
+def _warn_stale_lock_hours(config, github, repo: str, logger: MainLogger) -> None:
+    """Log if a repo's `staleLockHours` promises a shorter window than the
+    real Postgres lease TTL can deliver.
+
+    `staleLockHours` (`pipeline.json`, parsed at `pipeline.py:76,157`) used
+    to be auto-claude's only staleness signal and was never read. Now
+    `lease_expires_at` (`config.database.lease_ttl_seconds`, Task 11 —
+    global to the harness, the same for every repo; `DbSync.acquire_lease`'s
+    frozen signature takes no per-repo override) is what actually determines
+    staleness. A repo whose `staleLockHours` claims a *shorter* window than
+    the harness's configured TTL is promising something the lease system
+    cannot keep: a legitimate, still-running worker can look "stuck" to a
+    human reading pipeline.json for up to the difference. This changes no
+    behaviour - it is a diagnostic only - which is deliberate: it makes the
+    field read and acted upon rather than silently discarded, without
+    inventing per-repo TTL plumbing the frozen `DbSync` surface does not
+    support. Compares against `config.database.lease_ttl_seconds`, not the
+    `db.lease.LEASE_TTL_SECONDS` module default, since Task 13 lets an
+    operator override that default — this diagnostic must reflect whatever
+    is actually running, not the fallback.
+    """
+    text = _pipeline_json_text(config, github, repo, logger)
+    if text is None:
+        return
+    try:
+        pipeline = parse_pipeline_config(text, source=f"{repo}/{PIPELINE_JSON_RELATIVE_PATH}")
+    except PipelineConfigError:
+        return  # already surfaced elsewhere; not this function's job to repeat it
+
+    ttl_seconds = config.database.lease_ttl_seconds
+    configured_seconds = pipeline.stale_lock_hours * 3600
+    if configured_seconds < ttl_seconds:
+        short_by_minutes = (ttl_seconds - configured_seconds) / 60
+        logger.warn(
+            f"{repo}: staleLockHours={pipeline.stale_lock_hours}h "
+            f"({configured_seconds:.0f}s) is shorter than the harness lease "
+            f"TTL ({ttl_seconds}s) — a legitimate in-progress "
+            f"run may appear stuck for up to {short_by_minutes:.0f} more minute(s)"
+        )
 
 
 def _maybe_heartbeat(dbsync, last_at: float, interval: float, logger: MainLogger,
@@ -707,7 +811,7 @@ def main() -> None:
 
     # Recover from a previous crash before polling, so a stuck lock does not
     # silently remove an issue from circulation.
-    released = _release_stale_locks(config, github, logger, dry_run=args.dry_run)
+    released = _release_stale_locks(config, github, logger, dry_run=args.dry_run, db=db)
     if not released:
         logger.info("No stale locks to release")
 

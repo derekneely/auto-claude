@@ -151,6 +151,106 @@ class TestReleaseStaleLocks:
         assert seen["assignee"] == "accelevation-bot"
 
 
+class _FakeDbUnavailable(Exception):
+    """Stand-in for db.pool.DbUnavailable that does not require importing
+    the real db package into this test file."""
+
+
+class FakeLeaseDb:
+    """Stands in for a real db.pool.Database, driven entirely through
+    main.db_lease / main.db_issue_state monkeypatches below - this class
+    itself is never called by _release_stale_locks directly, it just needs
+    to be a non-None sentinel."""
+
+
+def _patch_lease(monkeypatch, *, rows=None, release_expired_raises=False,
+                  fetch_raises_for=()):
+    """Monkeypatch main.db_lease.release_expired and main.db_issue_state.fetch.
+
+    `rows`: issue_id -> {"owner_harness_id": str | None}. Missing issue_id
+    means fetch() returns None (no Postgres row at all - e.g. a pre-Postgres
+    holdover), which must be treated as free.
+    """
+    rows = rows or {}
+
+    def fake_release_expired(db):
+        if release_expired_raises:
+            raise _FakeDbUnavailable("release_expired: db down")
+        return []
+
+    def fake_fetch(db, issue_id):
+        if issue_id in fetch_raises_for:
+            raise _FakeDbUnavailable(f"fetch({issue_id}): db down")
+        return rows.get(issue_id)
+
+    monkeypatch.setattr(main.db_lease, "release_expired", fake_release_expired)
+    monkeypatch.setattr(main.db_issue_state, "fetch", fake_fetch)
+    monkeypatch.setattr(main, "DbUnavailable", _FakeDbUnavailable)
+
+
+class TestReleaseStaleLocksWithLease:
+    def test_rewinds_a_lock_whose_lease_is_free(self, monkeypatch):
+        _patch_lease(monkeypatch, rows={"field_admin#7": {"owner_harness_id": None}})
+        gh = FakeGithub({"field_admin": [_issue(7, ["ac-in-progress", "ac-fix"])]})
+
+        n = main._release_stale_locks(_config(), gh, _logger(), db=FakeLeaseDb())
+
+        assert n == 1
+        assert ("field_admin", 7, "ac-dev-ready") in gh.added
+        assert ("field_admin", 7, "ac-in-progress") in gh.removed
+
+    def test_leaves_a_lock_whose_lease_is_held_by_another_harness(self, monkeypatch):
+        _patch_lease(monkeypatch, rows={
+            "field_admin#7": {"owner_harness_id": "some-other-harness"},
+        })
+        gh = FakeGithub({"field_admin": [_issue(7, ["ac-in-progress", "ac-fix"])]})
+
+        n = main._release_stale_locks(_config(), gh, _logger(), db=FakeLeaseDb())
+
+        assert n == 0
+        assert not gh.added and not gh.removed
+
+    def test_treats_a_missing_postgres_row_as_free(self, monkeypatch):
+        # A pre-Postgres holdover, or a row this harness never got to upsert.
+        _patch_lease(monkeypatch, rows={})
+        gh = FakeGithub({"field_admin": [_issue(7, ["ac-in-progress"])]})
+
+        n = main._release_stale_locks(_config(), gh, _logger(), db=FakeLeaseDb())
+
+        assert n == 1
+
+    def test_release_expired_failing_at_startup_rewinds_nothing(self, monkeypatch):
+        # Fails closed: cannot verify safety, so touch nothing this run,
+        # rather than falling back to "assume everything is stale".
+        _patch_lease(monkeypatch, release_expired_raises=True,
+                      rows={"field_admin#7": {"owner_harness_id": None}})
+        gh = FakeGithub({"field_admin": [_issue(7, ["ac-in-progress"])]})
+
+        n = main._release_stale_locks(_config(), gh, _logger(), db=FakeLeaseDb())
+
+        assert n == 0
+        assert not gh.added and not gh.removed
+
+    def test_a_fetch_failure_mid_sweep_leaves_that_one_issue_alone(self, monkeypatch):
+        _patch_lease(monkeypatch, fetch_raises_for={"field_admin#7"},
+                      rows={"field_admin#8": {"owner_harness_id": None}})
+        gh = FakeGithub({"field_admin": [
+            _issue(7, ["ac-in-progress"]),
+            _issue(8, ["ac-in-progress"]),
+        ]})
+
+        n = main._release_stale_locks(_config(), gh, _logger(), db=FakeLeaseDb())
+
+        assert n == 1
+        assert ("field_admin", 8, "ac-dev-ready") in gh.added
+        assert not any(num == 7 for _r, num, _l in gh.added)
+
+    def test_no_db_argument_still_behaves_like_before(self):
+        # db is None by default - the degraded/no-Postgres path, unchanged.
+        gh = FakeGithub({"field_admin": [_issue(7, ["ac-in-progress"])]})
+        assert main._release_stale_locks(_config(), gh, _logger()) == 1
+
+
 class TestSyncBoards:
     def test_noop_without_a_configured_toolchain(self, monkeypatch):
         called = []
