@@ -207,9 +207,19 @@ def _reconcile_at_startup(config, github, state, db, harness, dbsync, logger: Ma
     `release_expired` now exists on every real `DbSync` (Task 13 wired
     db/lease.py into it); the `getattr(..., None)` guard is kept so a
     stand-in `dbsync` that omits the method (e.g. a bare test double) still
-    no-ops instead of raising. DbSync.release_expired is itself a no-op
-    whenever Postgres is disabled or unreachable (it fails closed and
-    returns `[]`), so this call is safe in every configuration.
+    no-ops instead of raising — that guard is the only thing "safe in every
+    configuration" about this call. DbSync.release_expired fails open only
+    when Postgres is disabled (returns `[]`, matching single-harness mode);
+    if Postgres is unreachable it raises `DbUnavailable` uncaught, same as
+    `db/lease.py`'s own `release_expired`. That is deliberate, not a gap:
+    this call runs at *startup*, which is stricter than runtime by design
+    (see `_init_db_layer`) — a harness that cannot confirm Postgres is
+    reachable must not start polling, since a stale reconciliation could
+    double-claim an issue another box already holds. `_init_db_layer`'s own
+    schema/connectivity gate normally catches an unreachable Postgres
+    moments earlier; letting `DbUnavailable` propagate here as well covers
+    the narrow race where it drops between that gate and this call, and
+    aborts the daemon the same way rather than reconciling against stale data.
     """
     release_expired = getattr(dbsync, "release_expired", None)
     released = release_expired() if release_expired is not None else []
@@ -312,7 +322,8 @@ def _release_stale_locks(config, github: GithubClient, logger: MainLogger,
     return released
 
 
-def _maybe_heartbeat(dbsync, last_at: float, interval: float, now: float | None = None) -> float:
+def _maybe_heartbeat(dbsync, last_at: float, interval: float, logger: MainLogger,
+                      now: float | None = None) -> float:
     """Call `dbsync.heartbeat()` if `interval` seconds have passed since `last_at`.
 
     Returns the timestamp to use as `last_at` on the next call. `now`
@@ -323,11 +334,27 @@ def _maybe_heartbeat(dbsync, last_at: float, interval: float, now: float | None 
     (see `main`), because heartbeat cadence must not depend on the sleep
     loop running uninterrupted — a slow poll/triage pass that never reaches
     the sleep loop must still keep leases alive.
+
+    `dbsync.heartbeat()` fails open when Postgres is disabled (`DbSync`'s
+    own no-op path), but when Postgres is *unreachable* mid-run,
+    `db/lease.py`'s `heartbeat` lets `DbUnavailable` propagate uncaught, and
+    `DbSync.heartbeat` adds no handling — see Finding 1. The poll loop's
+    only handler is `except KeyboardInterrupt`, so an uncaught
+    `DbUnavailable` here would unwind straight out of `main()` and kill the
+    whole supervisor out from under every live worker. Caught and warned
+    here instead, and `last_at` still advances to `now` regardless —
+    otherwise a down database would turn every remaining loop tick into
+    another doomed heartbeat attempt instead of waiting out `interval` like
+    a healthy one would. A running agent is never aborted for a lost lease
+    or a database outage; this is that guarantee applied to the heartbeat.
     """
     now = time.monotonic() if now is None else now
     if now - last_at < interval:
         return last_at
-    dbsync.heartbeat()
+    try:
+        dbsync.heartbeat()
+    except DbUnavailable as exc:
+        logger.warn(f"Postgres unreachable — heartbeat skipped: {exc}")
     return now
 
 
@@ -709,7 +736,7 @@ def main() -> None:
             logger.drain_queue(log_queue)
             process_manager.reap_dead()
             last_heartbeat = _maybe_heartbeat(
-                dbsync, last_heartbeat, config.database.heartbeat_interval_seconds
+                dbsync, last_heartbeat, config.database.heartbeat_interval_seconds, logger
             )
 
             # 2. Poll for new/retriage issues
@@ -756,7 +783,7 @@ def main() -> None:
                 process_manager.drain_state_queue()
                 logger.drain_queue(log_queue)
                 last_heartbeat = _maybe_heartbeat(
-                    dbsync, last_heartbeat, config.database.heartbeat_interval_seconds
+                    dbsync, last_heartbeat, config.database.heartbeat_interval_seconds, logger
                 )
                 time.sleep(1)
 

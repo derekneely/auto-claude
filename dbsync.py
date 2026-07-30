@@ -87,11 +87,39 @@ class DbSync:
             self._logger.error(f"Durable write {op} failed (not journaled): {exc}")
 
     # ------------------------------------------------------------------
-    # Lease operations - fail closed, NEVER journal (spec: "Claims and
-    # fence checks never queue"). Each is a thin pass-through to db.lease,
-    # made a no-op-but-permissive when Postgres is disabled: no shared
-    # database means no second harness to coordinate with, so every lease
-    # call must behave as if uncontested rather than as if blocked.
+    # Lease operations - NEVER journal, NEVER queue (spec: "Claims and fence
+    # checks never queue" - do not "helpfully" route these through
+    # db/journal.py the way `_durable` above does for issue_state writes).
+    # Each is a thin pass-through to db.lease. Two entirely different
+    # database states, both handled here, must not be conflated:
+    #
+    #   * DISABLED (self._db is None, `enabled` is False): permissive on
+    #     every method — acquire_lease/check_lease return True,
+    #     heartbeat/release_lease are silent no-ops, release_expired
+    #     returns []. No shared database means no second harness to
+    #     coordinate with, so a lease call must behave as if uncontested,
+    #     never as if blocked.
+    #
+    #   * UNREACHABLE (self._db is set but Postgres cannot be reached — the
+    #     opposite case, and it must fail the opposite way): `check_lease`
+    #     is the only one of the five that fails closed itself — db.lease's
+    #     `check` retries internally and returns False rather than raising,
+    #     since the fencing caller cannot tell "partitioned" from "lost the
+    #     race" and must refuse the irreversible act either way. The other
+    #     four (acquire_lease, heartbeat, release_lease, release_expired)
+    #     let `DbUnavailable` propagate uncaught, exactly as db/lease.py's
+    #     own functions do — the caller, not this seam, decides what an
+    #     unreachable database means for it. As of the fix in this task's
+    #     review round, those callers are: `ProcessManager._lease_ok`
+    #     (acquire_lease → treat as lease denied, skip this spawn),
+    #     `ProcessManager.reap_dead` (release_lease → warn, rely on TTL
+    #     expiry), and `main._maybe_heartbeat` (heartbeat → warn, keep
+    #     polling) — all fail-closed-but-non-fatal, per "a running Claude
+    #     agent is never aborted for a lost lease or a database outage".
+    #     `release_expired` is deliberately left to propagate all the way
+    #     out of `main._reconcile_at_startup`, because startup is stricter
+    #     than runtime by design (see `main._init_db_layer`).
+    #
     # `ttl_seconds` (Task 8's constructor, `config.database.lease_ttl_seconds`
     # via Task 11) is threaded through acquire_lease/heartbeat here — this is
     # the only place it is ever read.

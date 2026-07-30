@@ -9,6 +9,7 @@ from multiprocessing import Event, Process, Queue
 
 from config import Config
 from dbsync import DbSync
+from db.pool import DbUnavailable
 from ghauth import build_env, current_token
 from logger import ColorAssigner, MainLogger
 from github_client import GithubClient
@@ -135,11 +136,28 @@ class ProcessManager:
         Always True with no lease system wired (`self._dbsync is None`),
         matching the pre-lease behaviour exactly. Logs and returns False
         when another harness holds the lease.
+
+        Also returns False, rather than raising, when Postgres is
+        unreachable (`DbUnavailable` from `db.lease.acquire`, propagated
+        uncaught through `DbSync.acquire_lease`). This is real fail-closed:
+        a harness that cannot confirm it holds the lease must not spawn,
+        since it could double-claim an issue another box already owns —
+        the same rationale as the startup schema/connectivity gate. It just
+        skips this spawn; the next poll tries again. Distinct from the
+        `self._dbsync is None` branch above, which is deliberately
+        fail-*open* (no shared database at all means no second harness to
+        collide with) — collapsing the two would silently break one of them.
         """
         if self._dbsync is None:
             return True
-        if self._dbsync.acquire_lease(issue_id):
-            return True
+        try:
+            if self._dbsync.acquire_lease(issue_id):
+                return True
+        except DbUnavailable as exc:
+            self._logger.warn(
+                f"Postgres unreachable — not spawning {issue_id} this round: {exc}"
+            )
+            return False
         self._logger.warn(
             f"No lease for {issue_id} — not spawning (owned by another harness)"
         )
@@ -252,7 +270,20 @@ class ProcessManager:
             # instead, which is safe (bounded by LEASE_TTL_SECONDS) if
             # slower than an explicit release.
             if self._dbsync is not None:
-                self._dbsync.release_lease(issue_id)
+                try:
+                    self._dbsync.release_lease(issue_id)
+                except DbUnavailable as exc:
+                    # Unreachable, not disabled (see dbsync.py's lease-
+                    # operations note on that split): tolerate it and keep
+                    # reaping the rest of this batch rather than abandon
+                    # their state updates over one lease release. TTL expiry
+                    # still frees the lease eventually (bounded by
+                    # LEASE_TTL_SECONDS) — the same fallback shutdown_all's
+                    # forced-termination path already relies on above.
+                    self._logger.warn(
+                        f"Postgres unreachable — could not release lease for "
+                        f"{issue_id}, relying on TTL expiry: {exc}"
+                    )
 
             record = self._state.get(issue_id)
             if record is None:

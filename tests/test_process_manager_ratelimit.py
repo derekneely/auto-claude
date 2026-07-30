@@ -12,6 +12,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from db.pool import DbUnavailable  # noqa: E402
 from process_manager import ProcessManager  # noqa: E402
 from worker import StateUpdate  # noqa: E402
 
@@ -233,6 +234,29 @@ class FakeDbSync:
         self.released.append(issue_id)
 
 
+class FakeUnavailableDbSync:
+    """A dbsync whose Postgres has gone unreachable mid-run: acquire_lease
+    and release_lease raise DbUnavailable uncaught, exactly as db/lease.py's
+    real functions do when DbSync.enabled is True but the connection is
+    down. Distinct from FakeDbSync(grant=False), which models a live,
+    reachable Postgres that legitimately denies the lease to another
+    harness — the two must produce different behaviour (fail-closed-and-
+    retry-next-poll for both, but this one must never propagate the
+    exception out of ProcessManager)."""
+
+    def __init__(self):
+        self.acquired: list[str] = []
+        self.release_attempts: list[str] = []
+
+    def acquire_lease(self, issue_id):
+        self.acquired.append(issue_id)
+        raise DbUnavailable("could not reach Postgres")
+
+    def release_lease(self, issue_id):
+        self.release_attempts.append(issue_id)
+        raise DbUnavailable("could not reach Postgres")
+
+
 class TestLeaseGatesSpawn:
     """spawn() must not start a worker process without first holding the
     Postgres lease. `dbsync=None` (the default) preserves the pre-lease
@@ -253,6 +277,16 @@ class TestLeaseGatesSpawn:
         dbsync = FakeDbSync(grant=True)
         pm, _, _ = make_pm(dbsync=dbsync)
         assert pm._lease_ok("r#1") is True
+
+    def test_db_unavailable_blocks_without_raising(self):
+        # Fix round 1, Finding 1: an unreachable Postgres must fail closed
+        # (skip this spawn, retry next poll) rather than let DbUnavailable
+        # escape spawn() and take the whole poll loop down with it.
+        dbsync = FakeUnavailableDbSync()
+        pm, _, logger = make_pm(dbsync=dbsync)
+        assert pm._lease_ok("r#1") is False  # must not raise
+        assert dbsync.acquired == ["r#1"]
+        assert "unreachable" in logger.text().lower()
 
     def test_spawn_returns_before_starting_a_process_when_lease_denied(self, monkeypatch):
         pm, _, _ = make_pm()
@@ -286,3 +320,24 @@ class TestLeaseReleaseOnReap:
         pm._workers["r#1"] = (FakeProc(exitcode=0), object())
 
         pm.reap_dead()  # must not raise
+
+    def test_db_unavailable_on_release_warns_and_reaping_continues(self):
+        # Fix round 1, Finding 1: reap_dead() must not abandon the rest of
+        # the batch just because Postgres went unreachable partway through
+        # releasing leases. TTL expiry covers the leak (bounded by
+        # LEASE_TTL_SECONDS), same as shutdown_all's forced-termination path.
+        rec1 = SimpleNamespace(issue_id="r#1", status="completed", error=None,
+                                continuation_count=0, branch=None, number=1, repo="r")
+        rec2 = SimpleNamespace(issue_id="r#2", status="completed", error=None,
+                                continuation_count=0, branch=None, number=2, repo="r")
+        dbsync = FakeUnavailableDbSync()
+        pm, state, logger = make_pm(records={"r#1": rec1, "r#2": rec2}, dbsync=dbsync)
+        pm._workers["r#1"] = (FakeProc(exitcode=0), object())
+        pm._workers["r#2"] = (FakeProc(exitcode=0), object())
+
+        pm.reap_dead()  # must not raise
+
+        assert dbsync.release_attempts == ["r#1", "r#2"], \
+            "both workers must still be reaped despite the first release failing"
+        assert "unreachable" in logger.text().lower()
+        assert "r#1" not in pm._workers and "r#2" not in pm._workers
