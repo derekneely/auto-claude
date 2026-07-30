@@ -25,16 +25,22 @@ from db.pool import DbUnavailable  # noqa: E402
 
 
 class FakeDatabase:
-    """Records every execute() call; fails on the Nth call if `fail_at` is set."""
+    """Records every execute() call; fails on the Nth call if `fail_at` or
+    `type_error_at` is set. `type_error_at` simulates a genuine bug/adaptation
+    failure surfacing from deep inside a real call (e.g. psycopg), as opposed
+    to `fail_at`'s DbUnavailable, which simulates Postgres being unreachable."""
 
-    def __init__(self, fail_at: int | None = None):
+    def __init__(self, fail_at: int | None = None, type_error_at: int | None = None):
         self.calls: list[tuple[str, tuple]] = []
         self._fail_at = fail_at
+        self._type_error_at = type_error_at
 
     def execute(self, sql, params=()):
         self.calls.append((sql, params))
         if self._fail_at is not None and len(self.calls) == self._fail_at:
             raise DbUnavailable("connection dropped mid-replay")
+        if self._type_error_at is not None and len(self.calls) == self._type_error_at:
+            raise TypeError("simulated parameter-adaptation failure inside execute")
         return []
 
 
@@ -232,9 +238,138 @@ class TestJournalQuarantinesUnreplayableEntries:
         )
 
     def test_ops_is_derived_from_op_handlers_so_the_two_cannot_drift_apart(self):
-        from db.journal import _OP_HANDLERS  # noqa: PLC0415
+        from db.journal import _OP_SPECS  # noqa: PLC0415
 
-        assert set(Journal.OPS) == set(_OP_HANDLERS), (
-            "OPS must be generated from _OP_HANDLERS, not hand-copied — an op "
+        assert set(Journal.OPS) == set(_OP_SPECS), (
+            "OPS must be generated from _OP_SPECS, not hand-copied — an op "
             "added to one but not the other silently wedges append() or replay()"
+        )
+
+
+class TestJournalQuarantinesMalformedEntryShapes:
+    """Fix round 2, Finding 1: a JSONL line can be syntactically valid JSON
+    and still not be a usable entry — a bare scalar/array, or an object with
+    a missing/non-string `op` or no `payload` key. Before this fix, indexing
+    or hashing such an entry raised an uncaught TypeError (e.g.
+    `entry["op"]` on a list, or `_OP_SPECS.get(op)` on an unhashable `op`),
+    wedging the journal exactly like the original finding — just via a
+    different fault shape. These must quarantine, not raise.
+    """
+
+    def test_a_bare_json_scalar_line_is_quarantined_not_raised(self, tmp_path):
+        path = tmp_path / "journal.jsonl"
+        journal = Journal(path)
+        with path.open("a", encoding="utf-8") as f:
+            f.write("42\n")  # valid JSON, not an object — entry["op"] would TypeError
+        journal.append(
+            "harness.register", dict(id="h1", hostname="box", pid=1, version="0.2.0")
+        )
+
+        db = FakeDatabase()
+        applied = journal.replay(db)
+
+        assert applied == 1
+        assert journal.pending() == 0
+        assert path.with_suffix(".corrupt").exists()
+
+    def test_a_bare_json_array_line_is_quarantined_not_raised(self, tmp_path):
+        path = tmp_path / "journal.jsonl"
+        journal = Journal(path)
+        with path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps([1, 2, 3]) + "\n")
+        journal.append(
+            "harness.register", dict(id="h1", hostname="box", pid=1, version="0.2.0")
+        )
+
+        db = FakeDatabase()
+        applied = journal.replay(db)
+
+        assert applied == 1
+        assert journal.pending() == 0
+        assert path.with_suffix(".corrupt").exists()
+
+    def test_a_non_string_unhashable_op_is_quarantined_not_raised(self, tmp_path):
+        path = tmp_path / "journal.jsonl"
+        journal = Journal(path)
+        # A list `op` would raise "unhashable type: 'list'" from a naive
+        # dict lookup — must be rejected by the isinstance(op, str) check
+        # before any lookup is attempted.
+        with path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps({"op": ["x"], "payload": {}}) + "\n")
+        journal.append(
+            "harness.register", dict(id="h1", hostname="box", pid=1, version="0.2.0")
+        )
+
+        db = FakeDatabase()
+        applied = journal.replay(db)
+
+        assert applied == 1
+        assert journal.pending() == 0
+        assert path.with_suffix(".corrupt").exists()
+
+
+class TestJournalDistinguishesBadPayloadFromRealBugs:
+    """Fix round 2, Finding 2: the structural-vs-transient line must be drawn
+    at the payload's *shape*, not at "any TypeError anywhere in the call".
+    A TypeError raised from genuinely inside a handler's real work (a future
+    bug in a handler body, or a parameter-adaptation failure deep inside
+    db.execute) is indistinguishable from a coding defect and must propagate
+    uncaught — quarantining it would silently misfile a real bug as bad data.
+    """
+
+    def test_a_typeerror_raised_from_inside_the_handler_body_propagates_uncaught(
+        self, tmp_path
+    ):
+        path = tmp_path / "journal.jsonl"
+        journal = Journal(path)
+        # A structurally valid payload for history.start_run — passes the
+        # signature bind cleanly.
+        journal.append("history.start_run", dict(
+            run_id="run1", issue_id="repo#1", harness_id="h1", mode="dev", model="m",
+        ))
+
+        db = FakeDatabase(type_error_at=1)
+        with pytest.raises(TypeError):
+            journal.replay(db)
+
+        assert journal.pending() == 1, (
+            "an in-body TypeError is a coding bug, not a bad payload — "
+            "nothing may be quarantined for it"
+        )
+        assert not path.with_suffix(".corrupt").exists()
+
+
+class TestJournalHandlesAnUnwritableCorruptFile:
+    """Fix round 2, Finding 3: if the `.corrupt` sidecar write itself fails
+    (e.g. a full disk — the same root cause the original finding names), the
+    journal must not be truncated. Truncating anyway would permanently lose
+    the quarantined lines with no copy anywhere — exactly the failure this
+    whole module exists to prevent, just triggered by the sidecar write
+    instead of the source line.
+    """
+
+    def test_an_oserror_writing_the_corrupt_file_leaves_the_journal_untouched(
+        self, tmp_path
+    ):
+        path = tmp_path / "journal.jsonl"
+        journal = Journal(path)
+        journal.append(
+            "harness.register", dict(id="h1", hostname="box", pid=1, version="0.2.0")
+        )
+        with path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps({"op": "not.a.real.op", "payload": {}}) + "\n")
+
+        # Make the corrupt-file path itself unwritable: a directory there
+        # makes opening it "a" raise an OSError (IsADirectoryError on
+        # POSIX, PermissionError on Windows) without needing real disk
+        # exhaustion or permission games.
+        path.with_suffix(".corrupt").mkdir()
+
+        db = FakeDatabase()
+        applied = journal.replay(db)
+
+        assert applied == 1, "the valid entry still applied before the sidecar write failed"
+        assert journal.pending() == 2, (
+            "both original lines must survive — the quarantine record could "
+            "not be durably written, so nothing may be discarded"
         )
