@@ -140,17 +140,26 @@ def _handle_lease_lost(
     exc: LeaseLostError,
     *,
     branch: str | None = None,
+    run_id: str | None = None,
+    metrics: "RunMetrics | None" = None,
 ) -> None:
     """Common fenced-exit path shared by run_dev_worker and run_review_worker.
 
     Writes a local crash log (disk only, never the remote) and sends a
     StateUpdate whose `error` is prefixed "fenced:" — StateUpdate's shape is
-    frozen for Phases A-C, so this is how a later phase's run/summary
-    capture can recognise and record a `summary` row with kind="fenced"
-    without a new field. Deliberately does NOT call `_post_crash_comment`
-    (a GitHub comment is exactly the remote touch fencing exists to
-    prevent) and does NOT clean up the worktree — the branch stays local
-    and the issue is retried by whichever harness now holds it.
+    frozen for Phases A-C, so this is how a later phase's summary capture
+    can recognise and record a `summary` row with kind="fenced" without a
+    new field. The `run` row itself is closed right here, with
+    `run_outcome="fenced"`: a fenced worker's first StateUpdate already
+    opened it (see run_dev_worker/run_review_worker's setup), and nothing
+    else in this exit path would ever close it otherwise — the caller's
+    status goes straight to "failed", not "in_progress", so `reap_dead`'s
+    and `_mark_interrupted`'s dangling-run cleanup (both gated on the issue
+    still being IN_PROGRESS) never fire for it. Deliberately does NOT call
+    `_post_crash_comment` (a GitHub comment is exactly the remote touch
+    fencing exists to prevent) and does NOT clean up the worktree — the
+    branch stays local and the issue is retried by whichever harness now
+    holds it.
     """
     logger.error(f"Fenced: {exc}")
     log_path = _write_crash_log(ctx, str(exc), logger)
@@ -161,6 +170,12 @@ def _handle_lease_lost(
         error=f"fenced: {exc}",
         branch=branch,
         pr_url=ctx.pr_url,
+        run_id=run_id,
+        run_outcome="fenced",
+        duration_seconds=metrics.duration_seconds if metrics else None,
+        cost_usd=metrics.cost_usd if metrics else None,
+        turns=metrics.turns if metrics else None,
+        crash_log_path=str(log_path) if log_path else None,
     ))
 
 
@@ -2054,7 +2069,8 @@ def run_dev_worker(
         ))
 
     except LeaseLostError as exc:
-        _handle_lease_lost(ctx, logger, state_queue, exc, branch=branch)
+        _handle_lease_lost(ctx, logger, state_queue, exc, branch=branch,
+                            run_id=run_id, metrics=metrics)
 
     except Exception as exc:
         import traceback
@@ -2452,7 +2468,7 @@ def run_review_worker(
         ))
 
     except LeaseLostError as exc:
-        _handle_lease_lost(ctx, logger, state_queue, exc)
+        _handle_lease_lost(ctx, logger, state_queue, exc, run_id=run_id, metrics=metrics)
 
     except Exception as exc:
         import traceback

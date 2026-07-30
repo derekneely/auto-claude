@@ -267,6 +267,49 @@ class TestRunRowClosedOnCrash:
         pm._mark_interrupted("r#1", exit_code=0)
         assert dbsync.finished == []
 
+    def test_reap_dead_closes_a_dangling_run_even_when_the_issue_record_is_gone(self):
+        # Task 18 review Finding 2: reap_dead popped the dead worker and its
+        # color slot, then hit `if record is None: continue` *before* ever
+        # reaching `_close_dangling_run` — so a run left open by a worker
+        # whose issue record vanished from the state store (removed between
+        # spawn and reap) stayed open forever: nothing else keys off that
+        # issue_id once its record is gone. No `record` fixture at all here,
+        # by design — the state store has nothing for "r#1".
+        pm, dbsync = _make_pm_with_dbsync({})
+        pm._active_runs["r#1"] = "run1"
+        pm._workers["r#1"] = (FakeProc(exitcode=137), object())
+
+        pm.reap_dead()
+
+        assert dbsync.finished == [dict(
+            run_id="run1", outcome="failed", exit_code=137, duration_seconds=None,
+            cost_usd=None, turns=None, crash_log_path=None,
+        )]
+        assert "r#1" not in pm._active_runs
+
+
+class TestRunRowClosedOnFencing:
+    def test_a_fenced_state_update_closes_the_run_row(self):
+        # Companion to tests/test_worker_fencing.py's TestHandleLeaseLost
+        # fenced-outcome tests: this confirms the outcome the worker now
+        # sends actually reaches DbSync.finish_run through drain_state_queue,
+        # the same path every other terminal outcome goes through.
+        rec = SimpleNamespace(status="in_progress", error=None, branch=None, pr_url=None,
+                              worker_pid=111, handoff_summary=None)
+        pm, dbsync = _make_pm_with_dbsync({"r#1": rec})
+        pm._active_runs["r#1"] = "run1"
+        pm._state_queue.put(StateUpdate(
+            "r#1", "failed", error="fenced: lease lost",
+            run_id="run1", run_outcome="fenced",
+            duration_seconds=20, cost_usd=0.5, turns=3,
+        ))
+        pm.drain_state_queue()
+        assert dbsync.finished == [dict(
+            run_id="run1", outcome="fenced", exit_code=None, duration_seconds=20,
+            cost_usd=0.5, turns=3, crash_log_path=None,
+        )]
+        assert "r#1" not in pm._active_runs
+
 
 class FakeProc:
     """A worker process that has already exited."""
@@ -280,3 +323,151 @@ class FakeProc:
 
     def join(self, timeout=None):
         pass
+
+
+# ---------------------------------------------------------------------------
+# run_dev_worker end-to-end: the accumulate-then-emit path
+#
+# Task 18 review Finding 3: every test above builds a StateUpdate by hand —
+# nothing actually drove run_dev_worker or run_review_worker, so a regression
+# in the wiring itself (e.g. the terminal StateUpdate reading the pre-`try`
+# `RunMetrics()` seed instead of the `metrics` variable rebound by
+# `_run_claude`/`_accumulate_metrics`) would pass every other test in this
+# file. This drives run_dev_worker's real success path — including a forced
+# repair round, the one place metrics from two separate `_run_claude` calls
+# must be summed rather than either one alone — with every subprocess/
+# network touchpoint monkeypatched out, mirroring
+# tests/test_review_worker.py's TestRunReviewWorkerPrResolution.
+# ---------------------------------------------------------------------------
+
+class _FakeWorkerQueue:
+    """multiprocessing.Queue stand-in — records puts, no process boundary."""
+
+    def __init__(self):
+        self.items: list = []
+
+    def put(self, item) -> None:
+        self.items.append(item)
+
+
+class _FakeCompletedProcess:
+    def __init__(self, returncode=0, stdout="", stderr=""):
+        self.returncode = returncode
+        self.stdout = stdout
+        self.stderr = stderr
+
+
+class _FakeAbortEvent:
+    def is_set(self) -> bool:
+        return False
+
+
+def _make_dev_ctx(tmp_path):
+    import worker as worker_module
+    return worker_module.IssueContext(
+        issue_id="repo#1",
+        repo="repo",
+        number=1,
+        title="Add a widget",
+        body="b",
+        action="implement",
+        org="org",
+        base_branch="main",
+        repos_dir=tmp_path / "repos",
+        worktrees_dir=tmp_path / "worktrees",
+        prompts_dir=Path(__file__).resolve().parent.parent / "prompts",
+        dev_model="model",
+        light_model="model",
+        permission_mode="bypassPermissions",
+        max_budget_usd=1.0,
+        max_turns=5,
+        crash_logs_dir=tmp_path / "crash",
+        color_name="RED",
+        color_code="\033[91m",
+    )
+
+
+def _stub_dev_worker_happy_path_with_one_repair_round(monkeypatch):
+    """Stub every touchpoint of run_dev_worker's success path, forcing exactly
+    one repair round so the accumulate-then-emit path actually runs."""
+    import worker as worker_module
+
+    monkeypatch.setattr(worker_module, "_claim_labels", lambda ctx, logger: None)
+    monkeypatch.setattr(worker_module, "_clone_or_fetch", lambda ctx, logger: Path("."))
+    monkeypatch.setattr(worker_module, "_cleanup_worktree", lambda *a, **k: None)
+    monkeypatch.setattr(worker_module, "_get_issue_comments", lambda ctx, logger: [])
+    monkeypatch.setattr(worker_module, "_build_prompt", lambda *a, **k: "prompt")
+    monkeypatch.setattr(worker_module, "_post_issue_report", lambda *a, **k: None)
+    monkeypatch.setattr(worker_module, "_write_crash_log", lambda *a, **k: None)
+    monkeypatch.setattr(worker_module, "_post_crash_comment", lambda *a, **k: None)
+    monkeypatch.setattr(
+        worker_module, "_push_and_pr",
+        lambda *a, **k: "https://github.com/org/repo/pull/1",
+    )
+
+    def fake_run_cmd(cmd, **_kwargs):
+        if cmd[:2] == ["git", "status"]:
+            return _FakeCompletedProcess(returncode=0, stdout=" M src/foo.py\n")
+        if cmd[:2] == ["git", "log"]:
+            return _FakeCompletedProcess(returncode=0, stdout="abc123 commit\n")
+        return _FakeCompletedProcess(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(worker_module, "_run_cmd", fake_run_cmd)
+
+    run_claude_calls = {"n": 0}
+
+    def fake_run_claude(**_kwargs):
+        run_claude_calls["n"] += 1
+        if run_claude_calls["n"] == 1:
+            return (0, "primary output", False, None,
+                    worker_module.RunMetrics(cost_usd=1.0, turns=5, duration_seconds=30))
+        return (0, "repair output", False, None,
+                worker_module.RunMetrics(cost_usd=0.25, turns=2, duration_seconds=3))
+
+    monkeypatch.setattr(worker_module, "_run_claude", fake_run_claude)
+
+    check_calls = {"n": 0}
+
+    def fake_prepare_and_check(ctx, worktree_dir, logger):
+        check_calls["n"] += 1
+        if check_calls["n"] == 1:
+            return False, "checks failed"
+        return True, "ok"
+
+    monkeypatch.setattr(worker_module, "_prepare_and_check", fake_prepare_and_check)
+    return run_claude_calls, check_calls
+
+
+class TestRunDevWorkerEmitsAccumulatedMetrics:
+    def test_a_repair_rounds_metrics_are_folded_into_the_terminal_state_update(
+        self, monkeypatch, tmp_path,
+    ):
+        import worker as worker_module
+
+        ctx = _make_dev_ctx(tmp_path)
+        run_claude_calls, check_calls = _stub_dev_worker_happy_path_with_one_repair_round(
+            monkeypatch,
+        )
+        state_queue = _FakeWorkerQueue()
+
+        worker_module.run_dev_worker(ctx, _FakeWorkerQueue(), state_queue, _FakeAbortEvent())
+
+        assert run_claude_calls["n"] == 2, "primary run + exactly one repair round"
+        assert check_calls["n"] == 2, "checks fail once, then pass after the repair round"
+
+        opening = state_queue.items[0]
+        assert opening.run_mode == "dev"
+        assert opening.run_id is not None
+
+        terminal = state_queue.items[-1]
+        assert terminal.status == "completed"
+        assert terminal.run_outcome == "completed"
+        assert terminal.run_id == opening.run_id
+        # 1.0 + 0.25, 5 + 2, 30 + 3 — the primary run's metrics plus the
+        # repair round's, per _accumulate_metrics. A regression that let the
+        # pre-`try` `RunMetrics()` seed reach the terminal StateUpdate
+        # instead (rather than the rebound-then-accumulated `metrics`
+        # variable) would report all three fields as None here.
+        assert terminal.cost_usd == 1.25
+        assert terminal.turns == 7
+        assert terminal.duration_seconds == 33

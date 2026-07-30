@@ -271,3 +271,54 @@ class TestHandleLeaseLost:
         assert posted == [], "must never post a crash comment - that touches the remote"
         assert remote_calls == []
         assert len(list(tmp_path.glob("*.log"))) == 1, "a local crash log must still be written"
+
+    def test_closes_the_run_row_with_a_fenced_outcome_when_run_identity_is_supplied(
+        self, monkeypatch, tmp_path,
+    ):
+        # Task 18 review Finding 1: a fenced worker's `run` row was never
+        # closed — its first StateUpdate opens it (run_mode set), but the
+        # fenced exit sent neither run_id nor run_outcome, so
+        # ProcessManager._active_runs kept the entry forever (the record's
+        # status goes straight to "failed", never back to "in_progress", so
+        # neither reap_dead's nor _mark_interrupted's dangling-run cleanup —
+        # both gated on IN_PROGRESS — ever fires for it). This pins the fix:
+        # _handle_lease_lost now accepts the same run_id/metrics every other
+        # exit path threads through, and closes the row itself.
+        monkeypatch.setattr(worker, "_post_crash_comment", lambda *a, **k: None)
+        _record_cmds(monkeypatch)
+        q = queue.Queue()
+        ctx = _ctx(tmp_path)
+        metrics = worker.RunMetrics(cost_usd=0.5, turns=3, duration_seconds=20)
+
+        worker._handle_lease_lost(
+            ctx, _logger(), q, LeaseLostError("lease lost"),
+            run_id="run1", metrics=metrics,
+        )
+
+        update = q.get_nowait()
+        assert update.error.startswith("fenced:"), "the literal prefix Task 19 depends on"
+        assert update.run_id == "run1"
+        assert update.run_outcome == "fenced"
+        assert update.cost_usd == 0.5
+        assert update.turns == 3
+        assert update.duration_seconds == 20
+        assert update.crash_log_path is not None, "the crash log written above must be reported"
+
+    def test_run_identity_defaults_to_none_when_the_caller_supplies_none(
+        self, monkeypatch, tmp_path,
+    ):
+        # Guards the pre-try crash case: a LeaseLostError raised before
+        # run_id/metrics are ever bound must not itself crash this path.
+        monkeypatch.setattr(worker, "_post_crash_comment", lambda *a, **k: None)
+        _record_cmds(monkeypatch)
+        q = queue.Queue()
+        ctx = _ctx(tmp_path)
+
+        worker._handle_lease_lost(ctx, _logger(), q, LeaseLostError("lease lost"))
+
+        update = q.get_nowait()
+        assert update.run_id is None
+        assert update.run_outcome == "fenced"
+        assert update.cost_usd is None
+        assert update.turns is None
+        assert update.duration_seconds is None

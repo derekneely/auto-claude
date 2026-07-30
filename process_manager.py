@@ -291,11 +291,21 @@ class ProcessManager:
                         f"{issue_id}, relying on TTL expiry: {exc}"
                     )
 
+            exitcode = proc.exitcode
+
+            # A dangling run must be closed even when the issue's state
+            # record is already gone by the time we get here (e.g. removed
+            # from the store between spawn and reap) — closing only needs
+            # the issue_id and exit code, never a live record. No-ops if the
+            # worker's own terminal StateUpdate already closed it (or none
+            # was ever opened), since `_close_dangling_run` pops
+            # `_active_runs` and returns early when the key is absent.
+            self._close_dangling_run(issue_id, outcome="failed", exit_code=exitcode)
+
             record = self._state.get(issue_id)
             if record is None:
                 continue
 
-            exitcode = proc.exitcode
             self._logger.info(
                 f"Worker for {issue_id} exited (code={exitcode}, status={record.status})"
             )
@@ -306,7 +316,6 @@ class ProcessManager:
                 self._state.update(issue_id, error=f"Worker crashed (exit code {exitcode})")
                 self._state.save()
                 record = self._state.get(issue_id)
-                self._close_dangling_run(issue_id, outcome="failed", exit_code=exitcode)
 
             # Rate limited: re-queue unconditionally. This is not the issue's
             # fault, so it must not consume a continuation or count as a failure.
