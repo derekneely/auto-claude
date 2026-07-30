@@ -71,7 +71,7 @@ class FakeState:
         self.saved += 1
 
 
-def make_pm(max_parallel=3, records=None):
+def make_pm(max_parallel=3, records=None, dbsync=None, harness_id=None):
     config = SimpleNamespace(
         workers=SimpleNamespace(max_parallel=max_parallel, shutdown_grace_seconds=30),
     )
@@ -84,6 +84,8 @@ def make_pm(max_parallel=3, records=None):
             logger=logger,
             log_queue=queue.Queue(),
             state_queue=queue.Queue(),
+            dbsync=dbsync,
+            harness_id=harness_id,
         ),
         state,
         logger,
@@ -215,3 +217,72 @@ class TestDrainStateQueue:
         assert rec.status == "completed"
         assert rec.branch == "ac/issue-1"
         assert pm._rate_limited_until == 0.0
+
+
+class FakeDbSync:
+    def __init__(self, grant=True):
+        self.grant = grant
+        self.acquired: list[str] = []
+        self.released: list[str] = []
+
+    def acquire_lease(self, issue_id):
+        self.acquired.append(issue_id)
+        return self.grant
+
+    def release_lease(self, issue_id):
+        self.released.append(issue_id)
+
+
+class TestLeaseGatesSpawn:
+    """spawn() must not start a worker process without first holding the
+    Postgres lease. `dbsync=None` (the default) preserves the pre-lease
+    behaviour exactly, so every other test in this file is unaffected."""
+
+    def test_no_dbsync_always_ok(self):
+        pm, _, _ = make_pm()
+        assert pm._lease_ok("r#1") is True
+
+    def test_denied_lease_blocks_and_warns(self):
+        dbsync = FakeDbSync(grant=False)
+        pm, _, logger = make_pm(dbsync=dbsync)
+        assert pm._lease_ok("r#1") is False
+        assert dbsync.acquired == ["r#1"]
+        assert "No lease" in logger.text()
+
+    def test_granted_lease_allows(self):
+        dbsync = FakeDbSync(grant=True)
+        pm, _, _ = make_pm(dbsync=dbsync)
+        assert pm._lease_ok("r#1") is True
+
+    def test_spawn_returns_before_starting_a_process_when_lease_denied(self, monkeypatch):
+        pm, _, _ = make_pm()
+        pm._lease_ok = lambda issue_id: False
+        calls = []
+        monkeypatch.setattr("process_manager.Process", lambda **kw: calls.append(kw))
+        pm.spawn(SimpleNamespace(
+            issue_id="r#1", repo="r", number=1, title="t", body="",
+            action="fix", branch=None, pr_url=None, rework_count=0,
+            handoff_summary=None,
+        ))
+        assert calls == [], "must not construct a worker Process without the lease"
+
+
+class TestLeaseReleaseOnReap:
+    def test_releases_the_lease_when_a_worker_is_reaped(self):
+        rec = SimpleNamespace(issue_id="r#1", status="completed", error=None,
+                               continuation_count=0, branch=None, number=1, repo="r")
+        dbsync = FakeDbSync()
+        pm, _, _ = make_pm(records={"r#1": rec}, dbsync=dbsync)
+        pm._workers["r#1"] = (FakeProc(exitcode=0), object())
+
+        pm.reap_dead()
+
+        assert dbsync.released == ["r#1"]
+
+    def test_no_dbsync_reap_does_not_error(self):
+        rec = SimpleNamespace(issue_id="r#1", status="completed", error=None,
+                               continuation_count=0, branch=None, number=1, repo="r")
+        pm, _, _ = make_pm(records={"r#1": rec})
+        pm._workers["r#1"] = (FakeProc(exitcode=0), object())
+
+        pm.reap_dead()  # must not raise

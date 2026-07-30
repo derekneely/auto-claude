@@ -8,6 +8,7 @@ import time
 from multiprocessing import Event, Process, Queue
 
 from config import Config
+from dbsync import DbSync
 from ghauth import build_env, current_token
 from logger import ColorAssigner, MainLogger
 from github_client import GithubClient
@@ -27,6 +28,8 @@ class ProcessManager:
         logger: MainLogger,
         log_queue: Queue,
         state_queue: Queue,
+        dbsync: DbSync | None = None,
+        harness_id: str | None = None,
     ) -> None:
         self._config = config
         self._state = state
@@ -47,6 +50,11 @@ class ProcessManager:
         # repo -> PipelineConfig | None, cached so we do not re-read and
         # re-warn about the same pipeline.json on every spawn.
         self._pipelines: dict[str, object] = {}
+        # Postgres lease system. `dbsync=None` is the pre-lease behaviour
+        # exactly (see `_lease_ok`), so every existing caller that builds a
+        # ProcessManager without these two new arguments is unaffected.
+        self._dbsync = dbsync
+        self._harness_id = harness_id
 
     def _repo_pipeline(self, repo: str):
         """The repo's `.claude/pipeline.json`, or None if it has none.
@@ -121,6 +129,22 @@ class ProcessManager:
         """Seconds left on the global rate-limit pause (0.0 when not paused)."""
         return max(0.0, self._rate_limited_until - time.time())
 
+    def _lease_ok(self, issue_id: str) -> bool:
+        """True if we may proceed spawning a worker for `issue_id`.
+
+        Always True with no lease system wired (`self._dbsync is None`),
+        matching the pre-lease behaviour exactly. Logs and returns False
+        when another harness holds the lease.
+        """
+        if self._dbsync is None:
+            return True
+        if self._dbsync.acquire_lease(issue_id):
+            return True
+        self._logger.warn(
+            f"No lease for {issue_id} — not spawning (owned by another harness)"
+        )
+        return False
+
     def spawn(self, record: IssueRecord) -> None:
         """Spawn a worker process for the given issue."""
         if not self.can_spawn():
@@ -132,6 +156,9 @@ class ProcessManager:
 
         if record.issue_id in self._workers:
             self._logger.warn(f"Worker already running for {record.issue_id}")
+            return
+
+        if not self._lease_ok(record.issue_id):
             return
 
         # Assign color
@@ -182,6 +209,7 @@ class ProcessManager:
             grace_budget_usd=claude_cfg.grace_budget_usd,
             claude_tools_root=self._config.integrations.claude_tools_root,
             pipeline_project=pipeline_project,
+            harness_id=self._harness_id,
         )
 
         abort_event = multiprocessing.Event()
@@ -216,6 +244,15 @@ class ProcessManager:
             proc, _abort_event = self._workers.pop(issue_id)
             self._color_assigner.release(issue_id)
             proc.join(timeout=5)
+
+            # Release now rather than waiting out the TTL: main knows for
+            # certain this worker is gone, and the next spawn() re-acquires
+            # a fresh lease anyway. Scoped to reap_dead() only -
+            # shutdown_all()'s forced-termination path relies on TTL expiry
+            # instead, which is safe (bounded by LEASE_TTL_SECONDS) if
+            # slower than an explicit release.
+            if self._dbsync is not None:
+                self._dbsync.release_lease(issue_id)
 
             record = self._state.get(issue_id)
             if record is None:

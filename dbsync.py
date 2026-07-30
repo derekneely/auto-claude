@@ -21,6 +21,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from db import issue_state
+from db import lease as db_lease
 from db.harness import Harness
 from db.pool import Database, DbUnavailable
 from state import IssueRecord
@@ -84,3 +85,39 @@ class DbSync:
             self._logger.warn(f"Postgres unreachable — dropping {op} (not journaled yet): {exc}")
         except Exception as exc:
             self._logger.error(f"Durable write {op} failed (not journaled): {exc}")
+
+    # ------------------------------------------------------------------
+    # Lease operations - fail closed, NEVER journal (spec: "Claims and
+    # fence checks never queue"). Each is a thin pass-through to db.lease,
+    # made a no-op-but-permissive when Postgres is disabled: no shared
+    # database means no second harness to coordinate with, so every lease
+    # call must behave as if uncontested rather than as if blocked.
+    # `ttl_seconds` (Task 8's constructor, `config.database.lease_ttl_seconds`
+    # via Task 11) is threaded through acquire_lease/heartbeat here — this is
+    # the only place it is ever read.
+    # ------------------------------------------------------------------
+
+    def acquire_lease(self, issue_id: str) -> bool:
+        if not self.enabled:
+            return True
+        return db_lease.acquire(self._db, issue_id, self._harness.id, self._ttl_seconds)
+
+    def heartbeat(self) -> None:
+        if not self.enabled:
+            return
+        db_lease.heartbeat(self._db, self._harness.id, self._ttl_seconds)
+
+    def release_lease(self, issue_id: str) -> None:
+        if not self.enabled:
+            return
+        db_lease.release(self._db, issue_id, self._harness.id)
+
+    def check_lease(self, issue_id: str) -> bool:
+        if not self.enabled:
+            return True
+        return db_lease.check(self._db, issue_id, self._harness.id)
+
+    def release_expired(self) -> list[str]:
+        if not self.enabled:
+            return []
+        return db_lease.release_expired(self._db)

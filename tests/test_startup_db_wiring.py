@@ -170,9 +170,13 @@ class TestReconcileAtStartupReleasesExpiredLeasesFirst:
         assert report.leases_released == ["field_admin#7"]
 
     def test_no_release_expired_method_yet_is_a_no_op(self, tmp_path):
-        # db/lease.py (Task 12) and Task 13's DbSync.release_expired do not
-        # exist until later — a plain Task 8 DbSync has no such attribute,
-        # and this must not raise or fabricate a release.
+        # Guards the getattr(dbsync, "release_expired", None) shim in
+        # _reconcile_at_startup: it exists so a dbsync stand-in that omits
+        # the method (e.g. an older SimpleNamespace fake, or any future
+        # caller that hasn't wired one) still no-ops instead of raising.
+        # A real DbSync always has release_expired now (Task 13); this test
+        # uses db=None, so DbSync.release_expired's own no-op path (Postgres
+        # disabled) is what actually returns [] here.
         state = main.StateStore(tmp_path / "issues.json")
         github = SimpleNamespace(list_issues=lambda repo, assignee=None: [])
         config = SimpleNamespace(github=SimpleNamespace(repos=[], bot_login="bot"))

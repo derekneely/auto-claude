@@ -109,3 +109,82 @@ class TestUpsertIssueNeverRaises:
     def test_no_database_at_all_is_a_silent_no_op(self):
         sync = DbSync(None, HARNESS, FakeLogger())
         sync.upsert_issue(_make_record(), stage="ac-in-progress")  # must not raise
+
+
+# ----------------------------------------------------------------------
+# Lease pass-through on DbSync.
+#
+# Guards three things at once: that DbSync.acquire_lease/heartbeat/
+# release_lease/check_lease/release_expired actually call db.lease's
+# functions (not reimplement the SQL), that every one of them is a safe
+# no-op when Postgres is disabled (`db=None`) - a disabled database means
+# no shared state, which per docs/plans/12-shared-state-in-postgres.md
+# means there cannot be a second harness, so lease operations must not
+# block anything - and that a non-default configured `ttl_seconds` (Task
+# 8's `DbSync.__init__`, otherwise unused until now) actually reaches
+# `db.lease.acquire`/`heartbeat`, which is what makes
+# `config.database.lease_ttl_seconds` (Task 2) more than a dead field on
+# the config object.
+# ----------------------------------------------------------------------
+
+
+class _FakeLeaseDb:
+    """Records every call it receives; DbSync must forward to db.lease, not
+    touch this fake's SQL surface directly."""
+
+    def __init__(self):
+        self.calls: list[tuple[str, tuple]] = []
+
+    def execute(self, sql, params=()):
+        self.calls.append((sql, params))
+        return [("field_admin#1",)]
+
+
+def _dbsync(db, ttl_seconds=1800):
+    harness = Harness(id="harness-a", hostname="box", pid=1, version="0.2.0")
+    return DbSync(db, harness, None, ttl_seconds=ttl_seconds)
+
+
+class TestLeasePassThroughWhenEnabled:
+    def test_acquire_lease_calls_db_lease_acquire(self):
+        db = _FakeLeaseDb()
+        assert _dbsync(db).acquire_lease("field_admin#1") is True
+        assert db.calls, "must have issued a query, not short-circuited"
+
+    def test_check_lease_calls_db_lease_check(self):
+        db = _FakeLeaseDb()
+        assert _dbsync(db).check_lease("field_admin#1") is True
+
+    def test_release_expired_returns_the_freed_ids(self):
+        db = _FakeLeaseDb()
+        assert _dbsync(db).release_expired() == ["field_admin#1"]
+
+
+class TestLeasePassThroughWhenDisabled:
+    def test_acquire_lease_is_always_granted(self):
+        assert _dbsync(None).acquire_lease("field_admin#1") is True
+
+    def test_check_lease_is_always_true(self):
+        assert _dbsync(None).check_lease("field_admin#1") is True
+
+    def test_heartbeat_and_release_lease_do_not_raise(self):
+        dbsync = _dbsync(None)
+        dbsync.heartbeat()
+        dbsync.release_lease("field_admin#1")  # must not raise
+
+    def test_release_expired_returns_empty(self):
+        assert _dbsync(None).release_expired() == []
+
+
+class TestConfiguredTtlReachesDbLease:
+    def test_acquire_lease_passes_the_configured_ttl_seconds_through(self):
+        db = _FakeLeaseDb()
+        _dbsync(db, ttl_seconds=900).acquire_lease("field_admin#1")
+        _sql, params = db.calls[0]
+        assert 900 in params, "the configured ttl_seconds must reach db.lease.acquire"
+
+    def test_heartbeat_passes_the_configured_ttl_seconds_through(self):
+        db = _FakeLeaseDb()
+        _dbsync(db, ttl_seconds=900).heartbeat()
+        _sql, params = db.calls[0]
+        assert 900 in params, "the configured ttl_seconds must reach db.lease.heartbeat"

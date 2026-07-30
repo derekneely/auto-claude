@@ -124,6 +124,11 @@ class IssueContext:
     # Worktree-preparation overrides from `[repos.<name>]`. None means
     # auto-detect from what is in the checkout, which is the normal case.
     repo_setup: RepoSetupConfig | None = None
+    # Which Postgres harness row spawned this worker. Set by
+    # ProcessManager.spawn from its own `harness_id`; None when no lease
+    # system is wired (--issue mode without Postgres, or an older caller) -
+    # `_assert_lease_held` treats that the same as "no shared database".
+    harness_id: str | None = None
 
 
 @dataclass

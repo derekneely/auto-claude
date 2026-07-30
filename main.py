@@ -204,11 +204,12 @@ def _reconcile_at_startup(config, github, state, db, harness, dbsync, logger: Ma
     from "never held". The ids `release_expired()` actually returned are
     substituted into the report afterwards, which is what keeps
     `ReconcileReport.leases_released` true rather than merely informational.
-    `release_expired` does not exist on `dbsync` until Task 13 wires
-    db/lease.py into it — `getattr(..., None)` makes the call a no-op until
-    then, and DbSync.release_expired is itself a no-op whenever Postgres is
-    disabled or unreachable (it fails closed and returns `[]`), so this
-    call is safe in every configuration.
+    `release_expired` now exists on every real `DbSync` (Task 13 wired
+    db/lease.py into it); the `getattr(..., None)` guard is kept so a
+    stand-in `dbsync` that omits the method (e.g. a bare test double) still
+    no-ops instead of raising. DbSync.release_expired is itself a no-op
+    whenever Postgres is disabled or unreachable (it fails closed and
+    returns `[]`), so this call is safe in every configuration.
     """
     release_expired = getattr(dbsync, "release_expired", None)
     released = release_expired() if release_expired is not None else []
@@ -309,6 +310,25 @@ def _release_stale_locks(config, github: GithubClient, logger: MainLogger,
             released += 1
 
     return released
+
+
+def _maybe_heartbeat(dbsync, last_at: float, interval: float, now: float | None = None) -> float:
+    """Call `dbsync.heartbeat()` if `interval` seconds have passed since `last_at`.
+
+    Returns the timestamp to use as `last_at` on the next call. `now`
+    defaults to `time.monotonic()` and exists purely so tests do not have to
+    sleep for real — production callers never pass it.
+
+    Called from both the top of the poll loop and its per-second sleep tick
+    (see `main`), because heartbeat cadence must not depend on the sleep
+    loop running uninterrupted — a slow poll/triage pass that never reaches
+    the sleep loop must still keep leases alive.
+    """
+    now = time.monotonic() if now is None else now
+    if now - last_at < interval:
+        return last_at
+    dbsync.heartbeat()
+    return now
 
 
 def _pipeline_json_text(config, github, repo: str, logger: MainLogger) -> str | None:
@@ -646,6 +666,8 @@ def main() -> None:
         logger=logger,
         log_queue=log_queue,
         state_queue=state_queue,
+        dbsync=dbsync,
+        harness_id=harness.id,
     )
 
     # Ensure all labels exist on monitored repos. Skipped under --dry-run:
@@ -678,12 +700,17 @@ def main() -> None:
     # Main polling loop
     logger.info(f"Polling every {config.github.poll_interval_seconds}s — press Ctrl+C to stop")
 
+    last_heartbeat = time.monotonic()
+
     try:
         while not shutdown_requested:
             # 1. Drain queues + reap dead workers
             process_manager.drain_state_queue()
             logger.drain_queue(log_queue)
             process_manager.reap_dead()
+            last_heartbeat = _maybe_heartbeat(
+                dbsync, last_heartbeat, config.database.heartbeat_interval_seconds
+            )
 
             # 2. Poll for new/retriage issues
             new_issues, retriage_issues = poller.poll()
@@ -728,6 +755,9 @@ def main() -> None:
                 # Drain queues during sleep too
                 process_manager.drain_state_queue()
                 logger.drain_queue(log_queue)
+                last_heartbeat = _maybe_heartbeat(
+                    dbsync, last_heartbeat, config.database.heartbeat_interval_seconds
+                )
                 time.sleep(1)
 
     except KeyboardInterrupt:
