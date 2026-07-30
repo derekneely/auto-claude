@@ -2334,17 +2334,42 @@ def _post_pr_review(
         logger.warn(f"Could not post PR review: {result.stderr.strip()}")
         return None
 
-    lookup = _run_cmd(
-        [
-            "gh", "api",
-            f"repos/{ctx.org}/{ctx.repo}/pulls/{pr_number}/reviews",
-            "--jq", ".[-1].html_url",
-        ],
-        logger=logger,
-        timeout=30,
-    )
-    url = lookup.stdout.strip()
-    return url if lookup.returncode == 0 and url.startswith("http") else None
+    # The review itself already landed on GitHub by this point — a failure
+    # from here on must degrade comment_url to None, never fail the post
+    # that already succeeded. `_run_cmd` does not catch
+    # TimeoutExpired/FileNotFoundError, so this call is wrapped explicitly
+    # rather than trusting the lookup to be as reliable as the post above.
+    try:
+        # `--paginate` because a PR with more than one page of reviews (30+)
+        # would otherwise have `.[-1]` select the last item of PAGE ONE, not
+        # the true most recent review — a wrong URL, which this task's
+        # contract treats as worse than a NULL one.
+        lookup = _run_cmd(
+            [
+                "gh", "api", "--paginate",
+                f"repos/{ctx.org}/{ctx.repo}/pulls/{pr_number}/reviews",
+                "--jq", ".[].html_url",
+            ],
+            logger=logger,
+            timeout=30,
+        )
+    except Exception as exc:
+        logger.warn(f"Could not resolve posted review URL: {exc}")
+        return None
+
+    if lookup.returncode != 0:
+        return None
+    # One URL per line across every page, oldest first — the true last line
+    # is the most recently submitted review, unlike `.[-1]` on an
+    # unpaginated single page. The startswith guard is applied to that one
+    # selected line, not to the whole (possibly multi-line) stdout blob,
+    # so a malformed earlier line can never make a later check pass by
+    # accident.
+    lines = [line for line in lookup.stdout.strip().splitlines() if line.strip()]
+    if not lines:
+        return None
+    url = lines[-1].strip()
+    return url if url.startswith("http") else None
 
 
 def run_review_worker(

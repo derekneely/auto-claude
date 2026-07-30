@@ -503,9 +503,18 @@ class TestPostIssueReportReturnsBodyAndUrl:
         assert url == "https://github.com/o/r/issues/7#issuecomment-1"
 
     def test_returns_none_url_when_the_post_fails(self, tmp_path, monkeypatch):
+        # Review fix (round 1): the original ctx omitted dev_model, so
+        # `_post_issue_report`'s `model=ctx.dev_model` read raised
+        # AttributeError inside the outer try — caught by the OUTER except,
+        # not the `result.returncode != 0` branch this test is meant to
+        # cover. `url is None` passed either way, for the wrong reason, and
+        # the second assertion (`"s" in body or body is not None`) was a
+        # tautology since `body is not None` is always true for a str. Adding
+        # dev_model reaches the intended branch; the replacement assertion
+        # actually checks the body the caller would have posted.
         import worker
 
-        ctx = SimpleNamespace(number=7, org="o", repo="r")
+        ctx = SimpleNamespace(number=7, org="o", repo="r", dev_model="m")
         monkeypatch.setattr(worker, "_get_issue_labels", lambda ctx, logger: [])
         monkeypatch.setattr(
             worker, "_run_cmd",
@@ -516,7 +525,7 @@ class TestPostIssueReportReturnsBodyAndUrl:
             outcome="success", logger=SimpleNamespace(warn=lambda *a: None),
         )
         assert url is None
-        assert "s" in body or body is not None
+        assert "s" in body, "the built report body must still carry the summary text"
 
 
 class TestPostCrashCommentReturnsUrlAndBody:
@@ -575,6 +584,66 @@ class TestPostPrReviewReturnsUrlFromApiLookup:
             ctx, SimpleNamespace(warn=lambda *a: None), approve=True, body="x",
         )
         assert url is None
+
+    def test_a_lookup_timeout_degrades_to_none_without_failing_the_already_posted_review(
+        self, monkeypatch,
+    ):
+        # Review fix (round 1, Finding 1): _run_cmd does not catch
+        # subprocess.TimeoutExpired/FileNotFoundError, so a timeout on the
+        # follow-up URL lookup used to propagate out of _post_pr_review
+        # *after* `gh pr review` had already posted successfully — an
+        # approved review recorded as a crashed run. The lookup must degrade
+        # to comment_url=None instead.
+        import subprocess
+
+        import worker
+
+        ctx = SimpleNamespace(
+            pr_url="https://github.com/o/r/pull/4", org="o", repo="r", harness_id=None,
+        )
+
+        def fake_run_cmd(cmd, **kwargs):
+            if cmd[:3] == ["gh", "pr", "review"]:
+                return SimpleNamespace(returncode=0, stdout="", stderr="")
+            raise subprocess.TimeoutExpired(cmd=cmd, timeout=30)
+
+        monkeypatch.setattr(worker, "_run_cmd", fake_run_cmd)
+        url = worker._post_pr_review(
+            ctx, SimpleNamespace(warn=lambda *a: None), approve=True, body="looks good",
+        )
+        assert url is None
+
+    def test_a_multi_page_reviews_response_selects_the_true_last_review(self, monkeypatch):
+        # Review fix (round 1, Finding 2): `gh api` without --paginate only
+        # fetches page 1 (30 items). On a PR with >30 reviews, the old
+        # `.[-1]` selected the 30th-OLDEST review, not the one this run just
+        # posted — a confidently wrong URL, worse than NULL per this task's
+        # contract. --paginate + `.[].html_url` now prints one URL per line
+        # across every page, oldest first; the true last line is the most
+        # recent review regardless of how many pages preceded it.
+        import worker
+
+        ctx = SimpleNamespace(
+            pr_url="https://github.com/o/r/pull/4", org="o", repo="r", harness_id=None,
+        )
+        calls = []
+
+        def fake_run_cmd(cmd, **kwargs):
+            calls.append(cmd)
+            if cmd[:3] == ["gh", "pr", "review"]:
+                return SimpleNamespace(returncode=0, stdout="", stderr="")
+            # Simulate 31 reviews spread across two pages, oldest first —
+            # the OLD `.[-1]` on an unpaginated call would have returned
+            # review-30 (page 1's last item), not review-31 (the real last).
+            urls = [f"https://github.com/o/r/pull/4#pullrequestreview-{n}" for n in range(1, 32)]
+            return SimpleNamespace(returncode=0, stdout="\n".join(urls) + "\n", stderr="")
+
+        monkeypatch.setattr(worker, "_run_cmd", fake_run_cmd)
+        url = worker._post_pr_review(
+            ctx, SimpleNamespace(warn=lambda *a: None), approve=True, body="looks good",
+        )
+        assert url == "https://github.com/o/r/pull/4#pullrequestreview-31"
+        assert any("--paginate" in c for c in calls)
 
 
 class TestProcessManagerPostsSummaries:
