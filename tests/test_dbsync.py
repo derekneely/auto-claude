@@ -15,10 +15,14 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+import dbsync  # noqa: E402
 from dbsync import DbSync  # noqa: E402
 from db.harness import Harness  # noqa: E402
+from db.journal import Journal  # noqa: E402
 from db.pool import DbUnavailable  # noqa: E402
 from state import IssueRecord  # noqa: E402
 
@@ -85,10 +89,11 @@ class TestUpsertIssueNeverRaises:
 
         assert db.calls, "must have issued a write, not short-circuited"
 
-    def test_db_unavailable_is_logged_and_swallowed_not_raised(self):
+    def test_db_unavailable_is_logged_and_swallowed_not_raised(self, tmp_path):
         db = FakeDatabase(raises=DbUnavailable("down"))
         logger = FakeLogger()
-        sync = DbSync(db, HARNESS, logger)
+        journal = Journal(tmp_path / "j.jsonl")
+        sync = DbSync(db, HARNESS, logger, journal=journal)
 
         sync.upsert_issue(_make_record(), stage="ac-in-progress")  # must not raise
 
@@ -106,8 +111,9 @@ class TestUpsertIssueNeverRaises:
 
         assert any("failed" in msg.lower() for _lvl, msg in logger.messages)
 
-    def test_no_database_at_all_is_a_silent_no_op(self):
-        sync = DbSync(None, HARNESS, FakeLogger())
+    def test_no_database_at_all_is_a_silent_no_op(self, tmp_path):
+        journal = Journal(tmp_path / "j.jsonl")
+        sync = DbSync(None, HARNESS, FakeLogger(), journal=journal)
         sync.upsert_issue(_make_record(), stage="ac-in-progress")  # must not raise
 
 
@@ -197,19 +203,21 @@ class TestStartAndFinishRun:
         sync.start_run(run_id="r1", issue_id="repo#1", mode="dev", model="m")
         assert db.calls
 
-    def test_finish_run_is_logged_and_dropped_on_db_unavailable(self):
+    def test_finish_run_is_logged_and_journaled_on_db_unavailable(self, tmp_path):
         db = FakeDatabase(raises=DbUnavailable("down"))
         logger = FakeLogger()
-        sync = DbSync(db, HARNESS, logger)
+        journal = Journal(tmp_path / "j.jsonl")
+        sync = DbSync(db, HARNESS, logger, journal=journal)
         sync.finish_run(run_id="r1", outcome="completed", exit_code=0,
                          duration_seconds=1, cost_usd=0.1, turns=1, crash_log_path=None)
-        assert any("dropping" in msg.lower() for _lvl, msg in logger.messages)
+        assert any("unreachable" in msg.lower() for _lvl, msg in logger.messages)
 
 
 class TestAddSummary:
-    def test_returns_a_stable_id_even_when_the_write_is_dropped(self):
+    def test_returns_a_stable_id_even_when_the_write_is_journaled(self, tmp_path):
         db = FakeDatabase(raises=DbUnavailable("down"))
-        sync = DbSync(db, HARNESS, FakeLogger())
+        journal = Journal(tmp_path / "j.jsonl")
+        sync = DbSync(db, HARNESS, FakeLogger(), journal=journal)
         summary_id = sync.add_summary(issue_id="repo#1", run_id=None, kind="triage", body="text")
         assert isinstance(summary_id, str) and len(summary_id) == 32
 
@@ -218,3 +226,140 @@ class TestAddSummary:
         sync = DbSync(db, HARNESS, FakeLogger())
         sync.add_summary(issue_id="repo#1", run_id="r1", kind="dev", body="did it")
         assert db.calls
+
+
+class TestDurableWritesNowJournalInsteadOfBeingDropped:
+    """The Task 8 -> Task 21 upgrade: every durable write already routed
+    through `_durable`; only its failure branch changes here, from a log
+    line to `self._journal.append(op, payload)`. Nothing above `_durable`
+    (upsert_issue, start_run, finish_run, add_summary) changes at all."""
+
+    def test_upsert_issue_journals_and_does_not_raise_on_db_unavailable(self, tmp_path):
+        db = FakeDatabase(raises=DbUnavailable("down"))
+        journal = Journal(tmp_path / "j.jsonl")
+        sync = DbSync(db, HARNESS, FakeLogger(), journal=journal)
+
+        sync.upsert_issue(_make_record(), stage="ac-in-progress")  # must not raise
+
+        assert journal.pending() == 1
+
+    def test_start_run_journals_on_db_unavailable(self, tmp_path):
+        db = FakeDatabase(raises=DbUnavailable("down"))
+        journal = Journal(tmp_path / "j.jsonl")
+        sync = DbSync(db, HARNESS, FakeLogger(), journal=journal)
+
+        sync.start_run(run_id="r1", issue_id="repo#1", mode="dev", model="m")
+
+        assert journal.pending() == 1
+
+    def test_finish_run_journals_on_db_unavailable(self, tmp_path):
+        db = FakeDatabase(raises=DbUnavailable("down"))
+        journal = Journal(tmp_path / "j.jsonl")
+        sync = DbSync(db, HARNESS, FakeLogger(), journal=journal)
+
+        sync.finish_run(
+            run_id="r1", outcome="completed", exit_code=0, duration_seconds=1,
+            cost_usd=0.1, turns=1, crash_log_path=None,
+        )
+
+        assert journal.pending() == 1
+
+    def test_add_summary_journals_and_still_returns_a_stable_id(self, tmp_path):
+        db = FakeDatabase(raises=DbUnavailable("down"))
+        journal = Journal(tmp_path / "j.jsonl")
+        sync = DbSync(db, HARNESS, FakeLogger(), journal=journal)
+
+        summary_id = sync.add_summary(
+            issue_id="repo#1", run_id=None, kind="triage", body="text",
+        )
+
+        assert isinstance(summary_id, str) and len(summary_id) == 32
+        assert journal.pending() == 1
+
+    def test_a_non_connectivity_error_is_still_logged_and_dropped_not_journaled(self, tmp_path):
+        # A bad payload (e.g. a body too long for the column) must not
+        # journal forever against a write that will never succeed — this
+        # branch of _durable is untouched by the upgrade.
+        db = FakeDatabase(raises=ValueError("value too long"))
+        journal = Journal(tmp_path / "j.jsonl")
+        logger = FakeLogger()
+        sync = DbSync(db, HARNESS, logger, journal=journal)
+
+        sync.start_run(run_id="r1", issue_id="repo#1", mode="dev", model="m")
+
+        assert journal.pending() == 0
+        assert any("failed" in msg.lower() for _lvl, msg in logger.messages)
+
+    def test_no_db_at_all_journals_directly(self, tmp_path):
+        journal = Journal(tmp_path / "j.jsonl")
+        sync = DbSync(None, HARNESS, FakeLogger(), journal=journal)
+
+        sync.start_run(run_id="r1", issue_id="repo#1", mode="dev", model="m")
+
+        assert journal.pending() == 1
+
+
+class TestLeaseOperationsStillNeverJournal:
+    """Regression guard for the upgrade above: a real Journal is now wired
+    in, so it would be easy to accidentally route a lease operation through
+    it. `acquire_lease`/`check_lease` must keep failing closed and queuing
+    nothing — see the comment on that section of DbSync. "Claims never
+    queue" (spec, 12-shared-state-in-postgres.md): a journaled claim would
+    silently replay later and double-claim an issue another harness has
+    since taken over, which is the exact bug the lease exists to prevent."""
+
+    def test_acquire_lease_propagates_db_unavailable_and_does_not_journal(
+        self, tmp_path, monkeypatch
+    ):
+        # acquire_lease deliberately does not catch DbUnavailable itself (see
+        # the comment on DbSync's lease-operations block) — the caller
+        # decides what an unreachable database means for it. What this
+        # upgrade must not do is quietly journal the claim on the way out.
+        journal = Journal(tmp_path / "j.jsonl")
+        sync = DbSync(FakeDatabase(), HARNESS, FakeLogger(), journal=journal)
+        monkeypatch.setattr(
+            dbsync.lease, "acquire",
+            lambda *a, **k: (_ for _ in ()).throw(DbUnavailable("down")),
+        )
+
+        with pytest.raises(DbUnavailable):
+            sync.acquire_lease("repo#1")
+
+        assert journal.pending() == 0, "claims must fail closed, never queue"
+
+    def test_check_lease_delegates_to_lease_check_and_never_journals(
+        self, tmp_path, monkeypatch
+    ):
+        journal = Journal(tmp_path / "j.jsonl")
+        sync = DbSync(FakeDatabase(), HARNESS, FakeLogger(), journal=journal)
+        monkeypatch.setattr(dbsync.lease, "check", lambda *a, **k: False)
+
+        assert sync.check_lease("repo#1") is False
+        assert journal.pending() == 0
+
+
+class TestReplayPending:
+    def test_drains_the_journal_once_the_db_is_back(self, tmp_path):
+        journal = Journal(tmp_path / "j.jsonl")
+        journal.append(
+            "history.start_run",
+            dict(run_id="r1", issue_id="repo#1", harness_id="h1", mode="dev", model="m"),
+        )
+        db = FakeDatabase()
+        sync = DbSync(db, HARNESS, FakeLogger(), journal=journal)
+
+        applied = sync.replay_pending()
+
+        assert applied == 1
+        assert journal.pending() == 0
+
+    def test_returns_zero_with_no_db(self, tmp_path):
+        journal = Journal(tmp_path / "j.jsonl")
+        journal.append(
+            "history.start_run",
+            dict(run_id="r1", issue_id="repo#1", harness_id="h1", mode="dev", model="m"),
+        )
+        sync = DbSync(None, HARNESS, FakeLogger(), journal=journal)
+
+        assert sync.replay_pending() == 0
+        assert journal.pending() == 1

@@ -8,12 +8,13 @@ whose backing module already exists (`db/pool.py`, `db/harness.py`,
 the plan's "Sequencing and the `dbsync` dependency" table — without any
 earlier caller ever having to change how it constructs or calls this class.
 
-At this task, a durable write that cannot reach Postgres is logged and
-dropped, not journaled: `db/journal.py` does not exist until Task 20. That is
-safe because GitHub labels remain truth and startup reconciliation (Tasks
-10-11) rebuilds `issues.json` from scratch on every restart regardless. Task
-21 upgrades this method to journal instead, without changing this
-signature — `journal` is already accepted and stored for exactly that.
+A durable write that cannot reach Postgres (`DbUnavailable`) is journaled to
+`db/journal.py` instead of being dropped (Task 21); `main.py`'s poll loop
+calls `replay_pending()` to drain that journal once Postgres is reachable
+again. GitHub labels remain truth in the meantime, and startup reconciliation
+(Tasks 10-11) rebuilds `issues.json` from scratch on every restart regardless,
+so a pending journal is a durability optimisation, never a correctness
+requirement.
 """
 
 from __future__ import annotations
@@ -22,21 +23,22 @@ from typing import TYPE_CHECKING
 
 from db import history
 from db import issue_state
-from db import lease as db_lease
+from db import lease
 from db.harness import Harness
 from db.pool import Database, DbUnavailable
 from state import IssueRecord
 
 if TYPE_CHECKING:
-    # db/journal.py does not exist until Task 21 — guard the import so this
-    # module never fails to import in the meantime. `journal` is typed
-    # loosely (see below) so no runtime reference to `Journal` is needed.
+    # Only needed for the type hint below — no runtime reference to
+    # `Journal` is required, so this stays lazy even though db/journal.py
+    # exists now.
     from db.journal import Journal
 
 
 class DbSync:
-    """Postgres access for the harness. At this task, durable writes that
-    fail are logged and dropped; Task 21 upgrades that to a real journal."""
+    """Postgres access for the harness. Durable writes that cannot reach
+    Postgres are journaled (see `_durable`) and replayed by `replay_pending`
+    once it is reachable again; lease operations never journal."""
 
     def __init__(self, db: Database | None, harness: Harness, logger, *,
                  journal: "Journal | None" = None, ttl_seconds: int = 1800) -> None:
@@ -102,21 +104,26 @@ class DbSync:
         return summary_id
 
     def _durable(self, op: str, payload: dict, call) -> None:
-        """Run a durable write. Never raises — logs and drops on failure.
+        """Run a durable write. Journal it on DbUnavailable; log and drop it
+        on any other error, since journaling a write that will never succeed
+        (a bad payload, a constraint violation) would retry it forever
+        against the same broken data every time the journal replays.
 
-        Safe because GitHub labels stay truth and startup reconciliation
-        rebuilds `issues.json` from scratch every restart. Task 21 replaces
-        the two `self._logger.warn(...)` branches below with
-        `self._journal.append(op, payload)`, once `db/journal.py` exists —
-        `payload` is already the exact dict a journal entry needs.
+        Upgraded here from Task 8's log-and-drop sink to a real journal —
+        `self._journal` is a `db.journal.Journal` now (main.py constructs
+        one below), not `None`. Nothing about `_durable`'s callers
+        (upsert_issue, start_run, finish_run, add_summary) or DbSync's
+        constructor signature changed to make this possible; `journal` has
+        been an accepted argument since Task 8.
         """
         if self._db is None:
-            self._logger.warn(f"No database configured — dropping {op}")
+            self._journal.append(op, payload)
             return
         try:
             call()
         except DbUnavailable as exc:
-            self._logger.warn(f"Postgres unreachable — dropping {op} (not journaled yet): {exc}")
+            self._logger.warn(f"Postgres unreachable — journaling {op}: {exc}")
+            self._journal.append(op, payload)
         except Exception as exc:
             self._logger.error(f"Durable write {op} failed (not journaled): {exc}")
 
@@ -162,24 +169,37 @@ class DbSync:
     def acquire_lease(self, issue_id: str) -> bool:
         if not self.enabled:
             return True
-        return db_lease.acquire(self._db, issue_id, self._harness.id, self._ttl_seconds)
+        return lease.acquire(self._db, issue_id, self._harness.id, self._ttl_seconds)
 
     def heartbeat(self) -> None:
         if not self.enabled:
             return
-        db_lease.heartbeat(self._db, self._harness.id, self._ttl_seconds)
+        lease.heartbeat(self._db, self._harness.id, self._ttl_seconds)
 
     def release_lease(self, issue_id: str) -> None:
         if not self.enabled:
             return
-        db_lease.release(self._db, issue_id, self._harness.id)
+        lease.release(self._db, issue_id, self._harness.id)
 
     def check_lease(self, issue_id: str) -> bool:
         if not self.enabled:
             return True
-        return db_lease.check(self._db, issue_id, self._harness.id)
+        return lease.check(self._db, issue_id, self._harness.id)
 
     def release_expired(self) -> list[str]:
         if not self.enabled:
             return []
-        return db_lease.release_expired(self._db)
+        return lease.release_expired(self._db)
+
+    # ------------------------------------------------------------------
+    # Replay
+    # ------------------------------------------------------------------
+
+    def replay_pending(self) -> int:
+        if self._db is None:
+            return 0
+        try:
+            return self._journal.replay(self._db)
+        except DbUnavailable as exc:
+            self._logger.warn(f"Replay stopped — Postgres unreachable again: {exc}")
+            return 0

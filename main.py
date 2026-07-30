@@ -17,6 +17,7 @@ from db import harness as db_harness
 from db import issue_state as db_issue_state
 from db import lease as db_lease
 from db.harness import new_harness
+from db.journal import Journal
 from db.pool import Database, DbUnavailable
 from db.schema import SchemaOutOfDate, check_schema_current
 from dbsync import DbSync
@@ -114,25 +115,28 @@ def _check_schema_gate(db, logger: MainLogger) -> None:
         _abort(logger, f"Cannot reach Postgres to verify the schema: {exc}")
 
 
-def _register_harness(db, harness, logger: MainLogger) -> None:
+def _register_harness(db, harness, logger: MainLogger, journal) -> None:
     """Best-effort harness registration. A registration that cannot reach
-    Postgres is logged and dropped, not journaled — db/journal.py does not
-    exist until Task 20, and the harness attempts registration again on the
-    next restart regardless. Task 21 revisits this once a real Journal
-    exists."""
+    Postgres is journaled and replayed the next time Postgres is reachable —
+    see Journal.OPS, which lists "harness.register" as a legitimate op."""
     if db is None:
         return
     try:
         db_harness.register(db, harness)
     except DbUnavailable as exc:
-        logger.warn(f"Postgres unreachable while registering the harness: {exc}")
+        journal.append("harness.register", {
+            "id": harness.id, "hostname": harness.hostname,
+            "pid": harness.pid, "version": harness.version,
+        })
+        logger.warn(f"Postgres unreachable while registering the harness — journaled: {exc}")
 
 
 def _init_db_layer(config, logger: MainLogger):
     """Construct the Postgres-backed layer main() writes through, or a fully
     degraded stand-in when it is disabled/unreachable. Returns
-    (db, harness, dbsync) — db is None in degraded mode; harness and dbsync
-    always exist so callers never branch on "did this construct".
+    (db, journal, harness, dbsync) — db is None in degraded mode; journal,
+    harness and dbsync always exist so callers never branch on "did this
+    construct".
 
     Startup is deliberately stricter than runtime (ruling, 2026-07-29): a
     harness that cannot confirm it reaches a current-schema Postgres could
@@ -144,6 +148,7 @@ def _init_db_layer(config, logger: MainLogger):
     today. This is the opposite of runtime behaviour, where a database
     problem must never abort a running agent.
     """
+    journal = Journal(config.database.journal_file)
     harness = new_harness(version.__version__)
 
     db = None
@@ -151,15 +156,16 @@ def _init_db_layer(config, logger: MainLogger):
     if url:
         db = Database(url, connect_timeout=config.database.connect_timeout_seconds)
         _check_schema_gate(db, logger)
-        _register_harness(db, harness, logger)
+        _register_harness(db, harness, logger, journal)
     else:
         logger.info(
             "Database sync disabled or PIPELINE_METRICS_DATABASE_URL unset — "
             "running on local state only"
         )
 
-    dbsync = DbSync(db, harness, logger, ttl_seconds=config.database.lease_ttl_seconds)
-    return db, harness, dbsync
+    dbsync = DbSync(db, harness, logger, journal=journal,
+                     ttl_seconds=config.database.lease_ttl_seconds)
+    return db, journal, harness, dbsync
 
 
 def _collect_gh_issues_for_reconcile(config, github, logger: MainLogger) -> dict:
@@ -808,7 +814,7 @@ def main() -> None:
     # Initialize core components
     github = GithubClient(config.github.org)
 
-    db, harness, dbsync = _init_db_layer(config, logger)
+    db, journal, harness, dbsync = _init_db_layer(config, logger)
 
     state = StateStore(config.paths.state_file, on_change=_make_on_change(dbsync))
     _reconcile_at_startup(config, github, state, db, harness, dbsync, logger)
@@ -871,6 +877,7 @@ def main() -> None:
             last_heartbeat = _maybe_heartbeat(
                 dbsync, last_heartbeat, config.database.heartbeat_interval_seconds, logger
             )
+            dbsync.replay_pending()
 
             # 2. Poll for new/retriage issues
             new_issues, retriage_issues = poller.poll()
@@ -918,6 +925,7 @@ def main() -> None:
                 last_heartbeat = _maybe_heartbeat(
                     dbsync, last_heartbeat, config.database.heartbeat_interval_seconds, logger
                 )
+                dbsync.replay_pending()
                 time.sleep(1)
 
     except KeyboardInterrupt:

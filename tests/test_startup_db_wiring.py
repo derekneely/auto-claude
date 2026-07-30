@@ -64,7 +64,7 @@ class TestInitDbLayerDegradedMode:
         cfg = _config(_db_config(enabled=False))
         monkeypatch.setattr(main, "Database", lambda *a, **k: (_ for _ in ()).throw(
             AssertionError("must not construct a Database when disabled")))
-        db, harness, dbsync = main._init_db_layer(cfg, _logger())
+        db, _journal, harness, dbsync = main._init_db_layer(cfg, _logger())
         assert db is None
         assert dbsync.enabled is False
         assert harness is not None  # a harness identity always exists, DB or not
@@ -73,7 +73,7 @@ class TestInitDbLayerDegradedMode:
         cfg = _config(_db_config(enabled=True, url=None))
         monkeypatch.setattr(main, "Database", lambda *a, **k: (_ for _ in ()).throw(
             AssertionError("must not construct a Database with no URL")))
-        db, _harness, dbsync = main._init_db_layer(cfg, _logger())
+        db, _journal, _harness, dbsync = main._init_db_layer(cfg, _logger())
         assert db is None
         assert dbsync.enabled is False
 
@@ -83,7 +83,7 @@ class TestInitDbLayerDegradedMode:
         # has to land here even though nothing consumes it yet.
         cfg = _config(_db_config(enabled=False))
         cfg.database.lease_ttl_seconds = 900
-        _db, _harness, dbsync = main._init_db_layer(cfg, _logger())
+        _db, _journal, _harness, dbsync = main._init_db_layer(cfg, _logger())
         assert dbsync._ttl_seconds == 900
 
     def test_reconcile_at_startup_tolerates_no_database(self, tmp_path):
@@ -225,3 +225,26 @@ class TestOnChangeWrapperUpsertsWithDerivedStage:
         record = SimpleNamespace(labels=["ac-in-progress", "ac-fix"])
         handler(record)
         assert calls == [(record, "ac-in-progress")]
+
+
+class TestInitDbLayerConstructsARealJournal:
+    def test_init_db_layer_returns_a_four_tuple_with_a_real_journal(self, tmp_path):
+        cfg = _config(_db_config(enabled=False))
+        cfg.database.journal_file = tmp_path / "journal.jsonl"
+        db, journal, _harness, dbsync = main._init_db_layer(cfg, _logger())
+        assert db is None
+        assert isinstance(journal, main.Journal)
+        assert dbsync._journal is journal
+
+    def test_register_harness_now_journals_instead_of_only_logging(self, tmp_path, monkeypatch):
+        # Task 11 could only log-and-drop a failed registration — db/journal.py
+        # did not exist yet. Now that it does, a registration that cannot
+        # reach Postgres must be queued for replay, not merely logged.
+        harness = main.new_harness("0.2.0")
+        journal = main.Journal(tmp_path / "journal.jsonl")
+        monkeypatch.setattr(
+            main.db_harness, "register",
+            lambda *a, **k: (_ for _ in ()).throw(main.DbUnavailable("down")),
+        )
+        main._register_harness(object(), harness, _logger(), journal)
+        assert journal.pending() == 1
