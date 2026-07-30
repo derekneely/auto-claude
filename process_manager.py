@@ -56,6 +56,12 @@ class ProcessManager:
         # ProcessManager without these two new arguments is unaffected.
         self._dbsync = dbsync
         self._harness_id = harness_id
+        # issue_id -> run_id for the run row currently open on that issue's
+        # active worker. Populated by the worker's first StateUpdate,
+        # cleared by its terminal one. Anything still here when a worker is
+        # reaped means the terminal update never arrived — see
+        # `_close_dangling_run`.
+        self._active_runs: dict[str, str] = {}
 
     def _repo_pipeline(self, repo: str):
         """The repo's `.claude/pipeline.json`, or None if it has none.
@@ -300,6 +306,7 @@ class ProcessManager:
                 self._state.update(issue_id, error=f"Worker crashed (exit code {exitcode})")
                 self._state.save()
                 record = self._state.get(issue_id)
+                self._close_dangling_run(issue_id, outcome="failed", exit_code=exitcode)
 
             # Rate limited: re-queue unconditionally. This is not the issue's
             # fault, so it must not consume a continuation or count as a failure.
@@ -355,6 +362,12 @@ class ProcessManager:
             # not cause the pool-wide pause to be dropped on the floor.
             self._note_rate_limit(update)
 
+            # Run rows are opened/closed independently of whether the issue
+            # transition below succeeds — a worker that raced main's own
+            # bookkeeping (e.g. the issue was already terminal) still ran and
+            # still needs its cost/duration captured.
+            self._sync_run(update)
+
             record = self._state.get(update.issue_id)
             if record is None:
                 continue
@@ -383,6 +396,28 @@ class ProcessManager:
                 self._state.update(update.issue_id, **updates)
 
             self._state.save()
+
+    def _sync_run(self, update: StateUpdate) -> None:
+        """Open or close a `run` row from a worker's StateUpdate. No-op if
+        no dbsync is wired (see __init__)."""
+        if self._dbsync is None:
+            return
+
+        if update.run_mode is not None:
+            self._active_runs[update.issue_id] = update.run_id
+            self._dbsync.start_run(
+                run_id=update.run_id, issue_id=update.issue_id,
+                mode=update.run_mode, model=update.run_model,
+            )
+
+        if update.run_outcome is not None:
+            run_id = self._active_runs.pop(update.issue_id, update.run_id)
+            self._dbsync.finish_run(
+                run_id=run_id, outcome=update.run_outcome,
+                exit_code=update.exit_code, duration_seconds=update.duration_seconds,
+                cost_usd=update.cost_usd, turns=update.turns,
+                crash_log_path=update.crash_log_path,
+            )
 
     def abort_worker(self, issue_id: str) -> None:
         """Signal a specific worker to abort."""
@@ -418,7 +453,7 @@ class ProcessManager:
                 proc.terminate()
                 proc.join(timeout=5)
 
-            self._mark_interrupted(issue_id)
+            self._mark_interrupted(issue_id, exit_code=proc.exitcode)
 
         self._workers.clear()
 
@@ -451,7 +486,7 @@ class ProcessManager:
             f"{self.rate_limit_remaining / 60:.1f} min (resuming ~{resume})"
         )
 
-    def _mark_interrupted(self, issue_id: str) -> None:
+    def _mark_interrupted(self, issue_id: str, exit_code: int | None = None) -> None:
         """Leave an aborted worker's issue in a status the poller can resurrect.
 
         `poller` only re-queues a known issue from FAILED/COMPLETED/INTERRUPTED,
@@ -465,6 +500,28 @@ class ProcessManager:
         if record and record.status == IssueStatus.IN_PROGRESS:
             self._state.transition(issue_id, IssueStatus.INTERRUPTED)
             self._state.save()
+            self._close_dangling_run(issue_id, outcome="interrupted", exit_code=exit_code)
+
+    def _close_dangling_run(self, issue_id: str, *, outcome: str, exit_code: int | None) -> None:
+        """Close a `run` row the worker itself never got to close.
+
+        Reached when a worker process dies without sending a terminal
+        StateUpdate — a hard crash (outcome="failed", from `reap_dead`) or a
+        force-terminate during shutdown (outcome="interrupted", from
+        `_mark_interrupted`). `_active_runs` is populated from the worker's
+        first StateUpdate and popped by its terminal one; if this issue_id is
+        still in the map, that terminal message never arrived, so none of
+        the metric fields are known — they go in as NULL.
+        """
+        if self._dbsync is None:
+            return
+        run_id = self._active_runs.pop(issue_id, None)
+        if run_id is None:
+            return
+        self._dbsync.finish_run(
+            run_id=run_id, outcome=outcome, exit_code=exit_code,
+            duration_seconds=None, cost_usd=None, turns=None, crash_log_path=None,
+        )
 
     def _drain_and_reap_during_shutdown(self) -> None:
         """Drain queues and remove dead workers during shutdown."""
@@ -484,7 +541,7 @@ class ProcessManager:
             # reaped here, which pops it before shutdown_all's force-terminate
             # loop can see it. Without this the "mark interrupted" pass there
             # ran over an empty dict and every clean Ctrl+C stranded its issue.
-            self._mark_interrupted(issue_id)
+            self._mark_interrupted(issue_id, exit_code=proc.exitcode)
 
     def _post_budget_comment(self, record: IssueRecord) -> None:
         """Post a comment when budget was exceeded across max continuation runs."""

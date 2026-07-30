@@ -229,6 +229,21 @@ class StateUpdate:
     # Epoch seconds until which the supervisor should stop spawning workers.
     # Set when Claude reports a rate limit; see ratelimit.py.
     rate_limited_until: float | None = None
+    # Run identity + metrics, threaded from worker back to `main` — the sole
+    # Postgres writer — so a `run` row can be opened/closed without the
+    # worker touching the database directly. `run_mode`/`run_model` are set
+    # on the FIRST update of a run (opens the row); `run_outcome` and the
+    # metric fields are set on the LAST update (closes it). A message never
+    # carries both halves.
+    run_id: str | None = None
+    run_mode: str | None = None       # "dev" | "review"
+    run_model: str | None = None
+    run_outcome: str | None = None    # completed|failed|interrupted|fenced
+    exit_code: int | None = None
+    duration_seconds: int | None = None
+    cost_usd: float | None = None
+    turns: int | None = None
+    crash_log_path: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -1773,12 +1788,21 @@ def run_dev_worker(
     logger.info(f"Dev worker started (PID {pid}) — action={ctx.action}"
                 + (f" [rework #{ctx.rework_count}]" if is_rework else ""))
 
+    # Opened here so it is in scope for every exit path below, including the
+    # generic exception handler if a crash happens before Claude ever runs.
+    run_id = uuid.uuid4().hex
+    metrics = RunMetrics()
+    returncode: int | None = None
+
     # Signal that we're in progress + claim the stage label as a distributed
     # lock. This never touches the kind hint (ac-fix, ac-implement, ...).
     state_queue.put(StateUpdate(
         issue_id=ctx.issue_id,
         status="in_progress",
         worker_pid=pid,
+        run_id=run_id,
+        run_mode="dev",
+        run_model=ctx.dev_model,
     ))
 
     branch = sanitize_branch_name(ctx.title, ctx.number)
@@ -1860,6 +1884,12 @@ def run_dev_worker(
                 branch=branch,
                 pr_url=partial_pr or ctx.pr_url,
                 rate_limited_until=_rate_limited_until(rate_limit),
+                run_id=run_id,
+                run_outcome="failed",
+                exit_code=returncode,
+                duration_seconds=metrics.duration_seconds,
+                cost_usd=metrics.cost_usd,
+                turns=metrics.turns,
             ))
             return
 
@@ -1887,6 +1917,12 @@ def run_dev_worker(
                 branch=branch,
                 pr_url=partial_pr or ctx.pr_url,
                 handoff_summary=handoff,
+                run_id=run_id,
+                run_outcome="failed",
+                exit_code=returncode,
+                duration_seconds=metrics.duration_seconds,
+                cost_usd=metrics.cost_usd,
+                turns=metrics.turns,
             ))
             return
 
@@ -2009,6 +2045,12 @@ def run_dev_worker(
             status="completed",
             branch=branch,
             pr_url=pr_url,
+            run_id=run_id,
+            run_outcome="completed",
+            exit_code=returncode,
+            duration_seconds=metrics.duration_seconds,
+            cost_usd=metrics.cost_usd,
+            turns=metrics.turns,
         ))
 
     except LeaseLostError as exc:
@@ -2027,6 +2069,13 @@ def run_dev_worker(
             issue_id=ctx.issue_id,
             status="failed",
             error=str(exc),
+            run_id=run_id,
+            run_outcome="failed",
+            exit_code=returncode,
+            duration_seconds=metrics.duration_seconds,
+            cost_usd=metrics.cost_usd,
+            turns=metrics.turns,
+            crash_log_path=str(log_path) if log_path else None,
         ))
 
         # Bump the attempt counter and return to ac-dev-ready — or, on the
@@ -2241,10 +2290,17 @@ def run_review_worker(
     pid = os.getpid()
     logger.info(f"Review worker started (PID {pid}) — PR {ctx.pr_url}")
 
+    run_id = uuid.uuid4().hex
+    metrics = RunMetrics()
+    returncode: int | None = None
+
     state_queue.put(StateUpdate(
         issue_id=ctx.issue_id,
         status="in_progress",
         worker_pid=pid,
+        run_id=run_id,
+        run_mode="review",
+        run_model=ctx.dev_model,
     ))
 
     worktree_dir = ctx.worktrees_dir / ctx.repo / f"issue-{ctx.number}-review"
@@ -2357,6 +2413,12 @@ def run_review_worker(
                 issue_id=ctx.issue_id,
                 status="completed",
                 pr_url=ctx.pr_url,
+                run_id=run_id,
+                run_outcome="completed",
+                exit_code=returncode,
+                duration_seconds=metrics.duration_seconds,
+                cost_usd=metrics.cost_usd,
+                turns=metrics.turns,
             ))
             return
 
@@ -2381,6 +2443,12 @@ def run_review_worker(
             status="failed",
             error="blocked" if blocked else "review_fail",
             pr_url=ctx.pr_url,
+            run_id=run_id,
+            run_outcome="failed",
+            exit_code=returncode,
+            duration_seconds=metrics.duration_seconds,
+            cost_usd=metrics.cost_usd,
+            turns=metrics.turns,
         ))
 
     except LeaseLostError as exc:
@@ -2398,6 +2466,13 @@ def run_review_worker(
             issue_id=ctx.issue_id,
             status="failed",
             error=str(exc),
+            run_id=run_id,
+            run_outcome="failed",
+            exit_code=returncode,
+            duration_seconds=metrics.duration_seconds,
+            cost_usd=metrics.cost_usd,
+            turns=metrics.turns,
+            crash_log_path=str(log_path) if log_path else None,
         ))
 
         # Release the self-lock so the issue is not stranded on

@@ -188,3 +188,19 @@ class TestConfiguredTtlReachesDbLease:
         _dbsync(db, ttl_seconds=900).heartbeat()
         _sql, params = db.calls[0]
         assert 900 in params, "the configured ttl_seconds must reach db.lease.heartbeat"
+
+
+class TestStartAndFinishRun:
+    def test_start_run_succeeds_silently_when_postgres_is_reachable(self):
+        db = FakeDatabase()
+        sync = DbSync(db, HARNESS, FakeLogger())
+        sync.start_run(run_id="r1", issue_id="repo#1", mode="dev", model="m")
+        assert db.calls
+
+    def test_finish_run_is_logged_and_dropped_on_db_unavailable(self):
+        db = FakeDatabase(raises=DbUnavailable("down"))
+        logger = FakeLogger()
+        sync = DbSync(db, HARNESS, logger)
+        sync.finish_run(run_id="r1", outcome="completed", exit_code=0,
+                         duration_seconds=1, cost_usd=0.1, turns=1, crash_log_path=None)
+        assert any("dropping" in msg.lower() for _lvl, msg in logger.messages)

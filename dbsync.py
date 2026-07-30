@@ -20,6 +20,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+from db import history
 from db import issue_state
 from db import lease as db_lease
 from db.harness import Harness
@@ -66,6 +67,23 @@ class DbSync:
             continuation_count=record.continuation_count, last_error=record.error,
         )
         self._durable("issue_state.upsert", payload, lambda: issue_state.upsert(self._db, **payload))
+
+    def start_run(self, *, run_id: str, issue_id: str, mode: str, model: str | None) -> None:
+        payload = dict(
+            run_id=run_id, issue_id=issue_id, harness_id=self._harness.id,
+            mode=mode, model=model,
+        )
+        self._durable("history.start_run", payload, lambda: history.start_run(self._db, **payload))
+
+    def finish_run(self, *, run_id: str, outcome: str, exit_code: int | None,
+                   duration_seconds: int | None, cost_usd: float | None, turns: int | None,
+                   crash_log_path: str | None) -> None:
+        payload = dict(
+            run_id=run_id, outcome=outcome, exit_code=exit_code,
+            duration_seconds=duration_seconds, cost_usd=cost_usd, turns=turns,
+            crash_log_path=crash_log_path,
+        )
+        self._durable("history.finish_run", payload, lambda: history.finish_run(self._db, **payload))
 
     def _durable(self, op: str, payload: dict, call) -> None:
         """Run a durable write. Never raises — logs and drops on failure.
