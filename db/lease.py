@@ -40,7 +40,7 @@ UPDATE auto_claude.issue_state
        lease_expires_at = now() + make_interval(secs => %s),
        heartbeat_at     = now()
  WHERE issue_id = %s
-   AND (owner_harness_id IS NULL OR lease_expires_at < now())
+   AND (owner_harness_id IS NULL OR owner_harness_id = %s OR lease_expires_at < now())
 RETURNING issue_id
 """
 
@@ -89,6 +89,21 @@ def acquire(db: Database, issue_id: str, harness_id: str,
     from "someone else holds it", and the two demand different responses
     from a caller - retry shortly, versus move on to the next issue.
 
+    The WHERE guard's `owner_harness_id = %s` arm makes re-claiming a lease
+    we already hold succeed unconditionally, alongside a free row and an
+    expired one. Without it, `acquire` is the one statement in this module
+    that is not idempotent under `Database.execute`'s retry-on-
+    OperationalError (db/pool.py): a claim that commits on the server but
+    then loses the connection before the client sees the acknowledgement
+    gets retried, the retry's WHERE clause no longer matches because *we
+    ourselves* now hold the lease, it returns zero rows, and `acquire`
+    reports False for a lease we actually hold - after which `heartbeat`'s
+    blanket `WHERE owner_harness_id = %s` (no per-issue liveness check) keeps
+    renewing that phantom-lost lease indefinitely, making the issue
+    permanently unspawnable for the life of the daemon. See
+    tests/test_db_lease.py::TestAcquire::
+    test_reclaiming_a_lease_we_already_hold_always_succeeds.
+
     `owner_harness_id` carries a real FK to `auto_claude.harness(id)`.
     Claiming for a `harness_id` nobody registered raises the database's own
     integrity error (`psycopg.errors.ForeignKeyViolation` against a real
@@ -100,7 +115,7 @@ def acquire(db: Database, issue_id: str, harness_id: str,
     production rather than be mistaken for "someone else holds the lease".
     See tests/test_db_lease.py::TestAcquireOnUnregisteredHarness.
     """
-    rows = db.execute(_ACQUIRE_SQL, (harness_id, ttl_seconds, issue_id))
+    rows = db.execute(_ACQUIRE_SQL, (harness_id, ttl_seconds, issue_id, harness_id))
     return len(rows) == 1
 
 

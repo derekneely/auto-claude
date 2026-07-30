@@ -2,9 +2,9 @@
 """db/harness.py — this process's identity row in auto_claude.harness.
 
 Every lease and every run/summary row references a harness id, so `register`
-succeeding (or being journaled — Task 21, once a real journal exists; logged
-and dropped in the meantime, Task 11) comes before anything else in db/
-does useful work.
+succeeding — or, when Postgres is briefly unreachable, being journaled for
+replay instead (see `main._register_harness` and `db/journal.py`) — comes
+before anything else in db/ does useful work.
 """
 
 from __future__ import annotations

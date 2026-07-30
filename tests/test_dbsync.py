@@ -29,7 +29,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import dbsync  # noqa: E402
 from dbsync import DbSync  # noqa: E402
 from db.harness import Harness  # noqa: E402
-from db.journal import Journal  # noqa: E402
+from db.journal import Journal, NullJournal  # noqa: E402
 from db.pool import DbUnavailable  # noqa: E402
 from state import IssueRecord  # noqa: E402
 
@@ -77,15 +77,23 @@ def _make_record(**overrides):
 HARNESS = Harness(id="h1", hostname="box", pid=1, version="0.2.0")
 
 
-def _unused_journal() -> Journal:
-    """A Journal that is never read from or written to. `journal` is a
+def _unused_journal() -> NullJournal:
+    """A journal that must never actually be written to. `journal` is a
     required DbSync constructor argument (fix round, Finding 2), but many
     tests below exercise a path that succeeds before ever reaching
     `_durable`'s failure branches — this stands in for those, matching a
     real construction site without adding an irrelevant `tmp_path` fixture
-    to every one of them. Its constructor does no filesystem I/O (see
-    db/journal.py), so a bare relative path is harmless."""
-    return Journal(Path("unused-in-this-test.jsonl"))
+    to every one of them.
+
+    A real `Journal` on a bare relative path used to fill this role — its
+    constructor does no filesystem I/O, so it never failed outright — but
+    that made "this path must never journal" a fact about which tests
+    happen to exercise which branches rather than something enforced: a
+    regression that made one of these tests reach `_durable`'s
+    DbUnavailable branch would have quietly appended a real line into
+    `unused-in-this-test.jsonl` in the repo root and still passed.
+    `NullJournal.append` raises instead, so that regression fails loudly."""
+    return NullJournal()
 
 
 class TestEnabled:

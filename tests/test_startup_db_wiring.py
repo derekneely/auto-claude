@@ -227,6 +227,30 @@ class TestOnChangeWrapperUpsertsWithDerivedStage:
         assert calls == [(record, "ac-in-progress")]
 
 
+class TestHarnessIdForWorkers:
+    """Final whole-branch review, Critical 1: `main()` used to pass
+    `harness.id` into `ProcessManager` unconditionally — `_init_db_layer`
+    constructs a real `harness` even when `db` is None (disabled/no URL), so
+    every worker's `IssueContext.harness_id` was truthy regardless of
+    whether Postgres was configured. Combined with
+    `PIPELINE_METRICS_DATABASE_URL` routinely being set for the sibling Node
+    telemetry, `worker._assert_lease_held` connected to that unrelated
+    Postgres, found no lease row for a harness that never registered
+    anywhere, and fenced every single write - the documented
+    `[database] enabled = false` rollback switch was the thing that broke
+    the daemon. This pins the fix directly: the harness id handed to workers
+    must be None whenever there is no database to fence against."""
+
+    def test_none_when_db_is_none(self):
+        harness = SimpleNamespace(id="h1")
+        assert main._harness_id_for_workers(None, harness) is None
+
+    def test_real_id_when_db_is_configured(self):
+        harness = SimpleNamespace(id="h1")
+        db = SimpleNamespace()  # any non-None stand-in for a real Database
+        assert main._harness_id_for_workers(db, harness) == "h1"
+
+
 class TestInitDbLayerConstructsARealJournal:
     def test_init_db_layer_returns_a_four_tuple_with_a_real_journal(self, tmp_path):
         cfg = _config(_db_config(enabled=False))
@@ -248,3 +272,46 @@ class TestInitDbLayerConstructsARealJournal:
         )
         main._register_harness(object(), harness, _logger(), journal)
         assert journal.pending() == 1
+
+    def test_a_non_connectivity_error_is_logged_and_dropped_not_journaled(
+        self, tmp_path, monkeypatch,
+    ):
+        # Final whole-branch review, Finding 5: _register_harness used to
+        # catch only DbUnavailable, so any other exception from register()
+        # (a bad payload, a constraint violation - not a connectivity
+        # problem) propagated out of _init_db_layer as a raw traceback
+        # instead of the clean, logged outcome dbsync.py's _durable already
+        # gives the equivalent case. Journaling it would be wrong too:
+        # replaying the identical bad data would fail identically forever.
+        harness = main.new_harness("0.2.0")
+        journal = main.Journal(tmp_path / "journal.jsonl")
+        monkeypatch.setattr(
+            main.db_harness, "register",
+            lambda *a, **k: (_ for _ in ()).throw(ValueError("value too long")),
+        )
+        logger = _logger()
+
+        main._register_harness(object(), harness, logger, journal)  # must not raise
+
+        assert journal.pending() == 0
+        assert any("failed" in m.lower() for _lvl, m in logger.messages)
+
+    def test_a_journal_write_failure_after_db_unavailable_is_logged_not_raised(
+        self, tmp_path, monkeypatch,
+    ):
+        # Mirrors dbsync.py's _durable: a journal we cannot write to (disk
+        # full, a permissions failure) must not turn a best-effort
+        # registration into a startup crash either.
+        harness = main.new_harness("0.2.0")
+        monkeypatch.setattr(
+            main.db_harness, "register",
+            lambda *a, **k: (_ for _ in ()).throw(main.DbUnavailable("down")),
+        )
+        broken_journal = SimpleNamespace(
+            append=lambda *a, **k: (_ for _ in ()).throw(OSError("disk full"))
+        )
+        logger = _logger()
+
+        main._register_harness(object(), harness, logger, broken_journal)  # must not raise
+
+        assert any("could not journal" in m.lower() for _lvl, m in logger.messages)

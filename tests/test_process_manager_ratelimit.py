@@ -301,6 +301,95 @@ class TestLeaseGatesSpawn:
         assert calls == [], "must not construct a worker Process without the lease"
 
 
+def _make_full_pm(tmp_path, dbsync):
+    """A ProcessManager with a config complete enough to reach spawn()'s
+    Process construction, not just the early lease-check return. Kept
+    separate from `make_pm` above (whose config is deliberately minimal)
+    because every other test in this file returns before touching most of
+    these fields."""
+    config = SimpleNamespace(
+        workers=SimpleNamespace(max_parallel=3, shutdown_grace_seconds=30),
+        github=SimpleNamespace(org="Accelevation", base_branch="dev"),
+        claude=SimpleNamespace(
+            dev_model="claude-opus", light_model="claude-sonnet",
+            permission_mode="acceptEdits", max_budget_usd=10.0,
+            max_turns_dev=100, grace_budget_usd=1.0, action_models={},
+        ),
+        paths=SimpleNamespace(
+            repos_dir=tmp_path, worktrees_dir=tmp_path, prompts_dir=tmp_path,
+            crash_logs_dir=tmp_path,
+        ),
+        integrations=SimpleNamespace(claude_tools_root=None),
+        database=SimpleNamespace(url_env="PIPELINE_METRICS_DATABASE_URL"),
+    )
+    pm = ProcessManager(
+        config=config,
+        state=FakeState(),
+        logger=FakeLogger(),
+        log_queue=queue.Queue(),
+        state_queue=queue.Queue(),
+        dbsync=dbsync,
+        harness_id="h1",
+    )
+    pm._pipelines["r"] = None  # skip the GitHub pipeline.json lookup entirely
+    return pm
+
+
+def _full_record():
+    return SimpleNamespace(
+        issue_id="r#1", repo="r", number=1, title="t", body="",
+        action="fix", branch=None, pr_url=None, rework_count=0,
+        handoff_summary=None, mode="dev",
+    )
+
+
+class TestSpawnFailureReleasesTheLease:
+    """Final whole-branch review, Important 2 (second half): `proc.start()`
+    can raise (a Windows spawn failure, a pickling failure in `ctx`), and the
+    lease `_lease_ok` just acquired above must not then be held and
+    heartbeated for the rest of LEASE_TTL_SECONDS - the same as
+    `reap_dead`'s own release-on-exit path already guarantees."""
+
+    def test_a_process_construction_failure_releases_the_lease_and_registers_no_worker(
+        self, tmp_path, monkeypatch,
+    ):
+        dbsync = FakeDbSync(grant=True)
+        pm = _make_full_pm(tmp_path, dbsync)
+        monkeypatch.setattr(
+            "process_manager.Process",
+            lambda **kw: (_ for _ in ()).throw(OSError("could not spawn worker process")),
+        )
+
+        pm.spawn(_full_record())  # must not raise
+
+        assert dbsync.acquired == ["r#1"]
+        assert dbsync.released == ["r#1"], (
+            "a lease taken for a spawn that then failed must be released, "
+            "not left to expire on TTL alone"
+        )
+        assert "r#1" not in pm._workers
+
+    def test_a_process_construction_failure_with_postgres_unreachable_still_does_not_raise(
+        self, tmp_path, monkeypatch,
+    ):
+        # The release-on-failure path must itself tolerate a database that
+        # has gone unreachable in between - same fail-open-but-non-fatal
+        # rule as reap_dead's own release_lease handling.
+        dbsync = FakeDbSync(grant=True)
+        pm = _make_full_pm(tmp_path, dbsync)
+        dbsync.release_lease = lambda issue_id: (_ for _ in ()).throw(
+            DbUnavailable("could not reach Postgres")
+        )
+        monkeypatch.setattr(
+            "process_manager.Process",
+            lambda **kw: (_ for _ in ()).throw(OSError("could not spawn worker process")),
+        )
+
+        pm.spawn(_full_record())  # must not raise
+
+        assert "r#1" not in pm._workers
+
+
 class TestLeaseReleaseOnReap:
     def test_releases_the_lease_when_a_worker_is_reaped(self):
         rec = SimpleNamespace(issue_id="r#1", status="completed", error=None,

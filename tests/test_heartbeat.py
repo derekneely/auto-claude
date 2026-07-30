@@ -48,9 +48,13 @@ class _FakeLogger:
 class _FakeDbSync:
     def __init__(self):
         self.heartbeats = 0
+        self.touches = 0
 
     def heartbeat(self):
         self.heartbeats += 1
+
+    def touch_harness(self):
+        self.touches += 1
 
 
 class _FakeUnavailableDbSync:
@@ -60,9 +64,17 @@ class _FakeUnavailableDbSync:
 
     def __init__(self):
         self.attempts = 0
+        self.touch_attempts = 0
 
     def heartbeat(self):
         self.attempts += 1
+        raise DbUnavailable("could not reach Postgres")
+
+    def touch_harness(self):
+        # Never reached while heartbeat() itself raises first - kept here
+        # only so a future reordering can't silently AttributeError instead
+        # of hitting the DbUnavailable handling this class exists to guard.
+        self.touch_attempts += 1
         raise DbUnavailable("could not reach Postgres")
 
 
@@ -91,6 +103,16 @@ class TestMaybeHeartbeat:
         for elapsed in (10.0, 200.0):  # one slow pass alone blows past 60s
             last = main._maybe_heartbeat(dbsync, last_at=last, interval=60, logger=logger, now=elapsed)
         assert dbsync.heartbeats == 1
+
+    def test_also_touches_the_harness_row_on_the_same_cadence(self):
+        # Final whole-branch review, Finding 7: db/harness.py's `touch` had
+        # no caller at all, so `last_seen_at` only ever advanced at startup
+        # via `register`'s ON CONFLICT - the column meant to answer "is this
+        # harness alive" never actually did once the daemon was running.
+        dbsync = _FakeDbSync()
+        logger = _FakeLogger()
+        main._maybe_heartbeat(dbsync, last_at=100.0, interval=60, logger=logger, now=161.0)
+        assert dbsync.touches == 1
 
 
 class TestMaybeHeartbeatSurvivesDbUnavailable:

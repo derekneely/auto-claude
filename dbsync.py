@@ -2,11 +2,10 @@
 """dbsync.py — the single seam `main`, `process_manager` and `worker` use to
 reach Postgres.
 
-Introduced here, at the first task that needs it, with only the methods
-whose backing module already exists (`db/pool.py`, `db/harness.py`,
-`db/issue_state.py`). It grows module-by-module as later tasks land — see
-the plan's "Sequencing and the `dbsync` dependency" table — without any
-earlier caller ever having to change how it constructs or calls this class.
+Covers issue_state upserts, run/summary history, the harness lease, and
+journal replay — see `db/issue_state.py`, `db/history.py`, `db/lease.py` and
+`db/journal.py` for the modules each group of methods below is a thin,
+never-raising wrapper over.
 
 A durable write that cannot reach Postgres (`DbUnavailable`) is journaled to
 `db/journal.py` instead of being dropped (Task 21); `main.py`'s poll loop
@@ -21,6 +20,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+from db import harness as db_harness
 from db import history
 from db import issue_state
 from db import lease
@@ -95,8 +95,8 @@ class DbSync:
                     body: str, comment_url: str | None = None) -> str:
         # Generated up front, not inside _durable: the caller (and the
         # log line, if this ends up dropped) must get back the same id that
-        # will eventually land in Postgres, whether that happens now or once
-        # Task 21's journal replay applies it.
+        # will eventually land in Postgres, whether that happens now or via
+        # a later journal replay once Postgres is reachable again.
         summary_id = history.new_id()
         payload = dict(
             summary_id=summary_id, issue_id=issue_id, run_id=run_id,
@@ -125,7 +125,12 @@ class DbSync:
         dropping here is safe, exactly as it was before this task.
         """
         if self._db is None:
-            self._logger.warn(f"No database configured — dropping {op}")
+            # info, not warn: with no database configured at all this is the
+            # expected, supported steady state (single-harness mode), not a
+            # transient problem — every state transition would otherwise
+            # warn forever for the life of an installation that never
+            # configures Postgres.
+            self._logger.info(f"No database configured — dropping {op}")
             return
         try:
             call()
@@ -209,6 +214,21 @@ class DbSync:
         if not self.enabled:
             return []
         return lease.release_expired(self._db)
+
+    def touch_harness(self) -> None:
+        """Bump this harness row's `last_seen_at`. Best-effort, called from
+        `main._maybe_heartbeat` on the same cadence as the lease heartbeat
+        so "is this harness alive" (docs/plans/12-shared-state-in-postgres.md)
+        has a real, moving answer instead of only ever advancing at startup
+        via `register`'s `ON CONFLICT` — `db/harness.py`'s `touch` had no
+        caller at all until this. A no-op when Postgres is disabled, and
+        propagates `DbUnavailable` uncaught exactly like `heartbeat` above —
+        `_maybe_heartbeat` already catches it there, so this durable write
+        cannot abort the poll loop either.
+        """
+        if not self.enabled:
+            return
+        db_harness.touch(self._db, self._harness.id)
 
     # ------------------------------------------------------------------
     # Replay

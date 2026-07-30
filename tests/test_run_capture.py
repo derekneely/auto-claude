@@ -25,11 +25,6 @@ from worker import (  # noqa: E402
     _parse_run_metrics,
 )
 
-# `SimpleNamespace` and `pytest` are unused by the tests below but are
-# imported here because this file is built up incrementally across Tasks
-# 16-18, and every later task's appended test classes rely on both being
-# available at module scope.
-
 RESULT_LINE = (
     '{"type":"result","subtype":"success","is_error":false,'
     '"result":"done","session_id":"s1","uuid":"u1",'
@@ -267,8 +262,17 @@ class TestRunRowClosedOnCrash:
         assert "r#1" not in pm._active_runs
 
     def test_a_run_already_closed_normally_is_not_double_closed(self):
-        # No entry in _active_runs means drain_state_queue already handled it.
-        rec = SimpleNamespace(status="completed", error=None)
+        # Final whole-branch review, Finding 9: this used to seed rec.status
+        # as "completed", which _mark_interrupted's own IN_PROGRESS guard
+        # rejects before _close_dangling_run is ever reached — so the test
+        # passed for the wrong reason and could not have caught a regression
+        # in _close_dangling_run's actual double-close guard (deleting its
+        # `if run_id is None: return` left this test green). status is now
+        # "in_progress" so _mark_interrupted's guard lets the call through;
+        # what actually prevents the double-close is that _active_runs has
+        # no entry for "r#1" — drain_state_queue already popped it via the
+        # worker's own terminal StateUpdate.
+        rec = SimpleNamespace(status="in_progress", error=None)
         pm, dbsync = _make_pm_with_dbsync({"r#1": rec})
         pm._mark_interrupted("r#1", exit_code=0)
         assert dbsync.finished == []

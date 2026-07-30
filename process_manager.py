@@ -185,72 +185,103 @@ class ProcessManager:
         if not self._lease_ok(record.issue_id):
             return
 
-        # Assign color
-        color_name, color_code = self._color_assigner.assign(record.issue_id)
+        # Everything from here through the `self._workers[...]` assignment
+        # below is wrapped: `_lease_ok` above may just have acquired a real
+        # Postgres lease, and Process construction/`proc.start()` can raise
+        # (a Windows spawn failure, a pickling failure in `ctx`). Without
+        # this, such a failure would leave that lease held and heartbeated
+        # indefinitely instead of bounded by LEASE_TTL_SECONDS the way
+        # `reap_dead`'s own release-on-exit path already is (final
+        # whole-branch review, Important 2).
+        try:
+            # Assign color
+            color_name, color_code = self._color_assigner.assign(record.issue_id)
 
-        # Resolve model for this action (action_models override, else dev_model)
-        action = record.action
-        claude_cfg = self._config.claude
-        resolved_model = claude_cfg.action_models.get(action, claude_cfg.dev_model)
+            # Resolve model for this action (action_models override, else dev_model)
+            action = record.action
+            claude_cfg = self._config.claude
+            resolved_model = claude_cfg.action_models.get(action, claude_cfg.dev_model)
 
-        max_turns = claude_cfg.max_turns_dev
+            max_turns = claude_cfg.max_turns_dev
 
-        # Per-repo contract wins over the global fallback. A repo with no
-        # pipeline.json keeps the old behaviour rather than failing to spawn.
-        pipeline = self._repo_pipeline(record.repo)
-        base_branch = (
-            pipeline.pr_base_branch if pipeline
-            else self._config.github.base_branch
-        )
-        pipeline_project = pipeline.project if pipeline else record.repo
+            # Per-repo contract wins over the global fallback. A repo with no
+            # pipeline.json keeps the old behaviour rather than failing to spawn.
+            pipeline = self._repo_pipeline(record.repo)
+            base_branch = (
+                pipeline.pr_base_branch if pipeline
+                else self._config.github.base_branch
+            )
+            pipeline_project = pipeline.project if pipeline else record.repo
 
-        # Build IssueContext (all picklable)
-        ctx = IssueContext(
-            issue_id=record.issue_id,
-            repo=record.repo,
-            number=record.number,
-            title=record.title,
-            body=record.body,
-            action=record.action,
-            org=self._config.github.org,
-            base_branch=base_branch,
-            repos_dir=self._config.paths.repos_dir,
-            worktrees_dir=self._config.paths.worktrees_dir,
-            repo_setup=getattr(self._config, "repo_setup", {}).get(record.repo),
-            prompts_dir=self._config.paths.prompts_dir,
-            dev_model=resolved_model,
-            light_model=claude_cfg.light_model,
-            permission_mode=claude_cfg.permission_mode,
-            max_budget_usd=claude_cfg.max_budget_usd,
-            max_turns=max_turns,
-            crash_logs_dir=self._config.paths.crash_logs_dir,
-            color_name=color_name,
-            color_code=color_code,
-            existing_branch=record.branch,
-            pr_url=record.pr_url,
-            rework_count=record.rework_count,
-            handoff_summary=record.handoff_summary,
-            grace_budget_usd=claude_cfg.grace_budget_usd,
-            claude_tools_root=self._config.integrations.claude_tools_root,
-            pipeline_project=pipeline_project,
-            harness_id=self._harness_id,
-        )
+            # Build IssueContext (all picklable)
+            ctx = IssueContext(
+                issue_id=record.issue_id,
+                repo=record.repo,
+                number=record.number,
+                title=record.title,
+                body=record.body,
+                action=record.action,
+                org=self._config.github.org,
+                base_branch=base_branch,
+                repos_dir=self._config.paths.repos_dir,
+                worktrees_dir=self._config.paths.worktrees_dir,
+                repo_setup=getattr(self._config, "repo_setup", {}).get(record.repo),
+                prompts_dir=self._config.paths.prompts_dir,
+                dev_model=resolved_model,
+                light_model=claude_cfg.light_model,
+                permission_mode=claude_cfg.permission_mode,
+                max_budget_usd=claude_cfg.max_budget_usd,
+                max_turns=max_turns,
+                crash_logs_dir=self._config.paths.crash_logs_dir,
+                color_name=color_name,
+                color_code=color_code,
+                existing_branch=record.branch,
+                pr_url=record.pr_url,
+                rework_count=record.rework_count,
+                handoff_summary=record.handoff_summary,
+                grace_budget_usd=claude_cfg.grace_budget_usd,
+                claude_tools_root=self._config.integrations.claude_tools_root,
+                pipeline_project=pipeline_project,
+                harness_id=self._harness_id,
+                # The env-var *name*, never the connection URL itself - a
+                # live credential must never cross the pickle boundary (see
+                # IssueContext.lease_db_url_env's own docstring). Threaded
+                # through so a worker's fence check (worker._assert_lease_
+                # held) always reaches the SAME Postgres `main` uses, even
+                # when an operator points [database].url_env somewhere other
+                # than the default PIPELINE_METRICS_DATABASE_URL.
+                lease_db_url_env=self._config.database.url_env,
+            )
 
-        abort_event = multiprocessing.Event()
+            abort_event = multiprocessing.Event()
 
-        # `mode` is set by the poller from the issue's stage label, so routing
-        # follows the label rather than any local guess about what is next.
-        target = run_review_worker if record.mode == "review" else run_dev_worker
+            # `mode` is set by the poller from the issue's stage label, so
+            # routing follows the label rather than any local guess about
+            # what is next.
+            target = run_review_worker if record.mode == "review" else run_dev_worker
 
-        proc = Process(
-            target=target,
-            args=(ctx, self._log_queue, self._state_queue, abort_event),
-            name=f"worker-{record.issue_id}",
-            daemon=True,
-        )
-        proc.start()
+            proc = Process(
+                target=target,
+                args=(ctx, self._log_queue, self._state_queue, abort_event),
+                name=f"worker-{record.issue_id}",
+                daemon=True,
+            )
+            proc.start()
 
-        self._workers[record.issue_id] = (proc, abort_event)
+            self._workers[record.issue_id] = (proc, abort_event)
+        except Exception as exc:
+            self._logger.error(f"Failed to spawn worker for {record.issue_id}: {exc}")
+            if self._dbsync is not None:
+                try:
+                    self._dbsync.release_lease(record.issue_id)
+                except DbUnavailable as release_exc:
+                    self._logger.warn(
+                        f"Postgres unreachable — could not release lease for "
+                        f"{record.issue_id} after a failed spawn, relying on "
+                        f"TTL expiry: {release_exc}"
+                    )
+            return
+
         self._logger.info(
             f"Spawned {record.mode} worker ({record.action}) for "
             f"{record.issue_id} (PID {proc.pid})"

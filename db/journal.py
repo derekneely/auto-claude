@@ -57,7 +57,7 @@ from typing import Callable
 from db import harness as db_harness
 from db import history as db_history
 from db import issue_state as db_issue_state
-from db.pool import Database, DbUnavailable
+from db.pool import Database
 
 
 @dataclass(frozen=True)
@@ -271,3 +271,31 @@ class Journal:
         # Written explicitly as UTF-8, no BOM.
         self._path.write_text("", encoding="utf-8")
         return applied
+
+
+class NullJournal:
+    """A `Journal` stand-in whose `append` always raises.
+
+    For a caller that must satisfy `DbSync`'s required `journal` constructor
+    argument but must never actually be able to queue a durable write —
+    `worker._assert_lease_held` builds its own throwaway `DbSync` purely to
+    call `check_lease`, which per the spec ("Claims and fence checks never
+    queue") never journals in the first place, and a handful of tests
+    exercise a `DbSync` on a path that always succeeds before ever reaching
+    `_durable`'s failure branches.
+
+    A real `Journal` on some placeholder path would happen to work for both
+    of those today, because nothing on either path currently calls
+    `.append()` - but that makes "this DbSync must never journal" a usage
+    convention rather than something the type system enforces. The day a
+    durable write is added to a worker by mistake, a real `Journal` would
+    silently append cross-process into `main`'s actual `journal.jsonl`
+    (racing `Journal.replay`'s read-then-truncate — see its own docstring),
+    while `NullJournal` fails loudly and immediately instead.
+    """
+
+    def append(self, op: str, payload: dict) -> None:
+        raise RuntimeError(
+            f"NullJournal.append({op!r}) called — this DbSync must never "
+            f"journal a durable write; see NullJournal's docstring."
+        )

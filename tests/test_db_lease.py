@@ -50,12 +50,12 @@ class _FakeDb:
     def execute(self, sql, params=()):
         now = time.time()
         if sql == lease._ACQUIRE_SQL:
-            harness_id, ttl_seconds, issue_id = params
+            harness_id, ttl_seconds, issue_id, owner_check = params
             row = self._row(issue_id)
-            free = row["owner"] is None or (
+            reclaimable = row["owner"] is None or row["owner"] == owner_check or (
                 row["expires_at"] is not None and row["expires_at"] < now
             )
-            if not free:
+            if not reclaimable:
                 return []
             row["owner"] = harness_id
             row["expires_at"] = now + ttl_seconds
@@ -130,6 +130,33 @@ class TestAcquire:
         # means "try again next tick", the other means "spawn elsewhere".
         with pytest.raises(DbUnavailable):
             lease.acquire(_AlwaysDownDb(), "r#1", "harness-a")
+
+    def test_reclaiming_a_lease_we_already_hold_always_succeeds(self):
+        # Final whole-branch review, Important 2: `acquire` is the one
+        # statement in db/lease.py that is not idempotent under
+        # Database.execute's retry-on-OperationalError. A claim that commits
+        # on the server but then loses the connection before the client sees
+        # the ack gets retried by db/pool.py; without this, the retry's own
+        # WHERE clause no longer matches (we ourselves now hold the lease),
+        # it returns zero rows, and `acquire` incorrectly reports False for a
+        # lease we actually hold - after which `heartbeat` keeps renewing
+        # that phantom-lost lease forever, permanently blocking re-spawn.
+        db = _FakeDb()
+        assert lease.acquire(db, "r#1", "harness-a") is True
+        assert lease.acquire(db, "r#1", "harness-a") is True, (
+            "re-claiming our own live lease must succeed unconditionally, "
+            "the same as a fresh Database.execute retry would need"
+        )
+        assert db.rows["r#1"]["owner"] == "harness-a"
+
+    def test_reclaiming_does_not_let_someone_else_steal_our_live_lease(self):
+        # The self-reclaim arm must only ever match our own harness_id - it
+        # must not accidentally widen the guard into "anyone may reclaim a
+        # live lease".
+        db = _FakeDb()
+        db.seed("r#1", owner="harness-a", expires_in=1800)
+        assert lease.acquire(db, "r#1", "harness-b") is False
+        assert db.rows["r#1"]["owner"] == "harness-a"
 
 
 class TestHeartbeat:
@@ -335,6 +362,18 @@ class TestLeaseColumnInvariantIsPinnedInSQL:
         set_clause = _set_clause(lease._ACQUIRE_SQL)
         assert "owner_harness_id" in set_clause
         assert "lease_expires_at" in set_clause
+
+    def test_acquire_where_clause_lets_the_current_owner_reclaim(self):
+        # Pins the Important 2 fix directly against the SQL text: the WHERE
+        # guard must include a same-owner escape hatch alongside "free" and
+        # "expired", or `acquire` is not idempotent under Database.execute's
+        # retry (db/pool.py) - see acquire()'s own docstring.
+        where_clause = _where_clause(lease._ACQUIRE_SQL)
+        assert "owner_harness_id = %s" in where_clause
+        assert where_clause.count("%s") == 2, (
+            "expected exactly two placeholders in the WHERE clause: the "
+            "issue_id equality and the same-owner reclaim check"
+        )
 
     def test_release_clears_owner_and_expiry_together(self):
         set_clause = _set_clause(lease._RELEASE_SQL)

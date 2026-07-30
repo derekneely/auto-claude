@@ -118,17 +118,40 @@ def _check_schema_gate(db, logger: MainLogger) -> None:
 def _register_harness(db, harness, logger: MainLogger, journal) -> None:
     """Best-effort harness registration. A registration that cannot reach
     Postgres is journaled and replayed the next time Postgres is reachable —
-    see Journal.OPS, which lists "harness.register" as a legitimate op."""
+    see Journal.OPS, which lists "harness.register" as a legitimate op.
+
+    Hardened to match `dbsync.py`'s `_durable` (final whole-branch review,
+    Finding 5): the journal write itself is guarded, and any non-
+    `DbUnavailable` exception from `register` (a bad payload, a constraint
+    violation — not a connectivity problem) is logged and dropped rather
+    than journaled, since replaying it would fail identically forever.
+    Before this, both cases propagated as a raw traceback out of
+    `_init_db_layer` instead of a clean, logged outcome — this call runs
+    after `_check_schema_gate` has already proven Postgres reachable, so a
+    `DbUnavailable` here is only the narrow race where it drops in the
+    window between the two, not the common case.
+    """
     if db is None:
         return
     try:
         db_harness.register(db, harness)
     except DbUnavailable as exc:
-        journal.append("harness.register", {
-            "id": harness.id, "hostname": harness.hostname,
-            "pid": harness.pid, "version": harness.version,
-        })
-        logger.warn(f"Postgres unreachable while registering the harness — journaled: {exc}")
+        try:
+            journal.append("harness.register", {
+                "id": harness.id, "hostname": harness.hostname,
+                "pid": harness.pid, "version": harness.version,
+            })
+            logger.warn(f"Postgres unreachable while registering the harness — journaled: {exc}")
+        except Exception as journal_exc:
+            # Same "never raise" contract as _durable: a journal we cannot
+            # write to (disk full, a permissions failure) must not turn a
+            # best-effort registration into a startup crash.
+            logger.error(
+                f"Could not journal harness registration after Postgres "
+                f"became unreachable (dropped): {journal_exc}"
+            )
+    except Exception as exc:
+        logger.error(f"Harness registration failed (not journaled): {exc}")
 
 
 def _init_db_layer(config, logger: MainLogger):
@@ -166,6 +189,31 @@ def _init_db_layer(config, logger: MainLogger):
     dbsync = DbSync(db, harness, logger, journal=journal,
                      ttl_seconds=config.database.lease_ttl_seconds)
     return db, journal, harness, dbsync
+
+
+def _harness_id_for_workers(db, harness) -> str | None:
+    """The `harness_id` to hand `ProcessManager` (and, through it, every
+    worker's `IssueContext`). None whenever `db` is None — Postgres
+    disabled, or no URL configured — never `harness.id` unconditionally.
+
+    Final whole-branch review, Critical 1: `harness` is constructed
+    unconditionally in `_init_db_layer` above (a harness identity always
+    exists, DB or not — see that function's docstring), so `harness.id` is a
+    real value even with `[database] enabled = false`. Before this fix that
+    real id reached every `IssueContext.harness_id` regardless, and
+    `worker._assert_lease_held` only treats an *unset* `harness_id` as "no
+    shared database, no second harness to fence against" — with the id
+    always truthy, and `PIPELINE_METRICS_DATABASE_URL` routinely present for
+    the sibling Node telemetry even when auto-claude's own database sync is
+    off, every fence check connected to that unrelated Postgres, found no
+    matching lease row, and raised `LeaseLostError` at all seven fence sites.
+    Every issue got fully worked by the agent and then discarded as
+    "fenced", stuck at `ac-in-progress` forever (`_set_labels` is fenced
+    too) — the documented `[database] enabled = false` rollback switch was
+    the thing that broke the daemon. A harness with no database has no
+    lease to fence against, so it must carry no harness_id either.
+    """
+    return harness.id if db is not None else None
 
 
 def _collect_gh_issues_for_reconcile(config, github, logger: MainLogger) -> dict:
@@ -478,12 +526,23 @@ def _maybe_heartbeat(dbsync, last_at: float, interval: float, logger: MainLogger
     another doomed heartbeat attempt instead of waiting out `interval` like
     a healthy one would. A running agent is never aborted for a lost lease
     or a database outage; this is that guarantee applied to the heartbeat.
+
+    Also touches this harness's own `auto_claude.harness` row on the same
+    cadence (`DbSync.touch_harness`, final whole-branch review Finding 7):
+    without it, `last_seen_at` only ever advances at startup via
+    `register`'s `ON CONFLICT`, so the column meant to answer "is this
+    harness alive" never actually does once the daemon is running. Sharing
+    this function's existing try/except is enough — a durable write that
+    fails here must not abort the poll loop any more than the lease
+    heartbeat itself may, and it fails for the identical reason
+    (`DbUnavailable`, mid-run).
     """
     now = time.monotonic() if now is None else now
     if now - last_at < interval:
         return last_at
     try:
         dbsync.heartbeat()
+        dbsync.touch_harness()
     except DbUnavailable as exc:
         logger.warn(f"Postgres unreachable — heartbeat skipped: {exc}")
     return now
@@ -833,7 +892,7 @@ def main() -> None:
         log_queue=log_queue,
         state_queue=state_queue,
         dbsync=dbsync,
-        harness_id=harness.id,
+        harness_id=_harness_id_for_workers(db, harness),
     )
 
     # Ensure all labels exist on monitored repos. Skipped under --dry-run:
@@ -930,7 +989,8 @@ def main() -> None:
                 # execute() during replay burns ~33s of backoff, defeating
                 # the comment above ("shutdown is responsive") on every tick
                 # while entries are queued — exactly when Postgres is down.
-                # It still runs once per pass, at the top of the loop below.
+                # It still runs once per pass, at the top of this same loop
+                # (step 1, above) — not from this sleep tick.
                 last_heartbeat = _maybe_heartbeat(
                     dbsync, last_heartbeat, config.database.heartbeat_interval_seconds, logger
                 )

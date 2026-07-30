@@ -28,7 +28,7 @@ import worker  # noqa: E402
 from worker import LeaseLostError  # noqa: E402
 
 
-def _ctx(tmp_path, harness_id="harness-a"):
+def _ctx(tmp_path, harness_id="harness-a", lease_db_url_env="PIPELINE_METRICS_DATABASE_URL"):
     return worker.IssueContext(
         issue_id="field_admin#215",
         repo="field_admin",
@@ -50,6 +50,7 @@ def _ctx(tmp_path, harness_id="harness-a"):
         color_name="blue",
         color_code="\033[34m",
         harness_id=harness_id,
+        lease_db_url_env=lease_db_url_env,
     )
 
 
@@ -99,6 +100,62 @@ class TestAssertLeaseHeld:
     def test_no_op_when_the_context_carries_no_harness_id(self, tmp_path, monkeypatch):
         monkeypatch.setenv("PIPELINE_METRICS_DATABASE_URL", "postgres://fake/db")
         worker._assert_lease_held(_ctx(tmp_path, harness_id=None), _logger())
+
+    def test_no_op_when_the_context_carries_no_lease_db_url_env(self, tmp_path, monkeypatch):
+        # Distinct from the "no shared database" test above: here the env
+        # var itself is present (real telemetry, unrelated to auto-claude's
+        # own lease system) but ctx never learned which var name to read -
+        # e.g. an older/other caller that never wired ProcessManager.spawn's
+        # ctx field. Must be treated exactly like "no shared database".
+        monkeypatch.setenv("PIPELINE_METRICS_DATABASE_URL", "postgres://fake/db")
+        worker._assert_lease_held(_ctx(tmp_path, lease_db_url_env=None), _logger())
+
+    def test_the_production_combination_config_disabled_with_telemetry_var_set(
+        self, tmp_path, monkeypatch,
+    ):
+        # Final whole-branch review, Critical 1: the reason no per-task
+        # reviewer caught this bug. The two tests above each vary ONE of
+        # "harness_id" / the env var in isolation; this is the actual
+        # combination that occurred in production. `main._init_db_layer`
+        # always constructs a real `harness` (a harness identity always
+        # exists, DB or not) and `PIPELINE_METRICS_DATABASE_URL` is
+        # routinely set for the sibling Node telemetry even when auto-claude's
+        # own `[database] enabled = false` - so with the pre-fix code
+        # (`main.py` handing every `IssueContext` the real `harness.id`
+        # unconditionally) this exact combination reached a real `Database`
+        # connection attempt and fenced every single write. The fix is that
+        # `main._harness_id_for_workers` now yields None whenever Postgres
+        # is not configured, so the correctly-wired ctx here has
+        # harness_id=None despite the env var being present. Asserts more
+        # than "must not raise": `Database` is monkeypatched to explode if
+        # called at all, proving zero connection attempts, not a raise that
+        # merely happened not to occur.
+        monkeypatch.setenv("PIPELINE_METRICS_DATABASE_URL", "postgres://fake/db")
+        monkeypatch.setattr(
+            worker, "Database",
+            lambda *a, **k: (_ for _ in ()).throw(
+                AssertionError("must not construct a Database with no harness_id")
+            ),
+        )
+        ctx = _ctx(tmp_path, harness_id=None)  # what a disabled db now produces
+        worker._assert_lease_held(ctx, _logger())  # must not raise
+
+    def test_reads_the_configured_env_var_name_not_a_hardcoded_constant(
+        self, tmp_path, monkeypatch,
+    ):
+        # Final whole-branch review, Critical 1 (second reachable form): an
+        # operator who sets `[database] url_env = "SOMETHING_ELSE"` must have
+        # this fence check the SAME Postgres `main` uses. Proven here by
+        # leaving the default PIPELINE_METRICS_DATABASE_URL unset entirely -
+        # if this were still reading a hardcoded constant, it would find no
+        # URL and silently no-op instead of reaching Database/DbSync at all.
+        monkeypatch.delenv("PIPELINE_METRICS_DATABASE_URL", raising=False)
+        monkeypatch.setenv("SOMETHING_ELSE", "postgres://fake/db")
+        monkeypatch.setattr(worker, "DbSync", lambda *a, **k: _FakeDbSync(held=False))
+        monkeypatch.setattr(worker, "Database", lambda *a, **k: SimpleNamespace(close=lambda: None))
+        ctx = _ctx(tmp_path, lease_db_url_env="SOMETHING_ELSE")
+        with pytest.raises(LeaseLostError):
+            worker._assert_lease_held(ctx, _logger())
 
 
 # ---------------------------------------------------------------------------
@@ -322,3 +379,42 @@ class TestHandleLeaseLost:
         assert update.cost_usd is None
         assert update.turns is None
         assert update.duration_seconds is None
+
+    def test_threads_pending_summaries_from_before_the_lease_was_lost(
+        self, monkeypatch, tmp_path,
+    ):
+        # Final whole-branch review, Finding 3: a comment already posted to
+        # GitHub before the lease was discovered lost (e.g.
+        # _post_issue_report's failed-checks report) used to be silently
+        # dropped here — the only path where something real lands on GitHub
+        # and is then forgotten by Postgres, contradicting "the database and
+        # GitHub cannot disagree".
+        monkeypatch.setattr(worker, "_post_crash_comment", lambda *a, **k: None)
+        _record_cmds(monkeypatch)
+        q = queue.Queue()
+        ctx = _ctx(tmp_path)
+        pending = [{"kind": "dev", "body": "checks failed", "comment_url": "https://x/1"}]
+
+        worker._handle_lease_lost(
+            ctx, _logger(), q, LeaseLostError("lease lost"), summaries=pending,
+        )
+
+        update = q.get_nowait()
+        assert update.summaries == pending
+
+    def test_no_pending_summaries_is_none_not_an_empty_list(
+        self, monkeypatch, tmp_path,
+    ):
+        # Mirrors every other exit path's `summaries=pending_summaries or
+        # None` convention (see run_dev_worker/run_review_worker) so
+        # ProcessManager._sync_run's `for item in (update.summaries or [])`
+        # sees the same shape regardless of which exit path produced it.
+        monkeypatch.setattr(worker, "_post_crash_comment", lambda *a, **k: None)
+        _record_cmds(monkeypatch)
+        q = queue.Queue()
+        ctx = _ctx(tmp_path)
+
+        worker._handle_lease_lost(ctx, _logger(), q, LeaseLostError("lease lost"), summaries=[])
+
+        update = q.get_nowait()
+        assert update.summaries is None

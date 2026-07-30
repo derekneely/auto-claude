@@ -16,11 +16,11 @@ from pathlib import Path
 
 import stages
 from db.harness import Harness
-from db.journal import Journal
+from db.journal import NullJournal
 from db.pool import Database
 from dbsync import DbSync
 from ghauth import apply_git_credentials, build_env, current_token
-from integrations import METRICS_DB_ENV_VAR, TelemetryEvent, log_event
+from integrations import TelemetryEvent, log_event
 from logger import WorkerLogger
 from pipeline import load_pipeline_config
 from ratelimit import (
@@ -98,11 +98,20 @@ def _assert_lease_held(ctx: IssueContext, logger: WorkerLogger) -> None:
     Called immediately before every `git push`, `gh pr create`, `gh pr
     review`, and inside `_set_labels` - the single chokepoint for every
     `ac-*` label write - mirroring where `assert_pushable` is called. A
-    no-op when `ctx.harness_id` is unset or no shared database is configured
-    (`PIPELINE_METRICS_DATABASE_URL`), because both mean "no shared
+    no-op when `ctx.harness_id` is unset OR `ctx.lease_db_url_env` is unset
+    OR that env var itself has no value, because all three mean "no shared
     database, no second harness to fence against" - see
     `main._release_stale_locks`'s degraded-path reasoning, applied here
-    mid-run instead of at startup.
+    mid-run instead of at startup. Critically, `ctx.harness_id` being unset
+    is *itself* the degraded-mode signal `ProcessManager.spawn` derives from
+    whether Postgres is configured (see its own docstring) - the env-var
+    check alone is not enough, because `PIPELINE_METRICS_DATABASE_URL` is
+    also used by the sibling Node telemetry and is routinely set even when
+    `[database] enabled = false` for auto-claude's own lease system. Reading
+    `ctx.lease_db_url_env` rather than a hardcoded constant matters for the
+    same reason: an operator who points `[database].url_env` at a different
+    variable must have this fence check the SAME Postgres `main` does, not
+    silently default back to the telemetry variable.
 
     Builds its own `Database`/`DbSync` from `os.environ` rather than
     receiving one from `main`: the worker is a separate `spawn`ed process,
@@ -114,22 +123,27 @@ def _assert_lease_held(ctx: IssueContext, logger: WorkerLogger) -> None:
     """
     if not ctx.harness_id:
         return
-    url = os.environ.get(METRICS_DB_ENV_VAR)
+    if not ctx.lease_db_url_env:
+        return
+    url = os.environ.get(ctx.lease_db_url_env)
     if not url:
         return
 
     db = Database(url)
     try:
         harness = Harness(id=ctx.harness_id, hostname="", pid=0, version="")
-        # `journal` is required by DbSync's constructor (fix round, Finding
-        # 2) but is never touched here: check_lease never journals in the
-        # first place (spec: "Claims and fence checks never queue"). The
-        # path matches DatabaseConfig's own default (config.py) since this
-        # spawned worker process builds its own DbSync from os.environ
-        # rather than receiving one from main() (see this function's
-        # docstring), so it has no `Config` to read a configured path from.
-        journal = Journal(Path("state/journal.jsonl"))
-        dbsync = DbSync(db, harness, logger, journal=journal)
+        # A NullJournal, not a real Journal: check_lease never journals in
+        # the first place (spec: "Claims and fence checks never queue"), and
+        # `journal` is only a required DbSync constructor argument (fix
+        # round, Finding 2) so this throwaway DbSync can be built at all.
+        # Using a real Journal on a hardcoded relative path used to make
+        # "this call never journals" a usage convention rather than a
+        # structural guarantee - the day a durable write is added to a
+        # worker by mistake, it would silently append cross-process into
+        # main's real journal.jsonl (see Journal.replay's read-then-
+        # truncate race). NullJournal.append raising turns that into an
+        # immediate, loud failure instead.
+        dbsync = DbSync(db, harness, logger, journal=NullJournal())
         if not dbsync.check_lease(ctx.issue_id):
             raise LeaseLostError(
                 f"Lease on {ctx.issue_id} is no longer held by harness "
@@ -148,6 +162,7 @@ def _handle_lease_lost(
     branch: str | None = None,
     run_id: str | None = None,
     metrics: "RunMetrics | None" = None,
+    summaries: list[dict] | None = None,
 ) -> None:
     """Common fenced-exit path shared by run_dev_worker and run_review_worker.
 
@@ -162,10 +177,25 @@ def _handle_lease_lost(
     status goes straight to "failed", not "in_progress", so `reap_dead`'s
     and `_mark_interrupted`'s dangling-run cleanup (both gated on the issue
     still being IN_PROGRESS) never fire for it. Deliberately does NOT call
-    `_post_crash_comment` (a GitHub comment is exactly the remote touch
-    fencing exists to prevent) and does NOT clean up the worktree — the
-    branch stays local and the issue is retried by whichever harness now
-    holds it.
+    `_post_crash_comment` and does NOT clean up the worktree — the branch
+    stays local and the issue is retried by whichever harness now holds it.
+    No new GitHub comment is posted here because there is nothing useful
+    left to say to a ticket this harness no longer owns, not because a
+    comment is itself one of the remote acts fencing guards (the enumerated
+    fence sites are `git push`, `gh pr create`/`review`, and `ac-*` label
+    writes — a duplicate comment from another harness picking up the same
+    issue is noise, not corruption, so comments are deliberately unfenced
+    everywhere else in this file).
+
+    `summaries` carries any `summary` rows a comment already posted to
+    GitHub before the lease was discovered lost (e.g. `_post_issue_report`'s
+    failed-checks report) — without threading it through, that comment would
+    be the one path where something real lands on GitHub and is then
+    forgotten by Postgres, contradicting "the database and GitHub cannot
+    disagree". Passed straight to the terminal StateUpdate alongside the
+    existing `fenced:`-prefixed summary `_sync_run` synthesizes from `error`
+    (see process_manager.py) — the two are independent summary rows, not a
+    replacement for each other.
     """
     logger.error(f"Fenced: {exc}")
     log_path = _write_crash_log(ctx, str(exc), logger)
@@ -182,6 +212,7 @@ def _handle_lease_lost(
         cost_usd=metrics.cost_usd if metrics else None,
         turns=metrics.turns if metrics else None,
         crash_log_path=str(log_path) if log_path else None,
+        summaries=summaries or None,
     ))
 
 
@@ -231,10 +262,21 @@ class IssueContext:
     # auto-detect from what is in the checkout, which is the normal case.
     repo_setup: RepoSetupConfig | None = None
     # Which Postgres harness row spawned this worker. Set by
-    # ProcessManager.spawn from its own `harness_id`; None when no lease
-    # system is wired (--issue mode without Postgres, or an older caller) -
-    # `_assert_lease_held` treats that the same as "no shared database".
+    # ProcessManager.spawn from its own `harness_id`, which in turn is
+    # None whenever `main._init_db_layer` built no `Database` (Postgres
+    # disabled, or no URL configured) - see main.py's `_harness_id_for_
+    # workers`. `_assert_lease_held` treats None the same as "no shared
+    # database".
     harness_id: str | None = None
+    # Env-var name `_assert_lease_held` reads to build its own throwaway
+    # Database/DbSync - the raw connection URL itself must never cross the
+    # pickle boundary (a live credential should never be logged, and this
+    # keeps it out of any StateUpdate/crash-log dump too). Set by
+    # ProcessManager.spawn from `config.database.url_env`, so a worker
+    # fences against the SAME Postgres `main` uses even when an operator has
+    # pointed `[database].url_env` away from the default
+    # PIPELINE_METRICS_DATABASE_URL telemetry variable.
+    lease_db_url_env: str | None = None
 
 
 @dataclass
@@ -2110,7 +2152,8 @@ def run_dev_worker(
 
     except LeaseLostError as exc:
         _handle_lease_lost(ctx, logger, state_queue, exc, branch=branch,
-                            run_id=run_id, metrics=metrics)
+                            run_id=run_id, metrics=metrics,
+                            summaries=pending_summaries)
 
     except Exception as exc:
         import traceback
@@ -2565,7 +2608,8 @@ def run_review_worker(
         ))
 
     except LeaseLostError as exc:
-        _handle_lease_lost(ctx, logger, state_queue, exc, run_id=run_id, metrics=metrics)
+        _handle_lease_lost(ctx, logger, state_queue, exc, run_id=run_id, metrics=metrics,
+                            summaries=pending_summaries)
 
     except Exception as exc:
         import traceback
