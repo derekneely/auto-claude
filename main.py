@@ -922,10 +922,18 @@ def main() -> None:
                 # Drain queues during sleep too
                 process_manager.drain_state_queue()
                 logger.drain_queue(log_queue)
+                # Note: dbsync's journal replay is deliberately NOT attempted
+                # here (fix round, Finding 4). _maybe_heartbeat is
+                # interval-gated so this per-second tick never blocks on a
+                # dead database, but the replay call had no such gate:
+                # Database(retries=2, connect_timeout=10) means one failing
+                # execute() during replay burns ~33s of backoff, defeating
+                # the comment above ("shutdown is responsive") on every tick
+                # while entries are queued — exactly when Postgres is down.
+                # It still runs once per pass, at the top of the loop below.
                 last_heartbeat = _maybe_heartbeat(
                     dbsync, last_heartbeat, config.database.heartbeat_interval_seconds, logger
                 )
-                dbsync.replay_pending()
                 time.sleep(1)
 
     except KeyboardInterrupt:

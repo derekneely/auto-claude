@@ -93,7 +93,7 @@ class TestInitDbLayerDegradedMode:
             github=SimpleNamespace(repos=["field_admin"], bot_login="bot"),
         )
         harness = SimpleNamespace(id="me")
-        dbsync = main.DbSync(None, harness, _logger())
+        dbsync = main.DbSync(None, harness, _logger(), journal=main.Journal(tmp_path / "j.jsonl"))
         # db=None must not raise — reconciliation runs against an empty
         # db_rows dict, identical to Postgres genuinely being empty.
         main._reconcile_at_startup(config, github, state, None, harness, dbsync, _logger())
@@ -181,7 +181,7 @@ class TestReconcileAtStartupReleasesExpiredLeasesFirst:
         github = SimpleNamespace(list_issues=lambda repo, assignee=None: [])
         config = SimpleNamespace(github=SimpleNamespace(repos=[], bot_login="bot"))
         harness = SimpleNamespace(id="me")
-        dbsync = main.DbSync(None, harness, _logger())
+        dbsync = main.DbSync(None, harness, _logger(), journal=main.Journal(tmp_path / "j.jsonl"))
 
         report = main._reconcile_at_startup(
             config, github, state, None, harness, dbsync, _logger(),

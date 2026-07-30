@@ -16,6 +16,7 @@ from pathlib import Path
 
 import stages
 from db.harness import Harness
+from db.journal import Journal
 from db.pool import Database
 from dbsync import DbSync
 from ghauth import apply_git_credentials, build_env, current_token
@@ -120,10 +121,15 @@ def _assert_lease_held(ctx: IssueContext, logger: WorkerLogger) -> None:
     db = Database(url)
     try:
         harness = Harness(id=ctx.harness_id, hostname="", pid=0, version="")
-        # No `journal` passed — Task 8's default of `None` is fine here,
-        # since check_lease never journals in the first place (spec:
-        # "Claims and fence checks never queue").
-        dbsync = DbSync(db, harness, logger)
+        # `journal` is required by DbSync's constructor (fix round, Finding
+        # 2) but is never touched here: check_lease never journals in the
+        # first place (spec: "Claims and fence checks never queue"). The
+        # path matches DatabaseConfig's own default (config.py) since this
+        # spawned worker process builds its own DbSync from os.environ
+        # rather than receiving one from main() (see this function's
+        # docstring), so it has no `Config` to read a configured path from.
+        journal = Journal(Path("state/journal.jsonl"))
+        dbsync = DbSync(db, harness, logger, journal=journal)
         if not dbsync.check_lease(ctx.issue_id):
             raise LeaseLostError(
                 f"Lease on {ctx.issue_id} is no longer held by harness "

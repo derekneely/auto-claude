@@ -41,14 +41,18 @@ class DbSync:
     once it is reachable again; lease operations never journal."""
 
     def __init__(self, db: Database | None, harness: Harness, logger, *,
-                 journal: "Journal | None" = None, ttl_seconds: int = 1800) -> None:
+                 journal: "Journal", ttl_seconds: int = 1800) -> None:
         self._db = db
         self._harness = harness
         self._logger = logger
-        # Accepted now so later tasks never change this signature again:
-        # `journal` is wired for real by Task 21 (replacing the log-and-drop
-        # sink below with `journal.append(...)`); `ttl_seconds` is read by
-        # Task 13's acquire_lease/heartbeat once db/lease.py exists.
+        # Required, not optional: `_durable`'s DbUnavailable branch always
+        # dereferences `self._journal` (see below). A `journal=None` default
+        # used to be accepted here as a placeholder for Task 21's wiring;
+        # now that the wiring is real, an omitted journal is a construction
+        # bug, not a supported degraded mode — fail at construction time
+        # (fix round, Finding 2), not with an AttributeError deep inside a
+        # failed write. `ttl_seconds` is read by acquire_lease/heartbeat
+        # (db/lease.py).
         self._journal = journal
         self._ttl_seconds = ttl_seconds
 
@@ -109,21 +113,36 @@ class DbSync:
         (a bad payload, a constraint violation) would retry it forever
         against the same broken data every time the journal replays.
 
-        Upgraded here from Task 8's log-and-drop sink to a real journal —
-        `self._journal` is a `db.journal.Journal` now (main.py constructs
-        one below), not `None`. Nothing about `_durable`'s callers
-        (upsert_issue, start_run, finish_run, add_summary) or DbSync's
-        constructor signature changed to make this possible; `journal` has
-        been an accepted argument since Task 8.
+        A permanently disabled/unconfigured database (`self._db is None` for
+        the whole process lifetime) also logs and drops rather than
+        journaling (fix round, Finding 3 — reversing the first pass at this
+        task, which journaled here too): `replay_pending` is a no-op in that
+        same state, since there is nothing to replay into, so a journal
+        entry made here would never drain — `state/journal.jsonl` would grow
+        forever for the life of any installation that runs in
+        local-state-only mode. GitHub labels stay truth and startup
+        reconciliation rebuilds `issues.json` from scratch every restart, so
+        dropping here is safe, exactly as it was before this task.
         """
         if self._db is None:
-            self._journal.append(op, payload)
+            self._logger.warn(f"No database configured — dropping {op}")
             return
         try:
             call()
         except DbUnavailable as exc:
             self._logger.warn(f"Postgres unreachable — journaling {op}: {exc}")
-            self._journal.append(op, payload)
+            try:
+                self._journal.append(op, payload)
+            except Exception as journal_exc:
+                # A journal we cannot write to (disk full, a permissions
+                # failure, a Windows file lock) is exactly the log-and-drop
+                # case: the write is lost, but `_durable`'s "never raise"
+                # contract must survive this too, not just a DbUnavailable
+                # from Postgres (fix round, Finding 2).
+                self._logger.error(
+                    f"Could not journal {op} after Postgres became "
+                    f"unreachable (dropped): {journal_exc}"
+                )
         except Exception as exc:
             self._logger.error(f"Durable write {op} failed (not journaled): {exc}")
 
@@ -202,4 +221,20 @@ class DbSync:
             return self._journal.replay(self._db)
         except DbUnavailable as exc:
             self._logger.warn(f"Replay stopped — Postgres unreachable again: {exc}")
+            return 0
+        except Exception as exc:
+            # Journal.replay deliberately lets a handler failure (an FK/
+            # constraint violation on a queued entry) or an OSError from its
+            # own file read/truncate propagate uncaught, so the journal file
+            # stays byte-for-byte intact on that path (see db/journal.py).
+            # Before this fix (Finding 1), anything other than DbUnavailable
+            # escaped from here into main.py's poll loop, whose only handler
+            # is `except KeyboardInterrupt` — killing the whole supervisor
+            # with live workers attached, and on every restart thereafter,
+            # since the untouched journal re-raises the same entry on the
+            # very next replay. Swallowing means a poison entry logs one
+            # ERROR per tick instead of draining — strictly better than
+            # daemon death. Quarantining bad entries is Journal's job, not
+            # this seam's.
+            self._logger.error(f"Journal replay failed (journal left intact): {exc}")
             return 0
