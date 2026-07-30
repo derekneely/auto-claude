@@ -204,3 +204,17 @@ class TestStartAndFinishRun:
         sync.finish_run(run_id="r1", outcome="completed", exit_code=0,
                          duration_seconds=1, cost_usd=0.1, turns=1, crash_log_path=None)
         assert any("dropping" in msg.lower() for _lvl, msg in logger.messages)
+
+
+class TestAddSummary:
+    def test_returns_a_stable_id_even_when_the_write_is_dropped(self):
+        db = FakeDatabase(raises=DbUnavailable("down"))
+        sync = DbSync(db, HARNESS, FakeLogger())
+        summary_id = sync.add_summary(issue_id="repo#1", run_id=None, kind="triage", body="text")
+        assert isinstance(summary_id, str) and len(summary_id) == 32
+
+    def test_succeeds_silently_when_postgres_is_reachable(self):
+        db = FakeDatabase()
+        sync = DbSync(db, HARNESS, FakeLogger())
+        sync.add_summary(issue_id="repo#1", run_id="r1", kind="dev", body="did it")
+        assert db.calls

@@ -110,6 +110,7 @@ class FakeDbSync:
     def __init__(self):
         self.started: list[dict] = []
         self.finished: list[dict] = []
+        self.summaries: list[dict] = []
 
     def release_lease(self, issue_id):
         # reap_dead (Task 13) unconditionally releases the lease for any
@@ -126,6 +127,11 @@ class FakeDbSync:
             run_id=run_id, outcome=outcome, exit_code=exit_code,
             duration_seconds=duration_seconds, cost_usd=cost_usd, turns=turns,
             crash_log_path=crash_log_path,
+        ))
+
+    def add_summary(self, *, issue_id, run_id, kind, body, comment_url):
+        self.summaries.append(dict(
+            issue_id=issue_id, run_id=run_id, kind=kind, body=body, comment_url=comment_url,
         ))
 
 
@@ -397,9 +403,9 @@ def _stub_dev_worker_happy_path_with_one_repair_round(monkeypatch):
     monkeypatch.setattr(worker_module, "_cleanup_worktree", lambda *a, **k: None)
     monkeypatch.setattr(worker_module, "_get_issue_comments", lambda ctx, logger: [])
     monkeypatch.setattr(worker_module, "_build_prompt", lambda *a, **k: "prompt")
-    monkeypatch.setattr(worker_module, "_post_issue_report", lambda *a, **k: None)
+    monkeypatch.setattr(worker_module, "_post_issue_report", lambda *a, **k: ("report body", None))
     monkeypatch.setattr(worker_module, "_write_crash_log", lambda *a, **k: None)
-    monkeypatch.setattr(worker_module, "_post_crash_comment", lambda *a, **k: None)
+    monkeypatch.setattr(worker_module, "_post_crash_comment", lambda *a, **k: (None, "crash body"))
     monkeypatch.setattr(
         worker_module, "_push_and_pr",
         lambda *a, **k: "https://github.com/org/repo/pull/1",
@@ -471,3 +477,260 @@ class TestRunDevWorkerEmitsAccumulatedMetrics:
         assert terminal.cost_usd == 1.25
         assert terminal.turns == 7
         assert terminal.duration_seconds == 33
+
+
+class TestPostIssueReportReturnsBodyAndUrl:
+    def test_returns_the_exact_body_and_the_comment_url_on_success(self, tmp_path, monkeypatch):
+        import worker
+
+        ctx = SimpleNamespace(
+            number=7, org="o", repo="r", dev_model="m",
+        )
+        monkeypatch.setattr(worker, "_get_issue_labels", lambda ctx, logger: [])
+        monkeypatch.setattr(
+            worker, "_run_cmd",
+            lambda *a, **k: SimpleNamespace(
+                returncode=0, stdout="https://github.com/o/r/issues/7#issuecomment-1\n",
+                stderr="",
+            ),
+        )
+        body, url = worker._post_issue_report(
+            ctx, output="", summary="did the thing", branch="ac/issue-7-x",
+            pr_url="https://github.com/o/r/pull/7", outcome="success",
+            logger=SimpleNamespace(warn=lambda *a: None),
+        )
+        assert "did the thing" in body
+        assert url == "https://github.com/o/r/issues/7#issuecomment-1"
+
+    def test_returns_none_url_when_the_post_fails(self, tmp_path, monkeypatch):
+        import worker
+
+        ctx = SimpleNamespace(number=7, org="o", repo="r")
+        monkeypatch.setattr(worker, "_get_issue_labels", lambda ctx, logger: [])
+        monkeypatch.setattr(
+            worker, "_run_cmd",
+            lambda *a, **k: SimpleNamespace(returncode=1, stdout="", stderr="boom"),
+        )
+        body, url = worker._post_issue_report(
+            ctx, output="", summary="s", branch="b", pr_url=None,
+            outcome="success", logger=SimpleNamespace(warn=lambda *a: None),
+        )
+        assert url is None
+        assert "s" in body or body is not None
+
+
+class TestPostCrashCommentReturnsUrlAndBody:
+    def test_returns_the_url_and_the_exact_posted_body(self, tmp_path, monkeypatch):
+        import worker
+
+        ctx = SimpleNamespace(number=3, org="o", repo="r")
+
+        def fake_run(cmd, **kwargs):
+            return SimpleNamespace(
+                returncode=0, stdout="https://github.com/o/r/issues/3#issuecomment-9\n",
+                stderr="",
+            )
+
+        monkeypatch.setattr(worker.subprocess, "run", fake_run)
+        url, body = worker._post_crash_comment(
+            ctx, "boom", None, SimpleNamespace(error=lambda *a: None),
+        )
+        assert url == "https://github.com/o/r/issues/3#issuecomment-9"
+        assert "boom" in body
+
+
+class TestPostPrReviewReturnsUrlFromApiLookup:
+    def test_looks_up_the_review_url_after_a_successful_post(self, monkeypatch):
+        import worker
+
+        ctx = SimpleNamespace(
+            pr_url="https://github.com/o/r/pull/4", org="o", repo="r", harness_id=None,
+        )
+        calls = []
+
+        def fake_run_cmd(cmd, **kwargs):
+            calls.append(cmd)
+            if cmd[:3] == ["gh", "pr", "review"]:
+                return SimpleNamespace(returncode=0, stdout="", stderr="")
+            return SimpleNamespace(
+                returncode=0, stdout="https://github.com/o/r/pull/4#pullrequestreview-1\n",
+                stderr="",
+            )
+
+        monkeypatch.setattr(worker, "_run_cmd", fake_run_cmd)
+        url = worker._post_pr_review(
+            ctx, SimpleNamespace(warn=lambda *a: None), approve=True, body="looks good",
+        )
+        assert url == "https://github.com/o/r/pull/4#pullrequestreview-1"
+        assert any(c[:2] == ["gh", "api"] for c in calls)
+
+    def test_no_pr_number_returns_none_without_calling_gh(self, monkeypatch):
+        import worker
+
+        ctx = SimpleNamespace(pr_url=None, org="o", repo="r")
+        monkeypatch.setattr(
+            worker, "_run_cmd", lambda *a, **k: pytest.fail("must not call gh with no PR")
+        )
+        url = worker._post_pr_review(
+            ctx, SimpleNamespace(warn=lambda *a: None), approve=True, body="x",
+        )
+        assert url is None
+
+
+class TestProcessManagerPostsSummaries:
+    def test_drain_state_queue_writes_every_summary_on_the_terminal_update(self):
+        rec = SimpleNamespace(status="in_progress", error=None, branch=None, pr_url=None,
+                              worker_pid=111, handoff_summary=None)
+        pm, dbsync = _make_pm_with_dbsync({"r#1": rec})
+        pm._active_runs["r#1"] = "run1"
+        pm._state_queue.put(StateUpdate(
+            "r#1", "completed", run_id="run1", run_outcome="completed",
+            summaries=[
+                {"kind": "dev", "body": "did it", "comment_url": "https://x/1"},
+            ],
+        ))
+        pm.drain_state_queue()
+        assert getattr(dbsync, "summaries", None) == [
+            dict(issue_id="r#1", run_id="run1", kind="dev", body="did it",
+                 comment_url="https://x/1"),
+        ]
+
+    def test_no_summaries_field_posts_nothing(self):
+        rec = SimpleNamespace(status="in_progress", error=None, branch=None, pr_url=None,
+                              worker_pid=111, handoff_summary=None)
+        pm, dbsync = _make_pm_with_dbsync({"r#1": rec})
+        pm._active_runs["r#1"] = "run1"
+        pm._state_queue.put(StateUpdate("r#1", "completed", run_id="run1", run_outcome="completed"))
+        pm.drain_state_queue()
+        assert getattr(dbsync, "summaries", []) == []
+
+    def test_dbsync_property_exposes_the_wired_instance(self):
+        pm, dbsync = _make_pm_with_dbsync({})
+        assert pm.dbsync is dbsync
+
+    def test_a_fenced_error_writes_a_fenced_summary_row_even_with_no_summaries_list(self):
+        # Task 14's _handle_lease_lost sends error="fenced: ..." with
+        # summaries=None (it never touches GitHub, so there is no comment to
+        # report) — that hand-off must still produce a Postgres summary row,
+        # or it silently falls through the gap.
+        rec = SimpleNamespace(status="in_progress", error=None, branch=None, pr_url=None,
+                              worker_pid=111, handoff_summary=None)
+        pm, dbsync = _make_pm_with_dbsync({"r#1": rec})
+        pm._active_runs["r#1"] = "run1"
+        pm._state_queue.put(StateUpdate(
+            "r#1", "failed", error="fenced: lease lost", run_id="run1",
+            run_outcome="failed",
+        ))
+        pm.drain_state_queue()
+        assert getattr(dbsync, "summaries", None) == [
+            dict(issue_id="r#1", run_id="run1", kind="fenced",
+                 body="fenced: lease lost", comment_url=None),
+        ]
+
+    def test_a_non_fenced_error_does_not_write_a_fenced_summary(self):
+        rec = SimpleNamespace(status="in_progress", error=None, branch=None, pr_url=None,
+                              worker_pid=111, handoff_summary=None)
+        pm, dbsync = _make_pm_with_dbsync({"r#1": rec})
+        pm._active_runs["r#1"] = "run1"
+        pm._state_queue.put(StateUpdate(
+            "r#1", "failed", error="budget_exceeded", run_id="run1", run_outcome="failed",
+        ))
+        pm.drain_state_queue()
+        assert getattr(dbsync, "summaries", []) == []
+
+
+# ---------------------------------------------------------------------------
+# Task 14's reviewer flagged (and Task 19's dispatch recorded) a carry-forward
+# gap: _handle_lease_lost is tested in isolation (tests/test_worker_fencing.py),
+# but nothing asserts that `except LeaseLostError` actually precedes
+# `except Exception` inside run_dev_worker/run_review_worker themselves. A
+# one-line reordering or deletion there would let a fenced exit fall through
+# to the generic crash handler and emit error=str(exc) with no "fenced: "
+# prefix — silently breaking process_manager's `kind="fenced"` summary (see
+# TestProcessManagerPostsSummaries above) with zero other test failures.
+# These drive the real entry points end-to-end, mirroring
+# TestRunDevWorkerEmitsAccumulatedMetrics's monkeypatch-every-touchpoint style.
+# ---------------------------------------------------------------------------
+
+class TestRunDevWorkerFencesOnLeaseLost:
+    def test_a_lease_lost_error_produces_a_single_fenced_terminal_update(
+        self, monkeypatch, tmp_path,
+    ):
+        import worker as worker_module
+
+        ctx = _make_dev_ctx(tmp_path)
+
+        def raise_lease_lost(ctx, logger):
+            raise worker_module.LeaseLostError("lease lost")
+
+        # First touchpoint inside run_dev_worker's try block — raising here
+        # proves the wiring without needing to stub the rest of the pipeline.
+        monkeypatch.setattr(worker_module, "_claim_labels", raise_lease_lost)
+        state_queue = _FakeWorkerQueue()
+
+        worker_module.run_dev_worker(ctx, _FakeWorkerQueue(), state_queue, _FakeAbortEvent())
+
+        # Exactly two updates: the opening "in_progress" and the fenced exit —
+        # if this ever fell through to the generic `except Exception` instead,
+        # a crash-comment post would be attempted too (and would blow up here
+        # since gh/subprocess are not stubbed).
+        assert len(state_queue.items) == 2
+        terminal = state_queue.items[-1]
+        assert terminal.status == "failed"
+        assert terminal.error.startswith("fenced: "), (
+            "a LeaseLostError raised inside run_dev_worker must be caught by "
+            "its own except clause, not fall through to the generic handler"
+        )
+
+
+class TestRunReviewWorkerFencesOnLeaseLost:
+    def test_a_lease_lost_error_produces_a_single_fenced_terminal_update(
+        self, monkeypatch, tmp_path,
+    ):
+        import worker as worker_module
+
+        ctx = _make_ctx_for_review_fencing(tmp_path)
+
+        def raise_lease_lost(ctx, logger):
+            raise worker_module.LeaseLostError("lease lost")
+
+        # First touchpoint inside run_review_worker's try block.
+        monkeypatch.setattr(worker_module, "_claim_review_labels", raise_lease_lost)
+        state_queue = _FakeWorkerQueue()
+
+        worker_module.run_review_worker(ctx, _FakeWorkerQueue(), state_queue, _FakeAbortEvent())
+
+        assert len(state_queue.items) == 2
+        terminal = state_queue.items[-1]
+        assert terminal.status == "failed"
+        assert terminal.error.startswith("fenced: "), (
+            "a LeaseLostError raised inside run_review_worker must be caught "
+            "by its own except clause, not fall through to the generic handler"
+        )
+
+
+def _make_ctx_for_review_fencing(tmp_path):
+    import worker as worker_module
+    return worker_module.IssueContext(
+        issue_id="repo#1",
+        repo="repo",
+        number=1,
+        title="Add a widget",
+        body="b",
+        action="fix",
+        org="org",
+        base_branch="main",
+        repos_dir=tmp_path / "repos",
+        worktrees_dir=tmp_path / "worktrees",
+        prompts_dir=Path(__file__).resolve().parent.parent / "prompts",
+        dev_model="model",
+        light_model="model",
+        permission_mode="bypassPermissions",
+        max_budget_usd=1.0,
+        max_turns=5,
+        crash_logs_dir=tmp_path / "crash",
+        color_name="RED",
+        color_code="\033[91m",
+        existing_branch="ac/issue-1-x",
+        pr_url="https://github.com/org/repo/pull/1",
+    )

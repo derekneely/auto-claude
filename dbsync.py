@@ -85,6 +85,22 @@ class DbSync:
         )
         self._durable("history.finish_run", payload, lambda: history.finish_run(self._db, **payload))
 
+    def add_summary(self, *, issue_id: str, run_id: str | None, kind: str,
+                    body: str, comment_url: str | None = None) -> str:
+        # Generated up front, not inside _durable: the caller (and the
+        # log line, if this ends up dropped) must get back the same id that
+        # will eventually land in Postgres, whether that happens now or once
+        # Task 21's journal replay applies it.
+        summary_id = history.new_id()
+        payload = dict(
+            summary_id=summary_id, issue_id=issue_id, run_id=run_id,
+            kind=kind, body=body, comment_url=comment_url,
+        )
+        self._durable(
+            "history.add_summary", payload, lambda: history.add_summary(self._db, **payload)
+        )
+        return summary_id
+
     def _durable(self, op: str, payload: dict, call) -> None:
         """Run a durable write. Never raises — logs and drops on failure.
 

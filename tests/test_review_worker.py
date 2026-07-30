@@ -291,7 +291,7 @@ def _stub_happy_path(monkeypatch, *, verdict: str = "REVIEW_VERDICT: PASS"):
     monkeypatch.setattr(worker, "_review_pass_labels", lambda ctx, logger: None)
     monkeypatch.setattr(worker, "_review_fail_labels", lambda ctx, logger: False)
     monkeypatch.setattr(worker, "_write_crash_log", lambda *a, **k: None)
-    monkeypatch.setattr(worker, "_post_crash_comment", lambda *a, **k: None)
+    monkeypatch.setattr(worker, "_post_crash_comment", lambda *a, **k: (None, "crash body"))
 
 
 class TestRunReviewWorkerPrResolution:
@@ -356,7 +356,7 @@ class TestRunReviewWorkerPrResolution:
         )
         monkeypatch.setattr(worker, "_claim_review_labels", lambda ctx, logger: None)
         monkeypatch.setattr(worker, "_write_crash_log", lambda *a, **k: None)
-        monkeypatch.setattr(worker, "_post_crash_comment", lambda *a, **k: None)
+        monkeypatch.setattr(worker, "_post_crash_comment", lambda *a, **k: (None, "crash body"))
         monkeypatch.setattr(worker, "_run_cmd", lambda *a, **k: _FakeCompleted())
 
         state_queue = _FakeQueue()

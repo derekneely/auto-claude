@@ -550,7 +550,7 @@ def _sync_boards(config, github, logger: MainLogger) -> None:
 
 
 def _run_triage(record, state, github, triage_engine, config, logger,
-                dry_run: bool = False) -> None:
+                dry_run: bool = False, dbsync=None) -> None:
     """Triage a single issue and update state accordingly."""
     # Triage answers "is this issue specified well enough to implement". That
     # question is meaningless for a PR review, and a needs-info verdict would
@@ -586,7 +586,7 @@ def _run_triage(record, state, github, triage_engine, config, logger,
         if not dry_run:
             comment = format_clarifying_comment(decision, config)
             try:
-                github.post_comment(record.repo, record.number, comment)
+                comment_url = github.post_comment(record.repo, record.number, comment)
                 # Move the stage backwards off ac-dev-ready: the issue is not
                 # ready after all, and leaving the trigger label on would make
                 # the next poll pick it straight back up.
@@ -604,6 +604,13 @@ def _run_triage(record, state, github, triage_engine, config, logger,
                     state.save()
                 except Exception:
                     pass
+                # Runless — triage is an inline call from `main`, not a
+                # worker run, so `run_id` is NULL by design.
+                if dbsync is not None:
+                    dbsync.add_summary(
+                        issue_id=record.issue_id, run_id=None, kind="triage",
+                        body=comment, comment_url=comment_url,
+                    )
                 logger.info(f"Posted clarifying questions on {record.issue_id}")
             except Exception as exc:
                 logger.error(f"Failed to post comment on {record.issue_id}: {exc}")
@@ -683,7 +690,8 @@ def _run_single_issue(args, config, state, github, triage_engine, logger,
 
     # Triage if needed
     if record.status in (IssueStatus.DISCOVERED,):
-        _run_triage(record, state, github, triage_engine, config, logger)
+        _run_triage(record, state, github, triage_engine, config, logger,
+                    dbsync=process_manager.dbsync)
         record = state.get(issue_id)
 
     if record.status == IssueStatus.QUEUED:
@@ -876,14 +884,14 @@ def main() -> None:
                 if record.mode == "review":
                     continue
                 _run_triage(record, state, github, triage_engine, config, logger,
-                            dry_run=args.dry_run)
+                            dry_run=args.dry_run, dbsync=process_manager.dbsync)
 
             # 4. Re-triage updated needs_info issues
             for record in retriage_issues:
                 if shutdown_requested:
                     break
                 _run_triage(record, state, github, triage_engine, config, logger,
-                            dry_run=args.dry_run)
+                            dry_run=args.dry_run, dbsync=process_manager.dbsync)
 
             # 5. Spawn workers for queued issues
             if not args.dry_run:

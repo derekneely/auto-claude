@@ -407,8 +407,20 @@ class ProcessManager:
             self._state.save()
 
     def _sync_run(self, update: StateUpdate) -> None:
-        """Open or close a `run` row from a worker's StateUpdate. No-op if
-        no dbsync is wired (see __init__)."""
+        """Open/close a `run` row and post any `summary` rows from a worker's
+        StateUpdate. No-op if no dbsync is wired (see __init__).
+
+        A fenced worker (Task 14's `_handle_lease_lost`) is read-only — it
+        cannot write to Postgres itself, only `main` can — so it hands off
+        by sending `error="fenced: ..."` on the terminal StateUpdate and
+        nothing in `summaries` (posting a GitHub comment is exactly the
+        remote touch fencing exists to prevent, so there is no comment_url
+        to carry). That hand-off is completed HERE: an `error` starting
+        with "fenced:" gets its own `kind="fenced"` summary row, written to
+        Postgres (not GitHub) via `self._dbsync`, which is not the remote
+        act the fence guards against — only `main` ever calls this, from the
+        already-fenced-safe write seam.
+        """
         if self._dbsync is None:
             return
 
@@ -427,6 +439,26 @@ class ProcessManager:
                 cost_usd=update.cost_usd, turns=update.turns,
                 crash_log_path=update.crash_log_path,
             )
+
+        if update.error and update.error.startswith("fenced:"):
+            self._dbsync.add_summary(
+                issue_id=update.issue_id, run_id=update.run_id, kind="fenced",
+                body=update.error, comment_url=None,
+            )
+
+        for item in (update.summaries or []):
+            self._dbsync.add_summary(
+                issue_id=update.issue_id, run_id=update.run_id,
+                kind=item["kind"], body=item["body"],
+                comment_url=item.get("comment_url"),
+            )
+
+    @property
+    def dbsync(self):
+        """The wired DbSync instance (may be None) — read by `main` so
+        runless summaries (triage, budget) can be posted through the same
+        seam without ProcessManager owning that logic itself."""
+        return self._dbsync
 
     def abort_worker(self, issue_id: str) -> None:
         """Signal a specific worker to abort."""
@@ -568,7 +600,7 @@ class ProcessManager:
                 f"_Consider breaking this into smaller issues, or increase "
                 f"`max_budget_usd` in config._"
             )
-            subprocess.run(
+            result = subprocess.run(
                 [
                     "gh", "issue", "comment", str(record.number),
                     "--repo", f"{self._config.github.org}/{record.repo}",
@@ -581,5 +613,16 @@ class ProcessManager:
                 encoding="utf-8",
                 errors="replace",
             )
+            comment_url = result.stdout.strip()
+            if result.returncode != 0 or not comment_url.startswith("http"):
+                comment_url = None
+
+            # Runless — the decision to give up is made here, across
+            # continuation runs that each already closed their own `run` row.
+            if self._dbsync is not None:
+                self._dbsync.add_summary(
+                    issue_id=record.issue_id, run_id=None, kind="budget",
+                    body=body, comment_url=comment_url,
+                )
         except Exception as exc:
             self._logger.error(f"Failed to post budget comment on {record.issue_id}: {exc}")

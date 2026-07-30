@@ -161,15 +161,24 @@ class GithubClient:
         """Return all comments for an issue."""
         return self._gh_api(f"/repos/{self.org}/{repo}/issues/{number}/comments")
 
-    def post_comment(self, repo: str, number: int, body: str) -> None:
-        """Post a comment on an issue."""
-        self._run_gh(
+    def post_comment(self, repo: str, number: int, body: str) -> str | None:
+        """Post a comment on an issue. Returns the created comment's URL.
+
+        `gh issue comment` prints the new comment's URL as its only stdout
+        line on success. Returns None if that line is missing or does not
+        look like a URL — callers must treat the result as best-effort, not
+        as proof the comment exists (`_run_gh` already raised on a hard
+        failure, so this only covers an unparseable success).
+        """
+        result = self._run_gh(
             [
                 "issue", "comment", str(number),
                 "--repo", f"{self.org}/{repo}",
                 "--body", body,
             ]
         )
+        url = result.stdout.strip()
+        return url if url.startswith("http") else None
 
     def add_label(self, repo: str, number: int, label: str) -> None:
         """Add a label to an issue."""

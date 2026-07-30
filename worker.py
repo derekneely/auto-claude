@@ -259,6 +259,13 @@ class StateUpdate:
     cost_usd: float | None = None
     turns: int | None = None
     crash_log_path: str | None = None
+    # Comments this run posted to GitHub, to be written as `summary` rows
+    # alongside the closing update. A list because some failure paths post
+    # more than one comment for the same terminal event (e.g. a
+    # failed-checks report from `_post_issue_report`, followed by the crash
+    # comment from the outer exception handler) — each is its own row. Each
+    # dict has keys {"kind", "body", "comment_url"}.
+    summaries: list[dict] | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -299,8 +306,13 @@ def _post_crash_comment(
     error: str,
     log_path: Path | None,
     logger: WorkerLogger,
-) -> None:
-    """Post a concise failure comment on the issue referencing the local crash log."""
+) -> tuple[str | None, str]:
+    """Post a concise failure comment on the issue referencing the local crash log.
+
+    Returns (comment_url, body) — the exact text posted and the URL of the
+    created comment (None if the post failed), for the caller's `summary`
+    row.
+    """
     log_ref = f"\n\nCrash log: `{log_path}`" if log_path else ""
     body = redact(
         f"**auto-claude** failed while processing this issue.\n\n"
@@ -309,7 +321,7 @@ def _post_crash_comment(
     )
     env = build_env(current_token())
     try:
-        subprocess.run(
+        result = subprocess.run(
             [
                 "gh", "issue", "comment", str(ctx.number),
                 "--repo", f"{ctx.org}/{ctx.repo}",
@@ -322,8 +334,13 @@ def _post_crash_comment(
             encoding="utf-8",
             errors="replace",
         )
+        if result.returncode != 0:
+            return None, body
+        url = result.stdout.strip()
+        return (url if url.startswith("http") else None), body
     except Exception as exc:
         logger.error(f"Failed to post crash comment: {exc}")
+        return None, body
 
 
 def sanitize_branch_name(title: str, number: int) -> str:
@@ -859,13 +876,18 @@ def _post_issue_report(
     outcome: str,
     logger: WorkerLogger,
     notes_override: str | None = None,
-) -> None:
+) -> tuple[str, str | None]:
     """Post the agent's plan, summary and notes back to the issue.
 
     Never fatal. A worker that wrote the code, pushed it and opened a PR has
     done its job; failing it over a comment would send a completed issue back
     round the retry loop and produce a second PR.
+
+    Returns (body, comment_url) — the exact text posted and the URL of the
+    created comment (None if the post failed or the URL could not be
+    determined), for the caller's `summary` row.
     """
+    body = ""
     try:
         try:
             attempt = stages.attempt_of(_get_issue_labels(ctx, logger))
@@ -893,8 +915,12 @@ def _post_issue_report(
         )
         if result.returncode != 0:
             logger.warn(f"Could not post issue report: {result.stderr.strip()}")
+            return body, None
+        url = result.stdout.strip()
+        return body, (url if url.startswith("http") else None)
     except Exception as exc:
         logger.warn(f"Could not post issue report: {exc}")
+        return body, None
 
 
 def _extract_result_text(output: str) -> str:
@@ -1808,6 +1834,7 @@ def run_dev_worker(
     run_id = uuid.uuid4().hex
     metrics = RunMetrics()
     returncode: int | None = None
+    pending_summaries: list[dict] = []
 
     # Signal that we're in progress + claim the stage label as a distributed
     # lock. This never touches the kind hint (ac-fix, ac-implement, ...).
@@ -1999,7 +2026,7 @@ def run_dev_worker(
             # Nothing broken gets pushed. The transcript goes to the issue so
             # the next attempt starts from the actual failure.
             logger.error("Checks still failing after repair — refusing to push")
-            _post_issue_report(
+            report_body, report_url = _post_issue_report(
                 ctx,
                 output=output,
                 summary="",
@@ -2011,6 +2038,9 @@ def run_dev_worker(
                     "Verify/test commands failed and a repair round did not fix "
                     f"them. Nothing was pushed.\n\n```\n{checks_transcript[-3000:]}\n```"
                 ),
+            )
+            pending_summaries.append(
+                {"kind": "dev", "body": report_body, "comment_url": report_url}
             )
             raise RuntimeError("Verify/test checks failed — not pushing")
 
@@ -2043,7 +2073,7 @@ def run_dev_worker(
         # source of truth for anyone reading it later, and it previously
         # received only "PR created: <url>" — everything the agent decided
         # lived in a log nobody opens.
-        _post_issue_report(
+        report_body, report_url = _post_issue_report(
             ctx,
             output=output,
             summary=summary,
@@ -2051,6 +2081,9 @@ def run_dev_worker(
             pr_url=pr_url,
             outcome="success",
             logger=logger,
+        )
+        pending_summaries.append(
+            {"kind": "dev", "body": report_body, "comment_url": report_url}
         )
 
         # Success
@@ -2066,6 +2099,7 @@ def run_dev_worker(
             duration_seconds=metrics.duration_seconds,
             cost_usd=metrics.cost_usd,
             turns=metrics.turns,
+            summaries=pending_summaries or None,
         ))
 
     except LeaseLostError as exc:
@@ -2079,7 +2113,8 @@ def run_dev_worker(
 
         # Write crash log and post comment
         log_path = _write_crash_log(ctx, error_detail, logger)
-        _post_crash_comment(ctx, str(exc), log_path, logger)
+        crash_url, crash_body = _post_crash_comment(ctx, str(exc), log_path, logger)
+        pending_summaries.append({"kind": "crash", "body": crash_body, "comment_url": crash_url})
 
         state_queue.put(StateUpdate(
             issue_id=ctx.issue_id,
@@ -2092,6 +2127,7 @@ def run_dev_worker(
             cost_usd=metrics.cost_usd,
             turns=metrics.turns,
             crash_log_path=str(log_path) if log_path else None,
+            summaries=pending_summaries or None,
         ))
 
         # Bump the attempt counter and return to ac-dev-ready — or, on the
@@ -2274,12 +2310,18 @@ def _post_pr_review(
     *,
     approve: bool,
     body: str,
-) -> None:
-    """Post an approving or changes-requested review on the PR via gh."""
+) -> str | None:
+    """Post an approving or changes-requested review on the PR via gh.
+
+    Returns the URL of the created review, or None if there was no PR number
+    to review, the review post failed, or the follow-up lookup below did.
+    `gh pr review` prints nothing on success, so the URL is fetched with a
+    second call against the REST reviews endpoint rather than guessed at.
+    """
     pr_number = _pr_number(ctx.pr_url)
     if pr_number is None:
         logger.warn("No PR number to review — skipping gh pr review")
-        return
+        return None
     _assert_lease_held(ctx, logger)
     args = [
         "gh", "pr", "review", str(pr_number),
@@ -2287,7 +2329,22 @@ def _post_pr_review(
         "--approve" if approve else "--request-changes",
         "--body", redact(body),
     ]
-    _run_cmd(args, logger=logger, timeout=30)
+    result = _run_cmd(args, logger=logger, timeout=30)
+    if result.returncode != 0:
+        logger.warn(f"Could not post PR review: {result.stderr.strip()}")
+        return None
+
+    lookup = _run_cmd(
+        [
+            "gh", "api",
+            f"repos/{ctx.org}/{ctx.repo}/pulls/{pr_number}/reviews",
+            "--jq", ".[-1].html_url",
+        ],
+        logger=logger,
+        timeout=30,
+    )
+    url = lookup.stdout.strip()
+    return url if lookup.returncode == 0 and url.startswith("http") else None
 
 
 def run_review_worker(
@@ -2309,6 +2366,7 @@ def run_review_worker(
     run_id = uuid.uuid4().hex
     metrics = RunMetrics()
     returncode: int | None = None
+    pending_summaries: list[dict] = []
 
     state_queue.put(StateUpdate(
         issue_id=ctx.issue_id,
@@ -2422,7 +2480,10 @@ def run_review_worker(
                 "Agent review: build passes, diff satisfies acceptance criteria, "
                 "security pass clean. Handing to human for final test (HITL gate)."
             )
-            _post_pr_review(ctx, logger, approve=True, body=approve_body)
+            review_url = _post_pr_review(ctx, logger, approve=True, body=approve_body)
+            pending_summaries.append(
+                {"kind": "review", "body": approve_body, "comment_url": review_url}
+            )
             _review_pass_labels(ctx, logger)
 
             state_queue.put(StateUpdate(
@@ -2435,6 +2496,7 @@ def run_review_worker(
                 duration_seconds=metrics.duration_seconds,
                 cost_usd=metrics.cost_usd,
                 turns=metrics.turns,
+                summaries=pending_summaries or None,
             ))
             return
 
@@ -2452,7 +2514,10 @@ def run_review_worker(
         else:
             logger.info("Review fail — requesting changes and returning to ac-dev-ready")
             request_body = f"Agent review: changes needed.\n\n{feedback}"
-        _post_pr_review(ctx, logger, approve=False, body=request_body)
+        review_url = _post_pr_review(ctx, logger, approve=False, body=request_body)
+        pending_summaries.append(
+            {"kind": "review", "body": request_body, "comment_url": review_url}
+        )
 
         state_queue.put(StateUpdate(
             issue_id=ctx.issue_id,
@@ -2465,6 +2530,7 @@ def run_review_worker(
             duration_seconds=metrics.duration_seconds,
             cost_usd=metrics.cost_usd,
             turns=metrics.turns,
+            summaries=pending_summaries or None,
         ))
 
     except LeaseLostError as exc:
@@ -2476,7 +2542,8 @@ def run_review_worker(
         logger.error(f"Review worker failed: {exc}")
 
         log_path = _write_crash_log(ctx, error_detail, logger)
-        _post_crash_comment(ctx, str(exc), log_path, logger)
+        crash_url, crash_body = _post_crash_comment(ctx, str(exc), log_path, logger)
+        pending_summaries.append({"kind": "crash", "body": crash_body, "comment_url": crash_url})
 
         state_queue.put(StateUpdate(
             issue_id=ctx.issue_id,
@@ -2489,6 +2556,7 @@ def run_review_worker(
             cost_usd=metrics.cost_usd,
             turns=metrics.turns,
             crash_log_path=str(log_path) if log_path else None,
+            summaries=pending_summaries or None,
         ))
 
         # Release the self-lock so the issue is not stranded on
