@@ -14,8 +14,11 @@ from multiprocessing import Event, Queue
 from pathlib import Path
 
 import stages
+from db.harness import Harness
+from db.pool import Database
+from dbsync import DbSync
 from ghauth import apply_git_credentials, build_env, current_token
-from integrations import TelemetryEvent, log_event
+from integrations import METRICS_DB_ENV_VAR, TelemetryEvent, log_event
 from logger import WorkerLogger
 from pipeline import load_pipeline_config
 from ratelimit import (
@@ -77,6 +80,87 @@ def assert_pushable(branch: str | None, base_branch: str | None) -> None:
             f"Refusing to push to protected branch '{(branch or '').strip()}'. "
             f"Workers may only push their own ac/issue-* branches."
         )
+
+
+class LeaseLostError(RuntimeError):
+    """Raised when this harness no longer holds the Postgres lease on the
+    issue being worked, discovered immediately before an irreversible remote
+    act. Mirrors `ProtectedBranchError`: fails LOUD by raising, so a caller
+    cannot forget to check a return value.
+    """
+
+
+def _assert_lease_held(ctx: IssueContext, logger: WorkerLogger) -> None:
+    """Refuse an irreversible act once another harness owns this issue.
+
+    Called immediately before every `git push`, `gh pr create`, `gh pr
+    review`, and inside `_set_labels` - the single chokepoint for every
+    `ac-*` label write - mirroring where `assert_pushable` is called. A
+    no-op when `ctx.harness_id` is unset or no shared database is configured
+    (`PIPELINE_METRICS_DATABASE_URL`), because both mean "no shared
+    database, no second harness to fence against" - see
+    `main._release_stale_locks`'s degraded-path reasoning, applied here
+    mid-run instead of at startup.
+
+    Builds its own `Database`/`DbSync` from `os.environ` rather than
+    receiving one from `main`: the worker is a separate `spawn`ed process,
+    so a live connection cannot cross the pickle boundary. Only
+    `check_lease` is ever called on the result, which per its docstring
+    fails CLOSED (returns False, i.e. "lease lost") if Postgres is
+    unreachable after its own internal retries - so this function needs no
+    second layer of retry logic.
+    """
+    if not ctx.harness_id:
+        return
+    url = os.environ.get(METRICS_DB_ENV_VAR)
+    if not url:
+        return
+
+    db = Database(url)
+    try:
+        harness = Harness(id=ctx.harness_id, hostname="", pid=0, version="")
+        # No `journal` passed — Task 8's default of `None` is fine here,
+        # since check_lease never journals in the first place (spec:
+        # "Claims and fence checks never queue").
+        dbsync = DbSync(db, harness, logger)
+        if not dbsync.check_lease(ctx.issue_id):
+            raise LeaseLostError(
+                f"Lease on {ctx.issue_id} is no longer held by harness "
+                f"{ctx.harness_id} — refusing to touch the remote."
+            )
+    finally:
+        db.close()
+
+
+def _handle_lease_lost(
+    ctx: IssueContext,
+    logger: WorkerLogger,
+    state_queue: Queue,
+    exc: LeaseLostError,
+    *,
+    branch: str | None = None,
+) -> None:
+    """Common fenced-exit path shared by run_dev_worker and run_review_worker.
+
+    Writes a local crash log (disk only, never the remote) and sends a
+    StateUpdate whose `error` is prefixed "fenced:" — StateUpdate's shape is
+    frozen for Phases A-C, so this is how a later phase's run/summary
+    capture can recognise and record a `summary` row with kind="fenced"
+    without a new field. Deliberately does NOT call `_post_crash_comment`
+    (a GitHub comment is exactly the remote touch fencing exists to
+    prevent) and does NOT clean up the worktree — the branch stays local
+    and the issue is retried by whichever harness now holds it.
+    """
+    logger.error(f"Fenced: {exc}")
+    log_path = _write_crash_log(ctx, str(exc), logger)
+    logger.warn(f"Lease lost — leaving remote state untouched; crash log at {log_path}")
+    state_queue.put(StateUpdate(
+        issue_id=ctx.issue_id,
+        status="failed",
+        error=f"fenced: {exc}",
+        branch=branch,
+        pr_url=ctx.pr_url,
+    ))
 
 
 # ---------------------------------------------------------------------------
@@ -842,6 +926,7 @@ def _push_partial_work(
     except ProtectedBranchError as exc:
         logger.error(str(exc))
         return None
+    _assert_lease_held(ctx, logger)
 
     # Check for uncommitted changes
     status_result = _run_cmd(
@@ -892,6 +977,7 @@ def _push_partial_work(
 
     # Create PR if one doesn't exist yet
     if not ctx.pr_url:
+        _assert_lease_held(ctx, logger)
         pr_body = f"Work in progress — budget exceeded, continuation pending.\n\nAddresses #{ctx.number}"
         pr_title = f"wip: {ctx.title} (#{ctx.number})"
         logger.info("Creating WIP pull request...")
@@ -1162,6 +1248,7 @@ def _push_rework(
     # `branch` here came from local state or a PR's headRefName — not from us.
     # Fail before staging anything.
     assert_pushable(branch, ctx.base_branch)
+    _assert_lease_held(ctx, logger)
 
     # Stage and commit only if there are uncommitted changes
     # (Claude may have already committed)
@@ -1437,7 +1524,13 @@ def _set_labels(
     add: list[str] | None = None,
     remove: list[str] | None = None,
 ) -> None:
-    """Add and/or remove labels on the issue in a single gh call."""
+    """Add and/or remove labels on the issue in a single gh call.
+
+    The chokepoint for every `ac-*` label write - `_assert_lease_held` runs
+    immediately before the `gh issue edit` call, not at the top of the
+    function, so a no-op call (nothing to add or remove) never pays for a
+    lease check it does not need.
+    """
     args = [
         "gh", "issue", "edit", str(ctx.number),
         "--repo", f"{ctx.org}/{ctx.repo}",
@@ -1448,6 +1541,7 @@ def _set_labels(
         args += ["--remove-label", ",".join(remove)]
 
     if add or remove:
+        _assert_lease_held(ctx, logger)
         desc = []
         if remove:
             desc.append(f"-{','.join(remove)}")
@@ -1509,6 +1603,7 @@ def _push_and_pr(
 ) -> str:
     """Commit, push, create PR, comment on issue. Returns PR URL."""
     assert_pushable(branch, ctx.base_branch)
+    _assert_lease_held(ctx, logger)
 
     # Stage and commit only if there are uncommitted changes
     # (Claude may have already committed)
@@ -1540,6 +1635,8 @@ def _push_and_pr(
     )
     if result.returncode != 0:
         raise RuntimeError(f"Push failed: {result.stderr.strip()}")
+
+    _assert_lease_held(ctx, logger)
 
     # Create PR — redact summary to avoid leaking secrets from Claude output
     pr_body = f"{redact(summary)}\n\nCloses #{ctx.number}" if summary else f"Closes #{ctx.number}"
@@ -1611,13 +1708,16 @@ def run_dev_worker(
         status="in_progress",
         worker_pid=pid,
     ))
-    _claim_labels(ctx, logger)
 
     branch = sanitize_branch_name(ctx.title, ctx.number)
     worktree_dir = ctx.worktrees_dir / ctx.repo / f"issue-{ctx.number}"
     is_fresh_branch = False  # True if rework fell back to a new versioned branch
 
     try:
+        # [0] Self-lock. Inside the try so a lease lost between spawn and
+        # here is fenced, not an unhandled crash.
+        _claim_labels(ctx, logger)
+
         # [1] Clone / fetch
         repo_dir = _clone_or_fetch(ctx, logger)
 
@@ -1835,6 +1935,9 @@ def run_dev_worker(
             pr_url=pr_url,
         ))
 
+    except LeaseLostError as exc:
+        _handle_lease_lost(ctx, logger, state_queue, exc, branch=branch)
+
     except Exception as exc:
         import traceback
         error_detail = f"{exc}\n\n{traceback.format_exc()}"
@@ -2036,6 +2139,7 @@ def _post_pr_review(
     if pr_number is None:
         logger.warn("No PR number to review — skipping gh pr review")
         return
+    _assert_lease_held(ctx, logger)
     args = [
         "gh", "pr", "review", str(pr_number),
         "--repo", f"{ctx.org}/{ctx.repo}",
@@ -2067,14 +2171,15 @@ def run_review_worker(
         worker_pid=pid,
     ))
 
-    # [1] Self-lock FIRST, before any expensive work, so a concurrent runner
-    # cannot double-claim this review.
-    _claim_review_labels(ctx, logger)
-
     worktree_dir = ctx.worktrees_dir / ctx.repo / f"issue-{ctx.number}-review"
     repo_dir = ctx.repos_dir / ctx.repo
 
     try:
+        # [1] Self-lock FIRST, before any expensive work, so a concurrent
+        # runner cannot double-claim this review. Inside the try so a lease
+        # lost between spawn and here is fenced, not an unhandled crash.
+        _claim_review_labels(ctx, logger)
+
         # `ctx.pr_url`/`existing_branch` are only populated when this same
         # daemon process ran the dev worker that opened the PR — a restart, a
         # human-applied ac-dev-review label, or a PR from the sibling
@@ -2201,6 +2306,9 @@ def run_review_worker(
             error="blocked" if blocked else "review_fail",
             pr_url=ctx.pr_url,
         ))
+
+    except LeaseLostError as exc:
+        _handle_lease_lost(ctx, logger, state_queue, exc)
 
     except Exception as exc:
         import traceback
