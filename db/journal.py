@@ -12,18 +12,36 @@ are deliberately NOT journalable and have no entry in `OPS` or
 "right now" — replaying a stale claim later would hand an issue to a
 harness that no longer owns it, so `DbSync`'s lease methods bypass
 `_durable`/this journal entirely and always talk straight to Postgres.
+
+`replay()` draws a hard line between two kinds of failure:
+
+- Transient (`DbUnavailable`): Postgres, not the entry, is at fault. This
+  must stop the loop and leave the journal file completely untouched —
+  that is the confirm-then-truncate guarantee (see `replay()`) and it must
+  never regress.
+- Structural (unparseable JSON, a missing `op`/`payload` key, an
+  unrecognised op string, or a payload whose keys don't match its
+  handler's signature): no future replay of *this* entry could ever
+  succeed. Raising uncaught here would wedge the journal on that one line
+  forever — every retry re-applies the entries ahead of it, hits the same
+  fault, and never drains the entries behind it, silently losing every
+  write queued behind a single torn line. Structurally bad lines are
+  instead quarantined verbatim to a sibling `.corrupt` file and logged
+  once at error level, so an operator can see and recover them, and
+  replay proceeds past them.
 """
 
 from __future__ import annotations
 
 import json
+import logging
 from pathlib import Path
 from typing import Callable
 
 from db import harness as db_harness
 from db import history as db_history
 from db import issue_state as db_issue_state
-from db.pool import Database
+from db.pool import Database, DbUnavailable
 
 _OP_HANDLERS: dict[str, Callable[[Database, dict], None]] = {
     "issue_state.upsert": lambda db, payload: db_issue_state.upsert(db, **payload),
@@ -35,6 +53,8 @@ _OP_HANDLERS: dict[str, Callable[[Database, dict], None]] = {
     ),
 }
 
+_logger = logging.getLogger(__name__)
+
 
 class Journal:
     """Append-only JSONL of writes made while Postgres was unreachable.
@@ -43,10 +63,10 @@ class Journal:
     Every op must be idempotent, because replay may run twice.
     """
 
-    OPS = (
-        "issue_state.upsert", "history.start_run",
-        "history.finish_run", "history.add_summary", "harness.register",
-    )
+    # Generated from _OP_HANDLERS rather than hand-copied: two independently
+    # maintained lists of the same op names will eventually drift, and an op
+    # added to one but not the other silently wedges append() or replay().
+    OPS = tuple(_OP_HANDLERS)
 
     def __init__(self, path: Path) -> None:
         self._path = path
@@ -68,17 +88,23 @@ class Journal:
     def replay(self, db: Database) -> int:
         """Apply every entry in order, then truncate. Returns entries applied.
 
-        Raises DbUnavailable without truncating if the DB drops mid-replay —
-        the file keeps every entry, including the ones already applied
-        before the drop, so the next successful replay re-runs them too.
-        That is safe only because every handler above is idempotent; this is
-        the one place in the codebase allowed to rely on that.
+        Raises DbUnavailable without touching the file if the DB drops
+        mid-replay — every entry, including the ones already applied before
+        the drop, stays in the journal so the next successful replay
+        re-runs them too. That is safe only because every handler above is
+        idempotent; this is the one place in the codebase allowed to rely
+        on that.
 
         Confirm-then-truncate, never the reverse: truncating before every
-        entry is known to have applied would mean a connection drop on entry
+        entry is known to be resolved would mean a connection drop on entry
         3 of 5 discards entries 4 and 5 along with the ones that already
         succeeded, with no other copy to recover them from — Postgres itself
-        is exactly what was unreachable.
+        is exactly what was unreachable. This now covers quarantine
+        decisions too: a structurally bad line found earlier in this pass
+        is only moved to `.corrupt` once the *entire* pass finishes without
+        a transient failure — a `DbUnavailable` on a later entry leaves that
+        bad line exactly where it was, so the next attempt re-evaluates it
+        from scratch instead of finding it half-migrated.
         """
         if not self._path.exists():
             return 0
@@ -88,17 +114,57 @@ class Journal:
             return 0
 
         applied = 0
+        quarantined: list[tuple[str, str]] = []  # (raw line, why it was rejected)
         for line in lines:
-            entry = json.loads(line)
-            op = entry["op"]
-            payload = entry["payload"]
+            try:
+                entry = json.loads(line)
+                op = entry["op"]
+                payload = entry["payload"]
+            except (json.JSONDecodeError, KeyError) as exc:
+                # Torn write, or a hand-edited/foreign line missing a
+                # required key — no retry will ever parse this differently.
+                quarantined.append((line, f"{type(exc).__name__}: {exc}"))
+                continue
+
             handler = _OP_HANDLERS.get(op)
             if handler is None:
-                raise ValueError(f"Unknown journal op: {op!r}")
-            handler(db, payload)  # DbUnavailable propagates uncaught — see docstring
+                # An op this version of the daemon doesn't recognise —
+                # structural, not transient.
+                quarantined.append((line, f"unknown op {op!r}"))
+                continue
+
+            try:
+                handler(db, payload)
+            except DbUnavailable:
+                # Transient: Postgres, not the entry, is at fault. Propagate
+                # uncaught so nothing below runs — the journal, and every
+                # quarantine decision tentatively made above this line in
+                # this same pass, is left exactly as it was. See docstring.
+                raise
+            except TypeError as exc:
+                # The payload's keys don't match this handler's real
+                # signature (e.g. a stale field from an older version of
+                # this daemon) — raised by the kwarg splat before db.execute
+                # is ever reached. Structural, not a database problem.
+                quarantined.append((line, f"TypeError: {exc}"))
+                continue
             applied += 1
 
-        # Every entry applied without the DB dropping — safe to truncate.
+        # The whole pass resolved every line — applied or quarantined — with
+        # nothing transient interrupting us. Safe to commit both at once.
+        if quarantined:
+            corrupt_path = self._path.with_suffix(".corrupt")
+            with corrupt_path.open("a", encoding="utf-8") as f:
+                for line, _reason in quarantined:
+                    f.write(line + "\n")  # verbatim — an operator may need it
+            _logger.error(
+                "journal.replay: quarantined %d unreplayable entr%s to %s: %s",
+                len(quarantined),
+                "y" if len(quarantined) == 1 else "ies",
+                corrupt_path,
+                "; ".join(reason for _line, reason in quarantined),
+            )
+
         # Written explicitly as UTF-8, no BOM.
         self._path.write_text("", encoding="utf-8")
         return applied
