@@ -24,6 +24,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import worker  # noqa: E402
 from worker import (  # noqa: E402
     IssueContext,
+    RunMetrics,
     StateUpdate,
     _candidate_prs_for_issue,
     _extract_review_feedback,
@@ -284,7 +285,7 @@ def _stub_happy_path(monkeypatch, *, verdict: str = "REVIEW_VERDICT: PASS"):
     monkeypatch.setattr(worker, "_run_pipeline_checks", lambda ctx, worktree_dir, logger: (True, "ok"))
     monkeypatch.setattr(worker, "_get_issue_comments", lambda ctx, logger: [])
     monkeypatch.setattr(worker, "_build_review_prompt", lambda *a, **k: "prompt")
-    monkeypatch.setattr(worker, "_run_claude", lambda **k: (0, verdict, False, None))
+    monkeypatch.setattr(worker, "_run_claude", lambda **k: (0, verdict, False, None, RunMetrics()))
     monkeypatch.setattr(worker, "_run_cmd", lambda *a, **k: _FakeCompleted())
     monkeypatch.setattr(worker, "_claim_review_labels", lambda ctx, logger: None)
     monkeypatch.setattr(worker, "_review_pass_labels", lambda ctx, logger: None)

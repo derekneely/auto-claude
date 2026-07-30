@@ -9,6 +9,7 @@ import shutil
 import subprocess
 import threading
 import time
+import uuid
 from dataclasses import dataclass
 from multiprocessing import Event, Queue
 from pathlib import Path
@@ -436,6 +437,70 @@ def _format_review_section(review_comments: list[dict]) -> str:
     return "\n".join(lines)
 
 
+@dataclass
+class RunMetrics:
+    """Cost/turns/duration parsed from a Claude CLI `stream-json` result event.
+
+    All fields are None when no result event was seen — a crash mid-run, or
+    output truncated before the CLI got to emit one — so a caller writing
+    this to Postgres stores NULL rather than a fabricated zero.
+    """
+    cost_usd: float | None = None
+    turns: int | None = None
+    duration_seconds: int | None = None
+
+
+def _parse_run_metrics(output: str) -> RunMetrics:
+    """Extract cost/turns/duration from the LAST `"type":"result"` line.
+
+    Mirrors `_extract_result_text`'s line-by-line parse below. Malformed
+    lines are skipped rather than fatal, since stream-json output is
+    line-buffered from a subprocess and a truncated final line is routine.
+    When more than one result event appears, the last one wins — matching
+    the equivalent last-write behaviour a caller would get by re-running
+    `_extract_result_text` over the same stream.
+    """
+    metrics = RunMetrics()
+    for line in output.split("\n"):
+        try:
+            data = json.loads(line)
+        except (json.JSONDecodeError, TypeError):
+            continue
+        if not isinstance(data, dict) or data.get("type") != "result":
+            continue
+        cost = data.get("total_cost_usd")
+        turns = data.get("num_turns")
+        duration_ms = data.get("duration_ms")
+        metrics = RunMetrics(
+            cost_usd=float(cost) if isinstance(cost, (int, float)) else None,
+            turns=int(turns) if isinstance(turns, int) else None,
+            duration_seconds=(
+                round(duration_ms / 1000) if isinstance(duration_ms, (int, float)) else None
+            ),
+        )
+    return metrics
+
+
+def _accumulate_metrics(base: RunMetrics, extra: RunMetrics) -> RunMetrics:
+    """Sum two readings from sequential `_run_claude` calls billed to one run.
+
+    Used to fold a same-model repair round into the primary call's totals —
+    both bill against the same `run` row. A field stays None only when BOTH
+    inputs are None; one usable reading is better than discarding it because
+    the other call's result event never arrived.
+    """
+    def _sum(a: float | int | None, b: float | int | None):
+        if a is None and b is None:
+            return None
+        return (a or 0) + (b or 0)
+
+    return RunMetrics(
+        cost_usd=_sum(base.cost_usd, extra.cost_usd),
+        turns=_sum(base.turns, extra.turns),
+        duration_seconds=_sum(base.duration_seconds, extra.duration_seconds),
+    )
+
+
 def _run_claude(
     prompt: str,
     cwd: Path,
@@ -446,14 +511,15 @@ def _run_claude(
     budget_override: float | None = None,
     model_override: str | None = None,
     max_turns_override: int | None = None,
-) -> tuple[int, str, bool, RateLimitInfo | None]:
+) -> tuple[int, str, bool, RateLimitInfo | None, RunMetrics]:
     """Run Claude CLI via Popen, stream output to logger.
 
-    Returns (returncode, captured_output, budget_exceeded, rate_limit).
+    Returns (returncode, captured_output, budget_exceeded, rate_limit, metrics).
 
     `rate_limit` is the last limiting rate_limit_event seen, or None. Under
     subscription auth this — not the USD budget — is the constraint that
-    actually stops work.
+    actually stops work. `metrics` is parsed from the stream-json result
+    event and is all-None if the run crashed before emitting one.
     """
     model = model_override or ctx.dev_model
     max_turns = max_turns_override or ctx.max_turns
@@ -535,14 +601,14 @@ def _run_claude(
                     proc.wait(timeout=10)
                 except subprocess.TimeoutExpired:
                     proc.kill()
-                return (-1, "", False, rate_limit)
+                return (-1, "", False, rate_limit, RunMetrics())
 
         proc.wait()
     except Exception as exc:
         logger.error(f"Error reading Claude output: {exc}")
         proc.kill()
         proc.wait()
-        return (-1, "", False, rate_limit)
+        return (-1, "", False, rate_limit, RunMetrics())
 
     stderr_thread.join(timeout=5)
     stderr_output = "\n".join(stderr_lines).strip()
@@ -569,7 +635,9 @@ def _run_claude(
         else:
             logger.warn("No stderr output from Claude")
 
-    return (proc.returncode, "\n".join(captured_lines), budget_exceeded, rate_limit)
+    captured_output = "\n".join(captured_lines)
+    metrics = _parse_run_metrics(captured_output)
+    return (proc.returncode, captured_output, budget_exceeded, rate_limit, metrics)
 
 
 def _rate_limited_until(info: RateLimitInfo) -> float:
@@ -887,7 +955,11 @@ def _run_handoff_summary(
     )
 
     logger.info(f"Running grace-budget handoff summary (model={ctx.light_model})...")
-    returncode, output, _, _ = _run_claude(
+    # Metrics discarded: this call bills ctx.light_model, a different model
+    # paying for a different, smaller job than the primary run. Folding its
+    # cost into the primary run's single `model` column would misattribute
+    # spend, so it is dropped here rather than accumulated.
+    returncode, output, _, _, _metrics = _run_claude(
         prompt=prompt,
         cwd=cwd,
         ctx=ctx,
@@ -1753,7 +1825,7 @@ def run_dev_worker(
         review_comments = _get_pr_reviews(ctx, logger) if is_rework else None
         prompt = _build_prompt(ctx, comments, review_comments)
 
-        returncode, output, budget_exceeded, rate_limit = _run_claude(
+        returncode, output, budget_exceeded, rate_limit, metrics = _run_claude(
             prompt=prompt,
             cwd=worktree_dir,
             ctx=ctx,
@@ -1856,7 +1928,7 @@ def run_dev_worker(
 
         if not checks_ok:
             logger.warn("Checks failed — giving the agent one repair round")
-            repair_rc, repair_output, _budget, _rl = _run_claude(
+            repair_rc, repair_output, _budget, _rl, repair_metrics = _run_claude(
                 prompt=_build_repair_prompt(checks_transcript),
                 cwd=worktree_dir,
                 ctx=ctx,
@@ -1864,6 +1936,10 @@ def run_dev_worker(
                 abort_event=abort_event,
                 bypass_permissions=True,
             )
+            # A repair round is the same billed task continuing, not a
+            # separate job — fold its cost/turns/duration into the primary
+            # run's totals rather than discarding them.
+            metrics = _accumulate_metrics(metrics, repair_metrics)
             if repair_rc == 0:
                 output += "\n" + repair_output
             checks_ok, checks_transcript = _prepare_and_check(ctx, worktree_dir, logger)
@@ -2228,7 +2304,7 @@ def run_review_worker(
         comments = _get_issue_comments(ctx, logger)
         prompt = _build_review_prompt(ctx, comments, checks_ok, checks_transcript)
 
-        returncode, output, budget_exceeded, rate_limit = _run_claude(
+        returncode, output, budget_exceeded, rate_limit, metrics = _run_claude(
             prompt=prompt,
             cwd=worktree_dir,
             ctx=ctx,
