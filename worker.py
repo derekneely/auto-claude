@@ -765,23 +765,17 @@ def _extract_display_text(line: str) -> str:
 
 
 def _extract_summary(output: str) -> str:
-    """Extract the IMPLEMENTATION_SUMMARY line from Claude's output."""
-    for line in output.split("\n"):
-        # Check both raw lines and JSON-embedded text
-        if "IMPLEMENTATION_SUMMARY:" in line:
-            # Raw text match
-            idx = line.index("IMPLEMENTATION_SUMMARY:")
-            return line[idx + len("IMPLEMENTATION_SUMMARY:"):].strip()
-        # Try parsing as JSON to find embedded summary
-        try:
-            data = json.loads(line)
-            result = data.get("result", "")
-            if isinstance(result, str) and "IMPLEMENTATION_SUMMARY:" in result:
-                idx = result.index("IMPLEMENTATION_SUMMARY:")
-                return result[idx + len("IMPLEMENTATION_SUMMARY:"):].strip()
-        except (json.JSONDecodeError, TypeError):
-            pass
-    return ""
+    """Extract the IMPLEMENTATION_SUMMARY line from Claude's output.
+
+    Delegates to `_extract_block`, which decodes stream-json before looking for
+    the marker. The previous line-by-line scan checked its raw-text branch
+    first, and under `output_format = "stream-json"` the whole result event is
+    one physical line whose raw text contains the marker — so the raw branch
+    always won and returned everything after it: literal \\n escapes, the
+    trailing NOTES block, and the JSON envelope's session_id/request_id/token
+    counts. All of that reached the body of a public pull request (PR #334).
+    """
+    return _extract_block(output, "IMPLEMENTATION_SUMMARY")
 
 
 #: Markers the agent emits, in the order they appear. A block runs until the
@@ -789,8 +783,42 @@ def _extract_summary(output: str) -> str:
 OUTPUT_MARKERS = (
     "IMPLEMENTATION_PLAN",
     "IMPLEMENTATION_SUMMARY",
+    "CHANGES",
+    "TESTING_STEPS",
     "IMPLEMENTATION_NOTES",
 )
+
+#: Pull-request body sections, in render order, each paired with the keyword
+#: that fills it. A section with no content is dropped rather than rendered as
+#: a bare header.
+_PR_SECTIONS = (
+    ("## Summary", "summary"),
+    ("## Changes", "changes"),
+    ("## How to test", "testing"),
+    ("## Notes for the reviewer", "notes"),
+)
+
+
+def _pr_body(*, summary: str, changes: str, testing: str, notes: str,
+             number: int) -> str:
+    """Assemble the pull-request body from the agent's emitted sections.
+
+    Every value is agent-authored free text headed for a public pull request,
+    so each is redacted individually. The body always closes the issue, even
+    when the agent emitted nothing usable.
+    """
+    values = {
+        "summary": summary, "changes": changes,
+        "testing": testing, "notes": notes,
+    }
+    parts: list[str] = []
+    for header, key in _PR_SECTIONS:
+        text = (values[key] or "").strip()
+        if not text:
+            continue
+        parts.append(f"{header}\n\n{redact(text)}")
+    parts.append(f"Closes #{number}")
+    return "\n\n".join(parts)
 
 #: Markers the prompt specifies as a single line. Without this, a summary
 #: absorbs every trailing line the agent emits after it.
@@ -1834,8 +1862,13 @@ def _push_and_pr(
     worktree_dir: Path,
     summary: str,
     logger: WorkerLogger,
+    pr_body: str | None = None,
 ) -> str:
-    """Commit, push, create PR, comment on issue. Returns PR URL."""
+    """Commit, push, create PR, comment on issue. Returns PR URL.
+
+    `pr_body` is the assembled multi-section body from `_pr_body`. It stays
+    optional so callers that only have a summary still open a valid PR.
+    """
     assert_pushable(branch, ctx.base_branch)
     _assert_lease_held(ctx, logger)
 
@@ -1872,8 +1905,13 @@ def _push_and_pr(
 
     _assert_lease_held(ctx, logger)
 
-    # Create PR — redact summary to avoid leaking secrets from Claude output
-    pr_body = f"{redact(summary)}\n\nCloses #{ctx.number}" if summary else f"Closes #{ctx.number}"
+    # Create PR. `_pr_body` redacts each section; the summary-only fallback
+    # redacts here for the same reason — Claude's output is untrusted text.
+    if pr_body is None:
+        pr_body = _pr_body(
+            summary=summary, changes="", testing="", notes="",
+            number=ctx.number,
+        )
     pr_title = f"{ctx.action}: {ctx.title} (#{ctx.number})"
     logger.info("Creating pull request...")
     result = _run_cmd(
@@ -2154,12 +2192,24 @@ def run_dev_worker(
         if not summary:
             summary = f"Automated {ctx.action} for issue #{ctx.number}"
 
+        # The PR is what a human reviews, so it carries the agent's own
+        # file-by-file changes and hand-testing steps — not just the summary.
+        pr_body = _pr_body(
+            summary=summary,
+            changes=_extract_block(output, "CHANGES"),
+            testing=_extract_block(output, "TESTING_STEPS"),
+            notes=_extract_block(output, "IMPLEMENTATION_NOTES"),
+            number=ctx.number,
+        )
+
         if is_rework and not is_fresh_branch:
             # Rework on same branch — push only, PR auto-updates
             pr_url = _push_rework(ctx, branch, worktree_dir, summary, logger)
         else:
             # Fresh work or conflict fallback — create new PR
-            pr_url = _push_and_pr(ctx, branch, worktree_dir, summary, logger)
+            pr_url = _push_and_pr(
+                ctx, branch, worktree_dir, summary, logger, pr_body=pr_body,
+            )
 
         # [7] Cleanup worktree. Best-effort by design: the PR is already open,
         # so a failure here must not reach the `except Exception` below and

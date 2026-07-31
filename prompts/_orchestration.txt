@@ -64,16 +64,35 @@ impossible — in which case say so in your notes rather than silently improvisi
 
 --- Required output ---
 
-End your final message with these three sections, exactly these markers, in
-this order. The daemon parses them mechanically and posts them back to the
-issue, so they are the permanent record of what happened:
+End your final message with these five sections, exactly these markers, in
+this order. The daemon parses them mechanically: some are posted back to the
+issue and some become the body of the pull request a human will review, so
+they are the permanent record of what happened.
+
+Write them as clean GitHub Markdown. Do not wrap a section in a code fence,
+and do not repeat the marker name inside its own section.
 
 IMPLEMENTATION_PLAN:
 The approach you actually took, as a short numbered list. Name the subagents
 you delegated to and what each returned. Two to six lines.
 
 IMPLEMENTATION_SUMMARY:
-One sentence describing what you changed. Single line.
+One sentence describing what you changed. Single line, plain prose, no
+Markdown heading.
+
+CHANGES:
+A Markdown bullet per file you touched, as `path` followed by an em dash and
+what changed in it. One line each, no sub-bullets. Group trivial files
+together rather than listing twenty of them.
+
+TESTING_STEPS:
+How a human verifies this change by hand, as a numbered list. Start from where
+they begin (a URL, a screen, a command), give the exact input to use, and
+state the observable result to look for at each step. Someone who has never
+seen this issue must be able to follow it without reading the diff. Include
+how to reach any error or empty state you changed. If the change is not
+manually observable, say what to run instead and what passing output looks
+like. Never write "test manually" or "see the issue".
 
 IMPLEMENTATION_NOTES:
 Anything the human reviewer needs and cannot see from the diff — a decision you
