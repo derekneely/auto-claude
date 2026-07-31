@@ -1946,6 +1946,10 @@ def run_dev_worker(
     branch = sanitize_branch_name(ctx.title, ctx.number)
     worktree_dir = ctx.worktrees_dir / ctx.repo / f"issue-{ctx.number}"
     is_fresh_branch = False  # True if rework fell back to a new versioned branch
+    # Seeded here, not at the push, so the exception handler can always report
+    # it. Rework arrives with the PR it is reworking already on ctx; fresh work
+    # starts at None and picks up a URL in [5-6].
+    pr_url = ctx.pr_url
 
     try:
         # [0] Self-lock. Inside the try so a lease lost between spawn and
@@ -2205,6 +2209,12 @@ def run_dev_worker(
             issue_id=ctx.issue_id,
             status="failed",
             error=str(exc),
+            # A crash after [5-6] leaves a live branch and PR behind. Dropping
+            # them here strands the work: `poller`'s rework branch needs both
+            # to resume on the existing branch, and without them the next
+            # attempt starts a fresh one on top of the open PR.
+            branch=branch,
+            pr_url=pr_url,
             run_id=run_id,
             run_outcome="failed",
             exit_code=returncode,
@@ -2657,6 +2667,11 @@ def run_review_worker(
             issue_id=ctx.issue_id,
             status="failed",
             error=str(exc),
+            # Same reasoning as the dev worker's handler: the PR under review
+            # exists regardless of how the review ended, and every other exit
+            # from this function reports it.
+            branch=ctx.existing_branch,
+            pr_url=ctx.pr_url,
             run_id=run_id,
             run_outcome="failed",
             exit_code=returncode,
