@@ -8170,3 +8170,23 @@ Expected: 679 passed, 2 skipped, 0 failed
 git add dbsync.py main.py tests/test_dbsync.py tests/test_startup_db_wiring.py
 git commit -m "feat(history): journal durable writes on failure and replay them once Postgres returns (ai-cc)"
 ```
+
+---
+
+## Appendix: user rulings made during implementation
+
+Six questions escalated to the user while executing this plan. Each was a
+point where the plan contradicted itself or the brief, so the answer is not
+derivable from the code alone — but the *consequence* of each is now in the
+codebase, at the sites listed below. Recorded here because the scratch ledger
+they were logged in (`.superpowers/sdd/13-shared-state-implementation/`) was
+deliberately deleted after the feature shipped.
+
+| # | Date | Ruling | Where it lives now |
+|---|---|---|---|
+| 1 | 2026-07-29 | **Refuse to start** when Postgres is unreachable — a harness that cannot take a lease could double-claim an issue another box is working. Startup and runtime are deliberately opposite: startup refuses on unreachable/stale schema, runtime never aborts a running agent. | `main.py` `_check_schema_gate` docstring; the table in "Degraded operation" above; `tests/test_startup_db_wiring.py` |
+| 2 | 2026-07-30 | Runtime `DbUnavailable` **must be caught, not propagated** — the poll loop's only handler is `except KeyboardInterrupt`, so an escape kills the supervisor with live workers attached. `_lease_ok` warns and returns False (fail closed); `_maybe_heartbeat` warns but still advances `last_at` so a down database cannot hot-loop; `reap_dead`'s release warns and keeps reaping. `DbUnavailable` only — never bare `Exception`. | `process_manager.py` `_lease_ok` / `reap_dead`; `main.py` `_maybe_heartbeat` |
+| 3 | 2026-07-30 | `_release_stale_locks` **keeps warn-and-continue** on an unreachable database, despite `_check_schema_gate` aborting on the same condition. It runs after the gate, so it is only reachable in the window where Postgres dies between the two — and ruling 2 means no worker spawns anyway. | `main.py` `_release_stale_locks` docstring |
+| 4 | 2026-07-30 | Structurally bad journal lines are **quarantined**, not dropped: appended verbatim to a sibling `.corrupt` file, logged once at error, skipped. A transient `DbUnavailable` must still stop replay and leave the journal intact — the two must not collapse into one handler. | `db/journal.py` `replay()` |
+| 5 | 2026-07-30 | With **no database configured at all**, durable writes are **logged and dropped**, not journaled. GitHub labels stay truth and startup reconciliation rebuilds `issues.json` every restart. | `dbsync.py` `_durable`; `tests/test_dbsync.py` |
+| 6 | 2026-07-30 | `replay_pending()` runs **only at the top of the poll loop**, never on the per-second sleep tick — with `Database(retries=2, connect_timeout=10)` a failing execute burns ~33s of backoff and defeats responsive shutdown. | `main.py`, single call site in the poll loop |
