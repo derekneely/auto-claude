@@ -60,6 +60,25 @@ class Poller:
 
         for issue in issues:
             label_names = [lbl["name"] for lbl in issue.get("labels", [])]
+            issue_id = f"{repo}#{issue['number']}"
+
+            # Record the live labels on any issue we already track, before the
+            # terminal check below can `continue` past it. `record.labels` is
+            # what becomes `issue_state.stage` (main._make_on_change), and
+            # every real stage transition happens in the worker, out of
+            # process, where StateUpdate has no way to carry labels back. This
+            # poll is the only place the truth is visible — so an issue that
+            # walked on to ac-hitl or ac-blocked while we weren't acting on it
+            # would otherwise leave the shared database frozen at whatever
+            # stage it held when we last touched it, forever.
+            #
+            # Guarded on an actual change: without it, every poll re-upserts
+            # every issue every cycle.
+            if self._state.is_known(issue_id):
+                record = self._state.get(issue_id)
+                if record.labels != label_names:
+                    self._state.update(issue_id, labels=label_names)
+                    self._state.save()
 
             # Terminal stages are hands-off, unconditionally. A human who set
             # ac-blocked/ac-hitl/ac-merged/ac-done must have that stick even
@@ -68,7 +87,6 @@ class Poller:
             if stages.is_terminal(label_names):
                 continue
 
-            issue_id = f"{repo}#{issue['number']}"
             # Verb labels are hints only now; default "implement" covers
             # loop-created issues that carry no verb label at all.
             action = stages.kind_of(label_names)

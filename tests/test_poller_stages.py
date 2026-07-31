@@ -342,3 +342,118 @@ class TestModeFlipsOnStageTransition:
         payload = [make_issue(29, ["ac-dev-review"])]
         new, _retriage = make_poller(payload, state).poll()
         assert new == []
+
+
+class TestLabelSnapshotFollowsGitHub:
+    """`record.labels` is a snapshot, and `main._make_on_change` turns it into
+    `issue_state.stage` — so a snapshot that stops moving publishes a stage
+    that was true once and is now a lie.
+
+    Regression: field_admin#215, 2026-07-31. Every real stage transition is
+    performed by the worker, out of process, and `StateUpdate` carries no
+    `labels` field, so nothing propagates back. `_poll_repo` is the only place
+    that sees the live labels — but it dropped them on the floor for any issue
+    it was not about to act on:
+
+      - terminal stages hit `continue` before any state update, so an issue
+        that reached ac-hitl froze the DB at ac-dev-review, and one that burned
+        three attempts froze it at **ac-dev-ready** — the DB advertising a
+        blocked issue as ready to work
+      - the locked stages (ac-in-progress / ac-review-in-progress) match
+        neither `is_claimable` nor `is_reviewable`, so the known-issue branch
+        never touched them either
+
+    Adding `labels` to `StateUpdate` was considered and rejected: it cannot
+    cover the stages a human sets (ac-merged, ac-done). The label on GitHub is
+    the truth even when the issue is not ours to act on.
+    """
+
+    def test_terminal_label_updates_a_known_record(self, state):
+        issue_id = "field_admin#215"
+        seed_record(state, issue_id, "field_admin", 215, ["ac-dev-review"],
+                    IssueStatus.COMPLETED, mode="review")
+        state.save()
+
+        payload = [make_issue(215, ["ac-hitl"])]
+        new, retriage = make_poller(payload, state).poll()
+
+        assert new == [] and retriage == []
+        assert stages.stage_of(state.get(issue_id).labels) == "ac-hitl"
+
+    def test_blocked_replaces_a_stale_dev_ready(self, state):
+        # The worst manifestation: three attempts burned, GitHub says
+        # ac-blocked, and the DB still says ac-dev-ready.
+        issue_id = "field_admin#216"
+        seed_record(state, issue_id, "field_admin", 216, ["ac-dev-ready"],
+                    IssueStatus.FAILED)
+        state.save()
+
+        payload = [make_issue(216, ["ac-blocked", "ac-attempt-3"])]
+        make_poller(payload, state).poll()
+
+        assert stages.stage_of(state.get(issue_id).labels) == "ac-blocked"
+
+    def test_terminal_label_does_not_disturb_local_status(self, state):
+        # Recording the label is not the same as acting on it — the record's
+        # execution history must survive untouched.
+        issue_id = "field_admin#217"
+        seed_record(state, issue_id, "field_admin", 217, ["ac-dev-review"],
+                    IssueStatus.COMPLETED, mode="review")
+        state.save()
+
+        make_poller([make_issue(217, ["ac-hitl"])], state).poll()
+
+        record = state.get(issue_id)
+        assert record.status == IssueStatus.COMPLETED
+        assert record.mode == "review"
+
+    def test_locked_stage_updates_a_known_record(self, state):
+        # ac-review-in-progress matches neither trigger predicate, so nothing
+        # in the known-issue branch below ever reaches it.
+        issue_id = "field_admin#218"
+        seed_record(state, issue_id, "field_admin", 218, ["ac-dev-review"],
+                    IssueStatus.IN_PROGRESS, mode="review")
+        state.save()
+
+        make_poller([make_issue(218, ["ac-review-in-progress"])], state).poll()
+
+        assert stages.stage_of(state.get(issue_id).labels) == "ac-review-in-progress"
+
+    def test_unknown_terminal_issue_is_still_not_tracked(self, state):
+        # Recording labels must not become a back door that starts tracking
+        # issues auto-claude never claimed.
+        make_poller([make_issue(219, ["ac-hitl"])], state).poll()
+        assert not state.is_known("field_admin#219")
+
+    def test_changed_labels_are_published_once(self, tmp_path):
+        # The whole point: the on_change hook is what writes issue_state.stage.
+        published: list[str | None] = []
+        store = StateStore(
+            tmp_path / "issues.json",
+            on_change=lambda r: published.append(stages.stage_of(r.labels)),
+        )
+        seed_record(store, "field_admin#220", "field_admin", 220,
+                    ["ac-dev-review"], IssueStatus.COMPLETED, mode="review")
+        store.save()
+        published.clear()
+
+        make_poller([make_issue(220, ["ac-hitl"])], store).poll()
+
+        assert published == ["ac-hitl"]
+
+    def test_unchanged_labels_are_not_republished(self, tmp_path):
+        # The change-guard. Without it every poll re-upserts every issue every
+        # 60 seconds, forever.
+        published: list[str | None] = []
+        store = StateStore(
+            tmp_path / "issues.json",
+            on_change=lambda r: published.append(stages.stage_of(r.labels)),
+        )
+        seed_record(store, "field_admin#221", "field_admin", 221,
+                    ["ac-hitl"], IssueStatus.COMPLETED, mode="review")
+        store.save()
+        published.clear()
+
+        make_poller([make_issue(221, ["ac-hitl"])], store).poll()
+
+        assert published == []
