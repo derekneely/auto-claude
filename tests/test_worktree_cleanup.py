@@ -15,6 +15,7 @@ harmless: `_cleanup_worktree` removes a stale one at the start of the next run.
 
 from __future__ import annotations
 
+import inspect
 import subprocess
 import sys
 from pathlib import Path
@@ -125,6 +126,53 @@ class TestCleanupStillCleansUp:
         joined = [" ".join(c) for c in calls]
         assert any("worktree prune" in c for c in joined), (
             f"prune must still run after remove fails, got: {joined}"
+        )
+
+
+class TestCleanupIsGivenTimeToFinish:
+    """Not raising is not the same as succeeding.
+
+    In #215 the removal actually *worked* — the directory was gone and
+    `git worktree list` was clean afterwards. git simply had not exited when
+    `_run_cmd`'s 120s default elapsed, deleting a worktree that held a
+    freshly-installed `node_modules`. Best-effort cleanup downgrades that from
+    a discarded run to a leftover worktree, but at the default timeout it would
+    still leak one on every field_admin run, and the leak is not free: it is a
+    node_modules-sized directory per run, and `_cleanup_worktree` has to pay
+    the same removal cost at the start of the next one — where it is *not*
+    best-effort and does fail the run.
+
+    Cleanup is off the critical path (the PR is already open), so it can afford
+    to wait. Nothing else is blocked by it finishing.
+    """
+
+    def _timeout_for(self, monkeypatch, tmp_path, subcommand: str):
+        seen: dict[str, object] = {}
+
+        def record(cmd, **kwargs):
+            if subcommand in cmd:
+                seen["timeout"] = kwargs.get("timeout")
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+
+        monkeypatch.setattr(worker, "_run_cmd", record)
+        worker._cleanup_worktree_best_effort(
+            tmp_path, tmp_path / "issue-215", FakeLogger()
+        )
+        assert subcommand in seen or "timeout" in seen, (
+            f"`git worktree {subcommand}` was never called"
+        )
+        return seen["timeout"]
+
+    def test_remove_gets_longer_than_the_default(self, tmp_path, monkeypatch):
+        default = inspect.signature(worker._run_cmd).parameters["timeout"].default
+        timeout = self._timeout_for(monkeypatch, tmp_path, "remove")
+
+        assert timeout is not None, (
+            "remove inherits _run_cmd's default timeout — the exact thing that "
+            "killed a working cleanup in #215"
+        )
+        assert timeout > default, (
+            f"remove timeout {timeout}s is not longer than the {default}s default"
         )
 
 

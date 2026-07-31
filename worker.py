@@ -1303,6 +1303,15 @@ def _cleanup_worktree(
     _run_cmd(["git", "branch", "-D", branch], cwd=repo_dir, logger=logger)
 
 
+# `_run_cmd`'s 120s default is sized for git commands that talk to a remote.
+# Deleting a worktree is I/O against tens of thousands of node_modules files on
+# a Windows filesystem, and in #215 it needed longer — the delete finished, git
+# just had not exited yet. Cleanup runs after the PR is open, so nothing waits
+# on it; letting it take the time it needs is strictly better than leaking a
+# worktree that the *next* run has to remove under a non-best-effort path.
+CLEANUP_TIMEOUT_SECONDS = 600
+
+
 def _cleanup_worktree_best_effort(
     repo_dir: Path,
     worktree_dir: Path,
@@ -1341,6 +1350,7 @@ def _cleanup_worktree_best_effort(
         ["git", "worktree", "remove", str(worktree_dir), "--force"],
         cwd=repo_dir,
         logger=logger,
+        timeout=CLEANUP_TIMEOUT_SECONDS,
     ))
     _step("rmtree", lambda: (
         shutil.rmtree(worktree_dir, ignore_errors=True)
