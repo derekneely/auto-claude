@@ -161,30 +161,36 @@ def _init_db_layer(config, logger: MainLogger):
     harness and dbsync always exist so callers never branch on "did this
     construct".
 
-    Startup is deliberately stricter than runtime (ruling, 2026-07-29): a
-    harness that cannot confirm it reaches a current-schema Postgres could
-    double-claim an issue another box already holds a lease on, so both an
-    unreachable Postgres and a stale/missing schema abort the daemon here via
-    `_check_schema_gate` -> `_abort`. Only "database not configured at all"
-    (disabled, or no URL) is exempt — that is single-harness mode, which
-    never takes a lease to begin with, and runs exactly as the daemon does
-    today. This is the opposite of runtime behaviour, where a database
-    problem must never abort a running agent.
+    Startup is deliberately stricter than runtime (ruling, 2026-07-29; the
+    no-URL exemption removed 2026-07-31): a harness that cannot confirm it
+    reaches a current-schema Postgres could double-claim an issue another box
+    already holds a lease on. So an unset URL, an unreachable Postgres, and a
+    stale/missing schema all abort the daemon here.
+
+    There is no longer a DB-less mode. The old "database not configured at
+    all" exemption started the daemon in single-harness mode, which meant a
+    misconfigured run recorded nothing at all while its logs looked normal —
+    the failure was invisible precisely when it mattered.
+
+    This remains the opposite of runtime behaviour, where a database problem
+    must never abort a running agent.
     """
     journal = Journal(config.database.journal_file)
     harness = new_harness(version.__version__)
 
-    db = None
-    url = config.database.url() if config.database.enabled else None
-    if url:
-        db = Database(url, connect_timeout=config.database.connect_timeout_seconds)
-        _check_schema_gate(db, logger)
-        _register_harness(db, harness, logger, journal)
-    else:
-        logger.info(
-            "Database sync disabled or PIPELINE_METRICS_DATABASE_URL unset — "
-            "running on local state only"
+    url = config.database.url()
+    if not url:
+        _abort(
+            logger,
+            f"{config.database.url_env} is not set. The database is mandatory "
+            "— a daemon without Postgres takes no leases and records no runs, "
+            "yet looks perfectly healthy while doing it. Set the variable in "
+            ".env (main() loads it before this check) and start again."
         )
+
+    db = Database(url, connect_timeout=config.database.connect_timeout_seconds)
+    _check_schema_gate(db, logger)
+    _register_harness(db, harness, logger, journal)
 
     dbsync = DbSync(db, harness, logger, journal=journal,
                      ttl_seconds=config.database.lease_ttl_seconds)
@@ -193,8 +199,15 @@ def _init_db_layer(config, logger: MainLogger):
 
 def _harness_id_for_workers(db, harness) -> str | None:
     """The `harness_id` to hand `ProcessManager` (and, through it, every
-    worker's `IssueContext`). None whenever `db` is None — Postgres
-    disabled, or no URL configured — never `harness.id` unconditionally.
+    worker's `IssueContext`). None whenever `db` is None, never `harness.id`
+    unconditionally.
+
+    Since 2026-07-31 the database is mandatory, so `_init_db_layer` either
+    returns a real `db` or aborts — this None branch is now unreachable from
+    the daemon's own startup path. It is kept because the invariant it
+    encodes (no database => no lease => no harness_id to fence against) is
+    what makes the guard correct, and other constructors of this pair are
+    not required to have a database.
 
     Final whole-branch review, Critical 1: `harness` is constructed
     unconditionally in `_init_db_layer` above (a harness identity always

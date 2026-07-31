@@ -15,6 +15,8 @@ import os
 import sys
 from pathlib import Path
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from config import DatabaseConfig, load_config  # noqa: E402
@@ -69,7 +71,6 @@ class TestDatabaseSectionAbsent:
     def test_defaults_when_database_section_missing(self, tmp_path):
         # This is the real config.toml's shape today — no [database] block.
         cfg = load_config(_write_config(tmp_path))
-        assert cfg.database.enabled is True
         assert cfg.database.url_env == "PIPELINE_METRICS_DATABASE_URL"
         assert cfg.database.lease_ttl_seconds == 1800
         assert cfg.database.heartbeat_interval_seconds == 60
@@ -81,18 +82,30 @@ class TestDatabaseSectionPresent:
     def test_overrides_are_applied(self, tmp_path):
         extra = (
             "\n[database]\n"
-            "enabled = false\n"
             "url_env = \"CUSTOM_DB_URL\"\n"
             "lease_ttl_seconds = 900\n"
             "heartbeat_interval_seconds = 30\n"
             "connect_timeout_seconds = 5\n"
         )
         cfg = load_config(_write_config(tmp_path, extra))
-        assert cfg.database.enabled is False
         assert cfg.database.url_env == "CUSTOM_DB_URL"
         assert cfg.database.lease_ttl_seconds == 900
         assert cfg.database.heartbeat_interval_seconds == 30
         assert cfg.database.connect_timeout_seconds == 5
+
+    def test_the_removed_enabled_switch_is_a_hard_error(self, tmp_path):
+        """The database is mandatory (ruling, 2026-07-31). `enabled` used to
+        buy a DB-less run; silently ignoring a leftover `enabled = false`
+        would let someone believe they still had that escape hatch."""
+        extra = "\n[database]\nenabled = false\n"
+        with pytest.raises(ValueError) as excinfo:
+            load_config(_write_config(tmp_path, extra))
+        assert "enabled" in str(excinfo.value)
+
+    def test_enabled_true_is_also_rejected_rather_than_quietly_accepted(self, tmp_path):
+        extra = "\n[database]\nenabled = true\n"
+        with pytest.raises(ValueError):
+            load_config(_write_config(tmp_path, extra))
 
     def test_journal_file_resolved_relative_to_project_root(self, tmp_path):
         extra = '\n[database]\njournal_file = "custom/journal.jsonl"\n'

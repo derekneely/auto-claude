@@ -3,19 +3,18 @@ Database/Harness/DbSync, registering the harness, reconciling issues.json
 from GitHub + Postgres (releasing expired leases first), and wiring
 on_change into StateStore.
 
-Degraded mode (`[database].enabled = false`, or the URL environment variable
-unset) must never stop the daemon from starting: GitHub labels and the PR are
-still truth, and Postgres is explicitly an add-on (docs/plans/
-12-shared-state-in-postgres.md, "Three stores").
+**The database is mandatory (ruling, 2026-07-31 — supersedes 2026-07-29).**
+There is no degraded, DB-less mode. A daemon with no database silently
+records nothing while looking perfectly healthy, which is worse than not
+running at all. So every "database not configured" case — no URL in the
+environment — aborts startup via `main._abort`. The `[database] enabled`
+switch has been removed outright rather than left as a trap.
 
-Startup behaviour is deliberately stricter than runtime (ruling, 2026-07-29):
-a harness that cannot prove it holds a valid lease must never begin polling,
-since it could double-claim an issue another box already owns. So unlike
-runtime — where a database outage must never abort a running agent — a
-Postgres that is unreachable OR whose schema is stale/missing at startup
-must abort the daemon before it starts, via the existing `main._abort`. Only
-"database not configured at all" is exempt: that is single-harness mode,
-which never took a lease to begin with.
+Startup and runtime remain deliberately OPPOSITE, and only the startup half
+changed. At startup, anything that stops this harness proving it reaches a
+current-schema Postgres aborts: no URL, unreachable, or a stale/missing
+schema. At runtime a database problem must still NEVER abort a running agent
+— work already in flight is never thrown away for a database blip.
 """
 
 from __future__ import annotations
@@ -45,10 +44,10 @@ def _logger():
     )
 
 
-def _db_config(enabled=True, url="postgresql://x"):
+def _db_config(url="postgresql://x"):
     return SimpleNamespace(
-        enabled=enabled,
         url=lambda: url,
+        url_env="PIPELINE_METRICS_DATABASE_URL",
         connect_timeout_seconds=10,
         journal_file=Path("state/journal.jsonl"),
         lease_ttl_seconds=1800,
@@ -59,29 +58,51 @@ def _config(db_config):
     return SimpleNamespace(database=db_config)
 
 
-class TestInitDbLayerDegradedMode:
-    def test_disabled_in_config_yields_no_database(self, monkeypatch):
-        cfg = _config(_db_config(enabled=False))
-        monkeypatch.setattr(main, "Database", lambda *a, **k: (_ for _ in ()).throw(
-            AssertionError("must not construct a Database when disabled")))
-        db, _journal, harness, dbsync = main._init_db_layer(cfg, _logger())
-        assert db is None
-        assert dbsync.enabled is False
-        assert harness is not None  # a harness identity always exists, DB or not
+def _stub_reachable_db(monkeypatch):
+    """Let `_init_db_layer` run to completion without a real Postgres.
 
-    def test_url_unset_yields_no_database_even_when_enabled(self, monkeypatch):
-        cfg = _config(_db_config(enabled=True, url=None))
+    Every path through it now requires a database, so tests that care about
+    something else (ttl wiring, the journal) still have to get past the
+    connect + schema gate + harness registration.
+    """
+    monkeypatch.setattr(main, "Database", lambda *a, **k: SimpleNamespace())
+    monkeypatch.setattr(main, "_check_schema_gate", lambda db, logger: None)
+    monkeypatch.setattr(main, "_register_harness", lambda db, h, logger, j: None)
+
+
+class TestInitDbLayerRequiresADatabase:
+    """The database is mandatory — no URL means refuse to start, not
+    'run without one'. A daemon that starts DB-less records nothing while
+    looking healthy."""
+
+    def test_missing_url_aborts_startup(self, monkeypatch):
+        cfg = _config(_db_config(url=None))
         monkeypatch.setattr(main, "Database", lambda *a, **k: (_ for _ in ()).throw(
             AssertionError("must not construct a Database with no URL")))
-        db, _journal, _harness, dbsync = main._init_db_layer(cfg, _logger())
-        assert db is None
-        assert dbsync.enabled is False
+        with pytest.raises(SystemExit) as excinfo:
+            main._init_db_layer(cfg, _logger())
+        assert excinfo.value.code == 1
+
+    def test_empty_url_aborts_startup(self, monkeypatch):
+        """`DatabaseConfig.url()` returns None for an empty env var, but a
+        stubbed config can hand back "" — both mean 'not configured'."""
+        cfg = _config(_db_config(url=""))
+        with pytest.raises(SystemExit):
+            main._init_db_layer(cfg, _logger())
+
+    def test_the_abort_explains_which_env_var_is_missing(self, monkeypatch):
+        logger = _logger()
+        with pytest.raises(SystemExit):
+            main._init_db_layer(_config(_db_config(url=None)), logger)
+        errors = " ".join(m for level, m in logger.messages if level == "error")
+        assert "PIPELINE_METRICS_DATABASE_URL" in errors
 
     def test_init_db_layer_wires_the_configured_ttl_into_dbsync(self, monkeypatch):
         # Fix for config.database.lease_ttl_seconds otherwise being dead —
         # Task 13's acquire_lease/heartbeat read dbsync._ttl_seconds, so it
         # has to land here even though nothing consumes it yet.
-        cfg = _config(_db_config(enabled=False))
+        _stub_reachable_db(monkeypatch)
+        cfg = _config(_db_config())
         cfg.database.lease_ttl_seconds = 900
         _db, _journal, _harness, dbsync = main._init_db_layer(cfg, _logger())
         assert dbsync._ttl_seconds == 900
@@ -101,7 +122,7 @@ class TestInitDbLayerDegradedMode:
 
 class TestInitDbLayerStaleSchemaAborts:
     def test_schema_out_of_date_aborts_before_reaching_dbsync(self, monkeypatch):
-        cfg = _config(_db_config(enabled=True, url="postgresql://x"))
+        cfg = _config(_db_config())
         monkeypatch.setattr(main, "Database", lambda *a, **k: object())
         monkeypatch.setattr(
             main, "check_schema_current",
@@ -122,7 +143,7 @@ class TestInitDbLayerUnreachablePostgresAborts:
     connection attempt itself fails."""
 
     def test_db_unavailable_aborts_before_reaching_dbsync(self, monkeypatch):
-        cfg = _config(_db_config(enabled=True, url="postgresql://x"))
+        cfg = _config(_db_config())
         monkeypatch.setattr(main, "Database", lambda *a, **k: object())
         monkeypatch.setattr(
             main, "check_schema_current",
@@ -252,11 +273,12 @@ class TestHarnessIdForWorkers:
 
 
 class TestInitDbLayerConstructsARealJournal:
-    def test_init_db_layer_returns_a_four_tuple_with_a_real_journal(self, tmp_path):
-        cfg = _config(_db_config(enabled=False))
+    def test_init_db_layer_returns_a_four_tuple_with_a_real_journal(self, tmp_path, monkeypatch):
+        _stub_reachable_db(monkeypatch)
+        cfg = _config(_db_config())
         cfg.database.journal_file = tmp_path / "journal.jsonl"
         db, journal, _harness, dbsync = main._init_db_layer(cfg, _logger())
-        assert db is None
+        assert db is not None
         assert isinstance(journal, main.Journal)
         assert dbsync._journal is journal
 

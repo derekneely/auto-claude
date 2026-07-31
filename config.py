@@ -78,13 +78,18 @@ class IntegrationsConfig:
 
 @dataclass(frozen=True)
 class DatabaseConfig:
-    """Optional Postgres-backed shared state (docs/plans/
-    12-shared-state-in-postgres.md). Has a default so `[database]` being
-    absent from config.toml — true of the current file — and Config being
-    constructed positionally in existing tests both keep working.
+    """Postgres-backed shared state (docs/plans/
+    12-shared-state-in-postgres.md). Every field has a default so `[database]`
+    being absent from config.toml — true of the current file — and Config
+    being constructed positionally in existing tests both keep working.
+
+    The database is MANDATORY (ruling, 2026-07-31). There is no `enabled`
+    switch: a daemon running without Postgres records nothing while looking
+    perfectly healthy, which is worse than not running at all. `url_env` must
+    name an environment variable that is actually set, or startup aborts —
+    see `main._init_db_layer`.
     """
 
-    enabled: bool = True
     url_env: str = "PIPELINE_METRICS_DATABASE_URL"
     lease_ttl_seconds: int = 1800
     heartbeat_interval_seconds: int = 60
@@ -175,9 +180,21 @@ def load_config(config_path: Path | None = None) -> Config:
         )
 
     database_raw = raw.get("database", {})
+    # `enabled` used to buy a DB-less run. The database is mandatory now
+    # (ruling, 2026-07-31), so a leftover `enabled = false` must not be
+    # silently ignored — that would leave someone believing they still had an
+    # escape hatch while the daemon refused to start for reasons it did not
+    # explain. Reject the key outright, including `enabled = true`, so the
+    # config file cannot imply an option that no longer exists.
+    if "enabled" in database_raw:
+        raise ValueError(
+            "[database] enabled is no longer supported — the database is "
+            "mandatory. Remove the 'enabled' line from config.toml. A daemon "
+            "without Postgres records nothing while appearing healthy; if you "
+            "need to run without one, stop the daemon instead."
+        )
     _db_defaults = DatabaseConfig()
     database = DatabaseConfig(
-        enabled=database_raw.get("enabled", _db_defaults.enabled),
         url_env=database_raw.get("url_env", _db_defaults.url_env),
         lease_ttl_seconds=database_raw.get(
             "lease_ttl_seconds", _db_defaults.lease_ttl_seconds

@@ -108,15 +108,22 @@ Step 6   the interface — a separate project, out of scope here
 
 Tasks 1-15 deliver resilience and are independently testable end to end on `field_admin#215`. Tasks 16-21 deliver the history the interface will read.
 
-**Degraded operation is a first-class path — but only when Postgres is deliberately absent, not when it is broken.** Startup and runtime are governed by different rules, and conflating them is a defect:
+> **SUPERSEDED 2026-07-31 — the database is mandatory.** The row below granting
+> a DB-less start no longer exists in the code. `[database] enabled` has been
+> **removed**, and `config.py` raises `ValueError` if the key appears in
+> `config.toml` at all. See ruling 7 in the appendix.
+
+**Postgres is required to start. Runtime is the opposite trade.** Startup and runtime are governed by different rules, and conflating them is a defect:
 
 | Condition | Startup | Runtime (daemon already up) |
 |---|---|---|
-| `[database].enabled = false`, or no URL set | **Start.** Single-harness, `issues.json`-backed, no leases — exactly as today. | Unchanged; nothing ever calls Postgres. |
+| No URL set in the environment | **Refuse to start.** Naming the missing env var. | n/a — the daemon never got up. |
 | Postgres **unreachable** | **Refuse to start.** Log the reason and exit non-zero. | **Never abort a running agent.** Durable writes log-and-drop (later, journal); the daemon keeps working. |
 | Postgres reachable, schema **stale or missing** | **Refuse to start**, printing the exact upgrade command. The daemon never migrates. | n/a |
 
 The startup refusal is a deliberate ruling (2026-07-29): an unreachable database at boot means this harness cannot take a lease, and a harness that cannot take a lease could double-claim an issue another box is already working. A blip that stops autonomous work until a human looks is preferred over two harnesses on one issue. Runtime is the opposite trade — work already in flight is never thrown away for a database problem, which the spec states outright.
+
+The 2026-07-31 extension: "not configured at all" is no longer an exemption from that logic, it is another instance of it. A daemon that starts without Postgres takes no leases and writes no rows, yet logs nothing alarming — the failure is invisible exactly when it matters. Refusing to start makes a misconfiguration loud and immediate.
 
 Every task that touches startup tests both halves of this explicitly.
 
@@ -8175,12 +8182,16 @@ git commit -m "feat(history): journal durable writes on failure and replay them 
 
 ## Appendix: user rulings made during implementation
 
-Six questions escalated to the user while executing this plan. Each was a
-point where the plan contradicted itself or the brief, so the answer is not
-derivable from the code alone — but the *consequence* of each is now in the
-codebase, at the sites listed below. Recorded here because the scratch ledger
-they were logged in (`.superpowers/sdd/13-shared-state-implementation/`) was
-deliberately deleted after the feature shipped.
+Seven questions escalated to the user while executing this plan, and in the
+verification phase after it. Each was a point where the plan contradicted
+itself or the brief, so the answer is not derivable from the code alone — but
+the *consequence* of each is now in the codebase, at the sites listed below.
+Recorded here because the scratch ledger they were logged in
+(`.superpowers/sdd/13-shared-state-implementation/`) was deliberately deleted
+after the feature shipped.
+
+**Ruling 7 supersedes part of rulings 1 and 5.** Read it before acting on
+either.
 
 | # | Date | Ruling | Where it lives now |
 |---|---|---|---|
@@ -8190,3 +8201,4 @@ deliberately deleted after the feature shipped.
 | 4 | 2026-07-30 | Structurally bad journal lines are **quarantined**, not dropped: appended verbatim to a sibling `.corrupt` file, logged once at error, skipped. A transient `DbUnavailable` must still stop replay and leave the journal intact — the two must not collapse into one handler. | `db/journal.py` `replay()` |
 | 5 | 2026-07-30 | With **no database configured at all**, durable writes are **logged and dropped**, not journaled. GitHub labels stay truth and startup reconciliation rebuilds `issues.json` every restart. | `dbsync.py` `_durable`; `tests/test_dbsync.py` |
 | 6 | 2026-07-30 | `replay_pending()` runs **only at the top of the poll loop**, never on the per-second sleep tick — with `Database(retries=2, connect_timeout=10)` a failing execute burns ~33s of backoff and defeats responsive shutdown. | `main.py`, single call site in the poll loop |
+| 7 | 2026-07-31 | **The database is MANDATORY — there is no DB-less mode.** An unset URL now aborts startup exactly as an unreachable Postgres does. `[database] enabled` is **removed**, and `config.py` raises `ValueError` if the key is present at all (including `enabled = true`) rather than ignoring it and leaving someone believing the escape hatch still exists. Rationale: a daemon started without Postgres takes no leases and records no runs while its logs look perfectly normal — the failure is silent precisely when it matters. **Supersedes** ruling 1's "not configured at all is exempt" carve-out, and makes ruling 5's log-and-drop path unreachable in production. The runtime half is UNCHANGED: a database problem must still never abort a running agent. | `main.py` `_init_db_layer`; `config.py` `DatabaseConfig` + `load_config`; `tests/test_startup_db_wiring.py`, `tests/test_db_config.py`; the "Degraded operation" table above |

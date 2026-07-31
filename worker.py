@@ -106,8 +106,12 @@ def _assert_lease_held(ctx: IssueContext, logger: WorkerLogger) -> None:
     is *itself* the degraded-mode signal `ProcessManager.spawn` derives from
     whether Postgres is configured (see its own docstring) - the env-var
     check alone is not enough, because `PIPELINE_METRICS_DATABASE_URL` is
-    also used by the sibling Node telemetry and is routinely set even when
-    `[database] enabled = false` for auto-claude's own lease system. Reading
+    also used by the sibling Node telemetry, so its presence never proved
+    auto-claude's own lease system was live. (Historically that gap was
+    reachable via `[database] enabled = false`; that switch was removed on
+    2026-07-31 when the database became mandatory, but the fence still keys
+    off `harness_id` rather than the env var, which is the correct signal
+    regardless.) Reading
     `ctx.lease_db_url_env` rather than a hardcoded constant matters for the
     same reason: an operator who points `[database].url_env` at a different
     variable must have this fence check the SAME Postgres `main` does, not
