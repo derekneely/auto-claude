@@ -54,26 +54,73 @@ section is vague or missing, that is itself a review finding: send it back.
 
 ## The real path — run it
 
-From the `field_admin` checkout:
+The primary `accelevation/field_admin` checkout is usually occupied by other
+agents, so PR testing does not happen there. There is a **persistent worktree**
+reserved for it:
 
 ```
-/accelevation:test-pr 215
+auto-claude\worktrees\field_admin\pr-testing
 ```
 
-That builds a throwaway worktree at `../field_admin-test-215` on branch
-`test/issue-215`, merges the integration branch, copies the gitignored `.env*`
-files, runs `npm install` + `prisma generate`, and starts `next dev` on a
-non-9002 port so it does not collide with your own dev server. Then walk the
-PR body's **How to test** list.
+Point it at any PR:
 
-When you are done:
-
-```
-/accelevation:test-pr-cleanup 215
+```powershell
+.\scripts\use-pr.ps1 -Pr 334
 ```
 
-This does not merge anything. It only tears down the worktree, the dev server,
-and the local `test/issue-215` branch.
+That resolves the PR's head branch, fetches, checks it out **detached**, merges
+`origin/dev` on top so you are testing the post-merge state, refreshes
+`.env.local`, and reinstalls dependencies. A merge conflict stops the script
+and reports it — that is a real review finding, not a script failure.
+
+Then start it on a port that will not collide with your own dev server:
+
+```powershell
+cd ..\auto-claude\worktrees\field_admin\pr-testing
+npx next dev --turbopack -p 9010
+```
+
+`npm run dev` is hardcoded to `next dev --turbopack -p 9002`, so appending
+another `-p` would pass the flag twice — invoke `next` directly instead.
+
+Now walk the PR body's **How to test** list.
+
+### Why detached, and why it is safe to live there
+
+The worktree is on a detached HEAD because a branch checked out in one worktree
+cannot be checked out in another, and the daemon's clone already holds `dev`.
+Detached sidesteps that and makes the state obviously throwaway.
+
+It is safe to sit inside the daemon's `worktrees/` directory: every `rmtree` in
+`worker.py` targets a specific `issue-<n>` or `issue-<n>-review` path, and
+`git worktree prune` only unregisters worktrees whose directory is already
+gone. Nothing sweeps the parent directory.
+
+Only `.env.development` is copied in, landing as `.env.local`. `.env.production`
+is deliberately never copied — its `DATABASE_URL` points at the production
+database.
+
+### Removing it
+
+It is disposable. To reclaim the disk:
+
+```powershell
+git -C repos\field_admin worktree remove --force ..\..\worktrees\field_admin\pr-testing
+```
+
+Recreate it with:
+
+```powershell
+git -C repos\field_admin worktree add --detach ..\..\worktrees\field_admin\pr-testing origin/dev
+```
+
+### The alternative: the throwaway skill
+
+`/accelevation:test-pr 215` does the same job as a one-off — it builds
+`../field_admin-test-215` on branch `test/issue-215` and tears it down with
+`/accelevation:test-pr-cleanup 215`. Use it if you want two PRs up at once;
+use the persistent worktree for everyday review, since it skips a full
+`npm install` from cold each time.
 
 ## Accept or send back
 
