@@ -5,6 +5,7 @@ state/
 logs/
 repos/
 worktrees/
+crash_logs/
 __pycache__/
 *.pyc
 .venv/
