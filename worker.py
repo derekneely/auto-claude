@@ -1303,6 +1303,54 @@ def _cleanup_worktree(
     _run_cmd(["git", "branch", "-D", branch], cwd=repo_dir, logger=logger)
 
 
+def _cleanup_worktree_best_effort(
+    repo_dir: Path,
+    worktree_dir: Path,
+    logger: WorkerLogger | None = None,
+) -> None:
+    """Remove a finished worktree. Never raises.
+
+    Runs *after* the PR exists, so the run's real work is already done and
+    cannot be undone. This used to be inlined in `run_dev_worker`, where a
+    `git worktree remove` that exceeded `_run_cmd`'s 120s timeout propagated
+    into `except Exception` — which posts a crash comment and rolls the issue
+    back from ac-dev-review to ac-dev-ready + ac-attempt-1, re-queueing a
+    finished run for a full paid re-implementation on top of the live PR
+    (field_admin#215: a 40-minute, $6.72, 55-turn run discarded by an rmdir).
+
+    A leftover worktree is the cheap failure by comparison — `_cleanup_worktree`
+    removes a stale one at the start of the next run.
+
+    Each step is guarded separately: `prune` is what unregisters a worktree
+    whose directory is already gone, which is exactly the state `remove` leaves
+    when it finishes deleting but is killed before it exits. Letting a failed
+    `remove` skip `prune` would leave a phantom registration that breaks the
+    next `worktree add`.
+    """
+    def _step(label: str, fn) -> None:
+        try:
+            fn()
+        except Exception as exc:
+            if logger:
+                logger.warn(
+                    f"Worktree cleanup ({label}) failed, leaving it for the "
+                    f"next run: {exc}"
+                )
+
+    _step("remove", lambda: _run_cmd(
+        ["git", "worktree", "remove", str(worktree_dir), "--force"],
+        cwd=repo_dir,
+        logger=logger,
+    ))
+    _step("rmtree", lambda: (
+        shutil.rmtree(worktree_dir, ignore_errors=True)
+        if worktree_dir.exists() else None
+    ))
+    _step("prune", lambda: _run_cmd(
+        ["git", "worktree", "prune"], cwd=repo_dir, logger=logger
+    ))
+
+
 def _next_branch_version(base_branch: str, repo_dir: Path, logger: WorkerLogger) -> int:
     """Scan remote branches to find the next available -vN suffix."""
     result = _run_cmd(
@@ -1959,13 +2007,10 @@ def run_dev_worker(
             logger.warn("Rate limited — pushing partial work and re-queueing")
             partial_pr = _push_partial_work(ctx, branch, worktree_dir, logger)
 
-            _run_cmd(
-                ["git", "worktree", "remove", str(worktree_dir), "--force"],
-                cwd=repo_dir, logger=logger,
-            )
-            if worktree_dir.exists():
-                shutil.rmtree(worktree_dir, ignore_errors=True)
-            _run_cmd(["git", "worktree", "prune"], cwd=repo_dir, logger=logger)
+            # Best-effort: the partial work is already pushed, and a rate limit
+            # must not consume an attempt (see process_manager's re-queue). A
+            # raising cleanup here would land in `except Exception` and bill one.
+            _cleanup_worktree_best_effort(repo_dir, worktree_dir, logger)
 
             state_queue.put(StateUpdate(
                 issue_id=ctx.issue_id,
@@ -1991,14 +2036,10 @@ def run_dev_worker(
             # Push any partial work so the next agent can pick it up
             partial_pr = _push_partial_work(ctx, branch, worktree_dir, logger)
 
-            # Cleanup worktree
-            _run_cmd(
-                ["git", "worktree", "remove", str(worktree_dir), "--force"],
-                cwd=repo_dir, logger=logger,
-            )
-            if worktree_dir.exists():
-                shutil.rmtree(worktree_dir, ignore_errors=True)
-            _run_cmd(["git", "worktree", "prune"], cwd=repo_dir, logger=logger)
+            # Cleanup worktree. Best-effort: the handoff summary and partial
+            # push are already done, and a raising cleanup would discard both
+            # by routing into `except Exception`.
+            _cleanup_worktree_best_effort(repo_dir, worktree_dir, logger)
 
             state_queue.put(StateUpdate(
                 issue_id=ctx.issue_id,
@@ -2106,16 +2147,11 @@ def run_dev_worker(
             # Fresh work or conflict fallback — create new PR
             pr_url = _push_and_pr(ctx, branch, worktree_dir, summary, logger)
 
-        # [7] Cleanup worktree
+        # [7] Cleanup worktree. Best-effort by design: the PR is already open,
+        # so a failure here must not reach the `except Exception` below and
+        # undo a finished run. See the helper's docstring.
         logger.info("Cleaning up worktree...")
-        _run_cmd(
-            ["git", "worktree", "remove", str(worktree_dir), "--force"],
-            cwd=repo_dir,
-            logger=logger,
-        )
-        if worktree_dir.exists():
-            shutil.rmtree(worktree_dir, ignore_errors=True)
-        _run_cmd(["git", "worktree", "prune"], cwd=repo_dir, logger=logger)
+        _cleanup_worktree_best_effort(repo_dir, worktree_dir, logger)
 
         # [8] Write the record back to the issue. The issue is the pipeline's
         # source of truth for anyone reading it later, and it previously
@@ -2538,14 +2574,11 @@ def run_review_worker(
                 "Claude returned PASS but verify/test checks failed — overriding to FAIL"
             )
 
-        # [5] Cleanup worktree before acting on the outcome
-        _run_cmd(
-            ["git", "worktree", "remove", str(worktree_dir), "--force"],
-            cwd=repo_dir, logger=logger,
-        )
-        if worktree_dir.exists():
-            shutil.rmtree(worktree_dir, ignore_errors=True)
-        _run_cmd(["git", "worktree", "prune"], cwd=repo_dir, logger=logger)
+        # [5] Cleanup worktree before acting on the outcome. Best-effort: the
+        # review verdict is already decided, and a raising cleanup here would
+        # skip [6] entirely — no approval, no ac-hitl, no request-changes —
+        # and report a crash instead of the review that actually completed.
+        _cleanup_worktree_best_effort(repo_dir, worktree_dir, logger)
 
         # [6] Outcome
         if review_pass:
