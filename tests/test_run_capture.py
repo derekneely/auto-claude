@@ -74,7 +74,11 @@ class TestParseRunMetrics:
     def test_missing_keys_on_the_result_event_are_none_not_fatal(self):
         output = '{"type":"result","subtype":"success"}'
         metrics = _parse_run_metrics(output)
-        assert metrics == RunMetrics()
+        # The billing fields stay NULL rather than a fabricated zero. `subtype`
+        # is read from this same event, so it is populated — that is the point
+        # of it: the stop reason survives even when the cost fields do not.
+        assert (metrics.cost_usd, metrics.turns, metrics.duration_seconds) == (None, None, None)
+        assert metrics.subtype == "success"
 
 
 class TestAccumulateMetrics:

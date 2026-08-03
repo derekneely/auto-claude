@@ -16,7 +16,13 @@ from github_client import GithubClient
 from pipeline import PIPELINE_JSON_RELATIVE_PATH, parse_pipeline_config
 from state import IssueRecord, IssueStatus, StateStore
 from redact import redact
-from worker import IssueContext, StateUpdate, run_dev_worker, run_review_worker
+from worker import (
+    EXHAUSTION_ERRORS,
+    IssueContext,
+    StateUpdate,
+    run_dev_worker,
+    run_review_worker,
+)
 
 
 class ProcessManager:
@@ -360,8 +366,11 @@ class ProcessManager:
                     f"(resumes in {self.rate_limit_remaining / 60:.1f} min)"
                 )
 
-            # Budget exhaustion: re-queue for continuation if under limit
-            elif record.status == IssueStatus.FAILED and record.error == "budget_exceeded":
+            # Exhaustion: re-queue for continuation if under limit. A spent
+            # budget and a hit turn cap are the same situation — the agent ran
+            # out of room mid-task with its partial work already pushed. The
+            # difference is which knob to raise, not whether to resume.
+            elif record.status == IssueStatus.FAILED and record.error in EXHAUSTION_ERRORS:
                 new_count = record.continuation_count + 1
                 max_cont = self._config.workers.max_continuations
                 if new_count <= max_cont:
@@ -369,14 +378,14 @@ class ProcessManager:
                     self._state.update(issue_id, continuation_count=new_count)
                     self._state.save()
                     self._logger.info(
-                        f"Budget exceeded — re-queued {issue_id} for continuation "
+                        f"{record.error} — re-queued {issue_id} for continuation "
                         f"({new_count}/{max_cont})"
                     )
                 else:
                     self._state.update(issue_id, continuation_count=new_count)
                     self._state.save()
                     self._logger.error(
-                        f"{issue_id} exceeded budget across {new_count} runs — giving up"
+                        f"{issue_id} hit {record.error} across {new_count} runs — giving up"
                     )
                     self._post_budget_comment(record)
 

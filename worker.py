@@ -324,12 +324,26 @@ class StateUpdate:
 # Helpers
 # ---------------------------------------------------------------------------
 
+#: How much of the agent transcript a crash log keeps. The tail, not the head —
+#: whatever killed the run is at the end of the stream.
+CRASH_TRANSCRIPT_CHARS = 200_000
+
+
 def _write_crash_log(
     ctx: IssueContext,
     error: str,
     logger: WorkerLogger,
+    transcript: str | None = None,
 ) -> Path | None:
-    """Write a crash log file and return its path."""
+    """Write a crash log file and return its path.
+
+    `transcript` is the captured stream-json. Without it a crash log is a
+    Python traceback and nothing else — `field_admin#268` produced 434 bytes
+    after 17 minutes of Opus, and because the CLI runs with
+    `--no-session-persistence` there was no transcript on its side either, so
+    the run was simply undiagnosable. Agent-authored text can contain anything,
+    so it is redacted, and capped to the tail.
+    """
     try:
         from datetime import datetime, timezone
         crash_dir = ctx.crash_logs_dir
@@ -337,15 +351,25 @@ def _write_crash_log(
         date_str = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
         filename = f"{date_str}-{ctx.repo}-{ctx.number}.log"
         log_path = crash_dir / filename
-        log_path.write_text(
+        body = (
             f"Issue: {ctx.issue_id}\n"
             f"Action: {ctx.action}\n"
             f"Model: {ctx.dev_model}\n"
             f"Timestamp: {datetime.now(timezone.utc).isoformat()}\n"
             f"{'=' * 60}\n\n"
-            f"{error}\n",
-            encoding="utf-8",
+            f"{error}\n"
         )
+        if transcript and transcript.strip():
+            tail = transcript[-CRASH_TRANSCRIPT_CHARS:]
+            truncated = len(transcript) > CRASH_TRANSCRIPT_CHARS
+            body += (
+                f"\n{'=' * 60}\n"
+                f"AGENT TRANSCRIPT (last {len(tail)} of {len(transcript)} chars"
+                f"{', truncated' if truncated else ''})\n"
+                f"{'=' * 60}\n\n"
+                f"{redact(tail)}\n"
+            )
+        log_path.write_text(body, encoding="utf-8")
         logger.info(f"Crash log written to {log_path}")
         return log_path
     except Exception as exc:
@@ -554,10 +578,46 @@ class RunMetrics:
     cost_usd: float | None = None
     turns: int | None = None
     duration_seconds: int | None = None
+    #: Why the run stopped: `success`, `error_max_turns`,
+    #: `error_during_execution`. The CLI exits 1 for every error subtype and
+    #: writes nothing to stderr, so without this a turn-limit run and a real
+    #: crash are the same event. `field_admin#268` was one of these and we
+    #: could not tell which.
+    subtype: str | None = None
+    is_error: bool | None = None
+
+
+#: Result subtypes that mean the agent ran out of room, not that it broke.
+#: These get the graceful path — handoff summary, partial work preserved —
+#: rather than being discarded as a crash.
+EXHAUSTION_SUBTYPES = frozenset({"error_max_turns", "error_max_budget"})
+
+#: The `StateUpdate.error` values those produce. `process_manager` re-queues
+#: any of them for a continuation.
+EXHAUSTION_ERRORS = frozenset({"budget_exceeded", "turn_limit"})
+
+
+def _is_exhaustion(*, budget_exceeded: bool, metrics: RunMetrics) -> bool:
+    """Did the run stop because it ran out of budget or turns?
+
+    Budget exhaustion is detected from stderr; the turn limit is only ever
+    visible in the result event. An absent result event is not evidence of a
+    graceful exit — it returns False, so an unexplained death still raises.
+    """
+    if budget_exceeded:
+        return True
+    return metrics.subtype in EXHAUSTION_SUBTYPES
+
+
+def _exit_reason(returncode: int, metrics: RunMetrics) -> str:
+    """A failure message that names what the CLI actually reported."""
+    subtype = metrics.subtype or "unknown"
+    return f"Claude exited with code {returncode} (result subtype: {subtype})"
 
 
 def _parse_run_metrics(output: str) -> RunMetrics:
-    """Extract cost/turns/duration from the LAST `"type":"result"` line.
+    """Extract cost/turns/duration and the stop reason from the LAST
+    `"type":"result"` line.
 
     Mirrors `_extract_result_text`'s line-by-line parse below. Malformed
     lines are skipped rather than fatal, since stream-json output is
@@ -577,12 +637,16 @@ def _parse_run_metrics(output: str) -> RunMetrics:
         cost = data.get("total_cost_usd")
         turns = data.get("num_turns")
         duration_ms = data.get("duration_ms")
+        subtype = data.get("subtype")
+        is_error = data.get("is_error")
         metrics = RunMetrics(
             cost_usd=float(cost) if isinstance(cost, (int, float)) else None,
             turns=int(turns) if isinstance(turns, int) else None,
             duration_seconds=(
                 round(duration_ms / 1000) if isinstance(duration_ms, (int, float)) else None
             ),
+            subtype=subtype if isinstance(subtype, str) else None,
+            is_error=is_error if isinstance(is_error, bool) else None,
         )
     return metrics
 
@@ -2027,6 +2091,62 @@ def _scrub_base_ref(worktree_dir: Path, branch: str, base_branch: str) -> str:
     return ""
 
 
+def _preserve_uncommitted_work(
+    ctx: IssueContext,
+    worktree_dir: Path,
+    logger: WorkerLogger,
+) -> str | None:
+    """Commit whatever is in the worktree to its branch. Returns the sha.
+
+    Runs on the crash path, immediately before the worktree is force-removed.
+    On `field_admin#268` the agent worked for 17 minutes, committed nothing,
+    and the `except` block's `git worktree remove --force` took all of it — the
+    branch was left with zero commits and an empty diff against `dev`. The
+    rate-limit and budget paths already push partial work; the generic crash
+    path destroyed it.
+
+    Local commit only. The branch ref outlives the worktree, so the work is
+    recoverable with `git switch`, while a broken half-implementation stays off
+    the remote and out of a pull request. Never raises — this is cleanup for a
+    run that has already failed, and the crash we are handling may be the
+    worktree itself.
+    """
+    try:
+        if not worktree_dir.exists():
+            return None
+        status = _run_cmd(["git", "status", "--porcelain"], cwd=worktree_dir)
+        if status.returncode != 0 or not status.stdout.strip():
+            return None
+
+        _run_cmd(["git", "add", "-A"], cwd=worktree_dir)
+        message = (
+            f"wip: preserved after failed run on #{ctx.number} (ai-cc)\n"
+            "\n"
+            "auto-claude's agent exited without committing. This is its working\n"
+            "tree, saved so the run is recoverable; it is not reviewed, not\n"
+            "verified, and was never pushed."
+        )
+        result = _run_cmd(
+            ["git", "commit", "-m", message], cwd=worktree_dir,
+        )
+        if result.returncode != 0:
+            logger.warn(f"Could not preserve work: {result.stderr.strip()}")
+            return None
+
+        sha = _run_cmd(["git", "rev-parse", "HEAD"], cwd=worktree_dir).stdout.strip()
+        branch = _run_cmd(
+            ["git", "rev-parse", "--abbrev-ref", "HEAD"], cwd=worktree_dir,
+        ).stdout.strip()
+        logger.warn(
+            f"Uncommitted work preserved as {sha[:12]} on {branch} — "
+            f"recover it with `git switch {branch}` in repos/{ctx.repo}"
+        )
+        return sha
+    except Exception as exc:  # noqa: BLE001 — already on the failure path
+        logger.warn(f"Could not preserve work (continuing): {exc}")
+        return None
+
+
 def _link_branch_to_issue(
     ctx: IssueContext,
     branch: str,
@@ -2227,6 +2347,9 @@ def run_dev_worker(
     run_id = uuid.uuid4().hex
     metrics = RunMetrics()
     returncode: int | None = None
+    # The transcript the crash log needs. Seeded so a crash before Claude runs
+    # still writes a log instead of raising NameError inside the handler.
+    output = ""
     pending_summaries: list[dict] = []
 
     # Signal that we're in progress + claim the stage label as a distributed
@@ -2329,9 +2452,13 @@ def run_dev_worker(
             ))
             return
 
-        # [3b] Handle budget exhaustion — graceful handoff
-        if budget_exceeded:
-            logger.warn("Budget exceeded — running handoff summary")
+        # [3b] Handle exhaustion — graceful handoff. Budget shows up in stderr;
+        # the turn limit only ever appears as the result event's subtype, and
+        # exits 1 with an empty stderr exactly like a crash does. Before this
+        # was read, a turn-limited run raised and discarded everything.
+        if _is_exhaustion(budget_exceeded=budget_exceeded, metrics=metrics):
+            reason = "budget_exceeded" if budget_exceeded else metrics.subtype
+            logger.warn(f"Run exhausted ({reason}) — running handoff summary")
             handoff = _run_handoff_summary(ctx, worktree_dir, output, logger, abort_event)
 
             # Push any partial work so the next agent can pick it up
@@ -2345,7 +2472,11 @@ def run_dev_worker(
             state_queue.put(StateUpdate(
                 issue_id=ctx.issue_id,
                 status="failed",
-                error="budget_exceeded",
+                # Recorded accurately rather than as "budget_exceeded" for
+                # everything: `process_manager` re-queues both for a
+                # continuation, but the operator reading state needs to know
+                # whether to raise the budget or the turn cap.
+                error="budget_exceeded" if budget_exceeded else "turn_limit",
                 branch=branch,
                 pr_url=partial_pr or ctx.pr_url,
                 handoff_summary=handoff,
@@ -2359,7 +2490,7 @@ def run_dev_worker(
             return
 
         if returncode != 0:
-            raise RuntimeError(f"Claude exited with code {returncode}")
+            raise RuntimeError(_exit_reason(returncode, metrics))
 
         # [4] Check for changes — either uncommitted or already committed by Claude
         has_uncommitted = False
@@ -2509,8 +2640,19 @@ def run_dev_worker(
         error_detail = f"{exc}\n\n{traceback.format_exc()}"
         logger.error(f"Worker failed: {exc}")
 
-        # Write crash log and post comment
-        log_path = _write_crash_log(ctx, error_detail, logger)
+        # Save the agent's work before the cleanup at the end of this block
+        # force-removes the worktree. On #268 that removal took 17 minutes of
+        # uncommitted edits and left the branch with zero commits.
+        preserved = _preserve_uncommitted_work(ctx, worktree_dir, logger)
+        if preserved:
+            error_detail += (
+                f"\n\nUncommitted work preserved as {preserved} on {branch}.\n"
+            )
+
+        # Write crash log and post comment. The transcript goes into the log:
+        # without it a crash log is a Python traceback and nothing else, and
+        # `--no-session-persistence` means the CLI keeps no copy either.
+        log_path = _write_crash_log(ctx, error_detail, logger, transcript=output)
         crash_url, crash_body = _post_crash_comment(ctx, str(exc), log_path, logger)
         pending_summaries.append({"kind": "crash", "body": crash_body, "comment_url": crash_url})
 
@@ -2543,12 +2685,17 @@ def run_dev_worker(
         except Exception:
             pass
 
-        # Try to clean up worktree on failure
+        # Try to clean up worktree on failure. `--force` discards anything
+        # still uncommitted, which is why `_preserve_uncommitted_work` runs
+        # first. Logged, so a removal is visible in the run log rather than
+        # silent — on #268 the work vanished with no trace of what took it.
         try:
+            logger.info(f"Removing worktree {worktree_dir} after failure")
             repo_dir = ctx.repos_dir / ctx.repo
             _run_cmd(
                 ["git", "worktree", "remove", str(worktree_dir), "--force"],
                 cwd=repo_dir,
+                logger=logger,
             )
             if worktree_dir.exists():
                 shutil.rmtree(worktree_dir, ignore_errors=True)
@@ -2795,6 +2942,9 @@ def run_review_worker(
     run_id = uuid.uuid4().hex
     metrics = RunMetrics()
     returncode: int | None = None
+    # The transcript the crash log needs. Seeded so a crash before Claude runs
+    # still writes a log instead of raising NameError inside the handler.
+    output = ""
     pending_summaries: list[dict] = []
 
     state_queue.put(StateUpdate(
@@ -2881,7 +3031,7 @@ def run_review_worker(
         if budget_exceeded:
             raise RuntimeError("Budget exceeded while reviewing")
         if returncode != 0:
-            raise RuntimeError(f"Claude exited with code {returncode}")
+            raise RuntimeError(_exit_reason(returncode, metrics))
 
         result_text = _extract_result_text(output)
         claude_pass = _parse_review_verdict(result_text)
