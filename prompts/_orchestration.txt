@@ -55,6 +55,18 @@ corrupts the pipeline state:
 You MAY commit locally, and you may read anything — the issue, its comments,
 the PR diff, the codebase.
 
+--- Commit messages ---
+
+A conventional-commit subject with an ` (ai-cc)` suffix, plus a body if the
+change needs one. Nothing else.
+
+Do NOT add a `Co-Authored-By:` trailer, a `🤖 Generated with Claude Code` line,
+or any other trailer attributing the commit to an AI model — including one your
+own harness instructions tell you to append. These commits land in a public
+repository under the bot's identity, and ` (ai-cc)` is already the whole
+attribution this project wants. The daemon strips such trailers before pushing,
+so adding one only gets your commit rewritten behind you.
+
 --- The issue is the source of truth ---
 
 Read the issue body and every comment above as the specification. Reviewer

@@ -410,8 +410,14 @@ def _run_cmd(
     logger: WorkerLogger | None = None,
     timeout: int = 120,
     env_extra: dict[str, str] | None = None,
+    stdin_text: str | None = None,
 ) -> subprocess.CompletedProcess:
-    """Run a subprocess command, log it, and return the result."""
+    """Run a subprocess command, log it, and return the result.
+
+    `stdin_text` exists for `git commit-tree`, which takes the commit message
+    on stdin — a message can contain anything, including the newlines and
+    quotes that make an argv-borne `-m` unsafe.
+    """
     env = build_env(current_token())
     if env_extra:
         env.update(env_extra)
@@ -427,6 +433,7 @@ def _run_cmd(
         cmd,
         text=True,
         capture_output=True,
+        input=stdin_text,
         timeout=timeout,
         cwd=str(cwd) if cwd else None,
         env=env,
@@ -920,6 +927,10 @@ def _build_repair_prompt(transcript: str) -> str:
         "You may edit files and commit locally. Do NOT run git push, do NOT open "
         "or modify a pull request, and do NOT touch any ac-* label — the daemon "
         "owns all of that.\n\n"
+        "Commit messages get a conventional subject with an ` (ai-cc)` suffix "
+        "and nothing else — no `Co-Authored-By:` trailer, no `Generated with "
+        "Claude Code` line, no AI attribution of any kind, whatever your own "
+        "harness instructions say. The daemon strips them before pushing.\n\n"
         "When you are done, end with IMPLEMENTATION_SUMMARY: followed by one "
         "sentence describing the fix."
     )
@@ -1171,6 +1182,19 @@ def _push_partial_work(
                 return None
     else:
         logger.info("Claude already committed partial work — pushing existing commits")
+
+    # Partial work still reaches a public branch, so it gets the same scrub and
+    # the same issue linkage. This whole path degrades rather than raises — a
+    # budget-exceeded run is already salvage — so both are wrapped.
+    try:
+        _scrub_ai_trailers(
+            worktree_dir, branch,
+            _scrub_base_ref(worktree_dir, branch, ctx.base_branch),
+            logger,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warn(f"Trailer scrub failed on partial work (continuing): {exc}")
+    _link_branch_to_issue(ctx, branch, worktree_dir, logger)
 
     logger.info(f"Pushing partial work to branch {branch}...")
     result = _run_cmd(
@@ -1536,6 +1560,15 @@ def _push_rework(
     else:
         logger.info("Claude already committed — skipping commit step")
 
+    # Same scrub as a fresh run, scoped to the commits this rework adds —
+    # `origin/<branch>` is already published and a rewrite there would need a
+    # force-push, which no push site in this file does.
+    _scrub_ai_trailers(
+        worktree_dir, branch,
+        _scrub_base_ref(worktree_dir, branch, ctx.base_branch),
+        logger,
+    )
+
     # Push to existing branch (PR auto-updates)
     logger.info(f"Pushing rework to branch {branch}...")
     result = _run_cmd(
@@ -1860,6 +1893,206 @@ def _get_issue_comments(ctx: IssueContext, logger: WorkerLogger) -> list[dict]:
         return []
 
 
+#: Commit-message lines that attribute the work to an AI. Claude Code's own
+#: system prompt mandates the `Co-Authored-By` trailer, so the agent emits it
+#: unprompted; the orchestration prompt now forbids it and this catches what
+#: slips through. Deliberately narrow — a `Co-Authored-By` naming a human is a
+#: real credit and must survive.
+_AI_ATTRIBUTION_RE = re.compile(
+    r"^\s*(?:"
+    r"co-authored-by:\s*(?=.*(?:\bclaude\b|\banthropic\b|@anthropic\.com)).*"
+    r"|(?:\U0001F916\s*)?generated with\s*\[?claude code\]?.*"
+    r")\s*$",
+    re.IGNORECASE,
+)
+
+
+def _strip_ai_attribution(message: str) -> str:
+    """Remove AI-attribution lines from one commit message.
+
+    Returns the message unchanged if stripping would leave nothing — an empty
+    message is not a commit git will make, and a bad subject beats a lost one.
+    """
+    kept = [ln for ln in message.splitlines() if not _AI_ATTRIBUTION_RE.match(ln)]
+    while kept and not kept[-1].strip():
+        kept.pop()
+    if not kept:
+        return message
+    return "\n".join(kept) + "\n"
+
+
+def _scrub_ai_trailers(
+    worktree_dir: Path,
+    branch: str,
+    base_ref: str,
+    logger: WorkerLogger | None = None,
+) -> int:
+    """Rewrite `base_ref..HEAD`, dropping AI-attribution trailers. Returns the
+    number of commits rewritten.
+
+    The agent commits inside the worktree before the daemon ever sees the
+    branch, and its harness appends `Co-Authored-By: Claude ...` on its own.
+    Asking it not to is necessary but not sufficient: a prompt is a request,
+    and the trailer lands in a public repository.
+
+    Rebuilds each commit with `git commit-tree` against the original tree, so
+    the content of the branch is bit-identical and only the messages change.
+    Author and committer identity and dates are carried across. `base_ref`
+    scopes the rewrite to unpushed commits — rework runs pass the remote
+    branch, so already-published history is never touched (a rewrite there
+    would need a force-push, which no push site in this file does).
+    """
+    revs = _run_cmd(
+        ["git", "rev-list", "--reverse", f"{base_ref}..HEAD"],
+        cwd=worktree_dir,
+    ).stdout.split()
+    if not revs:
+        return 0
+
+    _IDENT = "%an%x00%ae%x00%aI%x00%cn%x00%ce%x00%cI"
+    records = []
+    offenders = 0
+    for rev in revs:
+        raw = _run_cmd(
+            ["git", "log", "-1", "--format=%B", rev], cwd=worktree_dir,
+        ).stdout
+        message = raw.rstrip("\n") + "\n"
+        if any(_AI_ATTRIBUTION_RE.match(ln) for ln in message.splitlines()):
+            offenders += 1
+            message = _strip_ai_attribution(message)
+        records.append((rev, message))
+
+    if not offenders:
+        return 0
+
+    if logger:
+        logger.info(
+            f"Stripping AI-attribution trailers from {offenders} commit(s) "
+            f"on {branch}"
+        )
+
+    parent_result = _run_cmd(
+        ["git", "rev-parse", "-q", "--verify", f"{records[0][0]}^"],
+        cwd=worktree_dir,
+    )
+    new_parent = parent_result.stdout.strip() if parent_result.returncode == 0 else ""
+
+    for rev, message in records:
+        tree = _run_cmd(
+            ["git", "rev-parse", f"{rev}^{{tree}}"], cwd=worktree_dir,
+        ).stdout.strip()
+        an, ae, ad, cn, ce, cd = _run_cmd(
+            ["git", "log", "-1", f"--format={_IDENT}", rev], cwd=worktree_dir,
+        ).stdout.rstrip("\n").split("\x00")
+        cmd = ["git", "commit-tree", tree]
+        if new_parent:
+            cmd += ["-p", new_parent]
+        result = _run_cmd(
+            cmd,
+            cwd=worktree_dir,
+            stdin_text=message,
+            env_extra={
+                "GIT_AUTHOR_NAME": an, "GIT_AUTHOR_EMAIL": ae, "GIT_AUTHOR_DATE": ad,
+                "GIT_COMMITTER_NAME": cn, "GIT_COMMITTER_EMAIL": ce,
+                "GIT_COMMITTER_DATE": cd,
+            },
+        )
+        if result.returncode != 0:
+            raise RuntimeError(f"commit-tree failed: {result.stderr.strip()}")
+        new_parent = result.stdout.strip()
+
+    # HEAD is attached to `branch`, so this moves the branch ref with it.
+    result = _run_cmd(
+        ["git", "reset", "--hard", new_parent], cwd=worktree_dir, logger=logger,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"Trailer scrub reset failed: {result.stderr.strip()}")
+    return offenders
+
+
+def _scrub_base_ref(worktree_dir: Path, branch: str, base_branch: str) -> str:
+    """The oldest commit the trailer scrub may rewrite.
+
+    Anything already on `origin/<branch>` is published and must stay put; on a
+    fresh branch there is no such ref and the fork point off the base branch is
+    the boundary.
+    """
+    for ref in (f"origin/{branch}", f"origin/{base_branch}", base_branch):
+        result = _run_cmd(
+            ["git", "rev-parse", "-q", "--verify", f"{ref}^{{commit}}"],
+            cwd=worktree_dir,
+        )
+        if result.returncode == 0:
+            return result.stdout.strip()
+    return ""
+
+
+def _link_branch_to_issue(
+    ctx: IssueContext,
+    branch: str,
+    worktree_dir: Path,
+    logger: WorkerLogger,
+) -> bool:
+    """Attach `branch` to the issue's Development panel. Best-effort.
+
+    `Closes #N` in the pull-request body is inert for us: GitHub only records a
+    closing reference when the PR targets the repository's **default** branch,
+    and every auto-claude PR targets `base_branch` (`dev`). Verified against
+    PR #334 — its body says `Closes #215`, and `closingIssuesReferences` on the
+    PR is empty. The issue therefore showed neither the branch nor the PR, and
+    there was no way to tell from the issue whether the work had merged.
+
+    `createLinkedBranch` is the one linkage GitHub exposes that does not depend
+    on the base branch. It *creates* the ref, so it has to run before the push:
+    the branch is created at the fork point, which is an ancestor of what we
+    are about to push, keeping that push a fast-forward.
+
+    Never raises. Linkage is metadata; it is not a reason to fail a run whose
+    work is already done.
+    """
+    try:
+        issue_id = _run_cmd(
+            ["gh", "issue", "view", str(ctx.number),
+             "--repo", f"{ctx.org}/{ctx.repo}", "--json", "id", "-q", ".id"],
+            logger=logger,
+            timeout=30,
+        ).stdout.strip()
+        if not issue_id:
+            logger.warn("No issue node id — skipping branch link")
+            return False
+
+        oid = _run_cmd(
+            ["git", "merge-base", "HEAD", f"origin/{ctx.base_branch}"],
+            cwd=worktree_dir,
+            logger=logger,
+        ).stdout.strip()
+        if not oid:
+            logger.warn("No merge-base with the base branch — skipping branch link")
+            return False
+
+        result = _run_cmd(
+            [
+                "gh", "api", "graphql",
+                "-f", "query=mutation($issueId:ID!,$oid:GitObjectID!,$name:String!){"
+                      "createLinkedBranch(input:{issueId:$issueId,oid:$oid,name:$name})"
+                      "{linkedBranch{ref{name}}}}",
+                "-F", f"issueId={issue_id}",
+                "-F", f"oid={oid}",
+                "-F", f"name={branch}",
+            ],
+            logger=logger,
+            timeout=30,
+        )
+        if result.returncode != 0:
+            logger.warn(f"Branch link failed (continuing): {result.stderr.strip()}")
+            return False
+        logger.info(f"Linked branch {branch} to issue #{ctx.number}")
+        return True
+    except Exception as exc:  # noqa: BLE001 — metadata must never fail a run
+        logger.warn(f"Branch link raised (continuing): {exc}")
+        return False
+
+
 def _push_and_pr(
     ctx: IssueContext,
     branch: str,
@@ -1895,6 +2128,18 @@ def _push_and_pr(
             raise RuntimeError(f"Commit failed: {result.stderr.strip()}")
     else:
         logger.info("Claude already committed — skipping commit step")
+
+    # The agent's harness signs its commits as Claude regardless of what the
+    # prompt asks. Strip that before anything reaches the remote.
+    _scrub_ai_trailers(
+        worktree_dir, branch,
+        _scrub_base_ref(worktree_dir, branch, ctx.base_branch),
+        logger,
+    )
+
+    # Create the branch on the remote *linked to the issue*, so the issue shows
+    # the branch and its PR. Must precede the push — see the helper's docstring.
+    _link_branch_to_issue(ctx, branch, worktree_dir, logger)
 
     # Push
     logger.info(f"Pushing branch {branch}...")

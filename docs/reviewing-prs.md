@@ -39,6 +39,36 @@ gh issue list --repo Accelevation/field_admin --assignee accelevation-bot `
   --label ac-hitl --state open
 ```
 
+## Finding the PR from the issue
+
+The issue's **Development** panel shows the work branch, and the branch carries
+its pull request and that PR's state — which is how you check from the issue
+alone whether the work merged.
+
+This does not come from `Closes #N`. GitHub only records a closing reference
+when the pull request targets the repository's **default** branch, and every
+auto-claude PR targets `base_branch` (`dev`). PR #334 proved it: its body says
+`Closes #215`, and `closingIssuesReferences` on the PR is empty — issue #215
+showed neither the branch nor the PR.
+
+So `worker._link_branch_to_issue` calls the `createLinkedBranch` mutation
+immediately before `git push`. That mutation *creates* the ref, which is why it
+has to run first; it creates it at the fork point, so the push that follows is
+still a fast-forward. It is best-effort — a failure logs a warning and the run
+continues, because linkage is metadata and the work is already done.
+
+Two consequences worth knowing:
+
+- **Merging into `dev` will not close the issue**, `Closes #N` or not. Closing
+  it is part of the human `ac-merged` → `ac-done` step.
+- To check merge state from an issue number:
+
+  ```powershell
+  gh api graphql -f query='{repository(owner:"Accelevation",name:"field_admin"){
+    issue(number:215){linkedBranches(first:10){nodes{ref{name
+      associatedPullRequests(first:5){nodes{number state}}}}}}}}'
+  ```
+
 ## The fast path — read it
 
 ```powershell
