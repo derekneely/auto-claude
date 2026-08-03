@@ -627,6 +627,19 @@ def _sync_boards(config, github, logger: MainLogger) -> None:
             )
 
 
+def _safe_sync_boards(config, github, logger) -> None:
+    """`_sync_boards` that can never take a run down with it.
+
+    The board mirrors label state, so drift self-corrects on the next sync — a
+    missing `project` gh scope or an unreachable board must not turn a finished
+    run into a failed one.
+    """
+    try:
+        _sync_boards(config, github, logger)
+    except Exception as exc:  # noqa: BLE001 — board sync is a side effect
+        logger.warn(f"Board sync failed (continuing): {exc}")
+
+
 def _run_triage(record, state, github, triage_engine, config, logger,
                 dry_run: bool = False, dbsync=None) -> None:
     """Triage a single issue and update state accordingly."""
@@ -789,6 +802,13 @@ def _run_single_issue(args, config, state, github, triage_engine, logger,
 
         record = state.get(issue_id)
         logger.info(f"Final status for {issue_id}: {record.status}")
+
+        # Mirror the stage this run ended on onto the Projects v2 board. Board
+        # sync used to live only in the daemon's poll loop, so a one-shot run
+        # moved the ac-* labels and left the card untouched: #268 reached
+        # ac-dev-review with a PR open while its card still read Backlog. The
+        # board is what people actually look at.
+        _safe_sync_boards(config, github, logger)
     else:
         logger.info(f"Issue {issue_id} is in status {record.status} — nothing to do")
 
@@ -985,7 +1005,7 @@ def main() -> None:
             #    every open issue it is given, so per-transition calls would be
             #    redundant work. Never fatal; board drift is recoverable.
             if not args.dry_run:
-                _sync_boards(config, github, logger)
+                _safe_sync_boards(config, github, logger)
 
             # 7. Sleep in small increments so shutdown is responsive
             for _ in range(config.github.poll_interval_seconds):
