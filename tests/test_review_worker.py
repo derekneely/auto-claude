@@ -385,15 +385,19 @@ def review_env(monkeypatch, tmp_path):
     introducing a second fake style.
 
     `_run_cmd` is faked at the same chokepoint the production code calls —
-    `_check_pr_already_merged` / `_merged_pr_for_issue` route `gh pr view` and
-    `gh pr list --state merged` through it for real, so a test asserting on
-    the result is exercising the actual implementation, not the fixture.
-    `_claim_review_labels` and `_get_issue_labels` are also left real (routed
-    through the same `_run_cmd` fake, answering `gh api ...` with an empty
-    label set) so the self-lock genuinely runs before the short-circuit.
+    `_check_pr_already_merged` / `_merged_pr_for_issue` / `_find_pr_for_issue`
+    route `gh pr view`, `gh pr list --state merged` and `gh pr list --state
+    open` through it for real, so a test asserting on the result is
+    exercising the actual implementation, not the fixture. `open_list` feeds
+    the open-state query — needed to prove a newer open PR takes priority
+    over a stale merged one. `_claim_review_labels` and `_get_issue_labels`
+    are also left real (routed through the same `_run_cmd` fake, answering
+    `gh api ...` with an empty label set) so the self-lock genuinely runs
+    before the short-circuit.
     """
 
-    def _make(*, pr_url=None, pr_view=None, merged_list=None, number=1, gh_fails=False):
+    def _make(*, pr_url=None, pr_view=None, merged_list=None, open_list=None,
+              number=1, gh_fails=False):
         ctx = _make_ctx(
             tmp_path,
             issue_id=f"repo#{number}",
@@ -426,7 +430,7 @@ def review_env(monkeypatch, tmp_path):
             if args[:3] == ["gh", "pr", "list"] and "merged" in args:
                 return _FakeCompleted(returncode=0, stdout=json.dumps(merged_list or []))
             if args[:3] == ["gh", "pr", "list"]:
-                return _FakeCompleted(returncode=0, stdout="[]")
+                return _FakeCompleted(returncode=0, stdout=json.dumps(open_list or []))
             if args[:2] == ["gh", "api"]:
                 return _FakeCompleted(returncode=0, stdout=json.dumps({"labels": []}))
             return _FakeCompleted(returncode=0, stdout="")
@@ -516,6 +520,26 @@ class TestCheckPrAlreadyMerged:
                          gh_fails=True)
         assert worker._check_pr_already_merged(env.ctx, env.logger) is None
 
+    def test_a_newer_open_pr_takes_priority_over_a_stale_merged_one(self, review_env):
+        # Regression for the coordinator-flagged hazard: an issue can carry
+        # both a stale merged PR (a re-opened issue, a superseded branch)
+        # and a newer open one. With ctx.pr_url unset, the open PR is the
+        # one that still needs reviewing — the merged lookup must not steal
+        # it just because it runs first internally.
+        env = review_env(
+            pr_url=None,
+            number=268,
+            merged_list=[
+                {"number": 340, "headRefName": "ac/issue-268-old-attempt",
+                 "url": "https://github.com/Org/repo/pull/340", "body": "", "title": ""},
+            ],
+            open_list=[
+                {"number": 341, "headRefName": "ac/issue-268-attachments",
+                 "url": "https://github.com/Org/repo/pull/341", "body": "", "title": ""},
+            ],
+        )
+        assert worker._check_pr_already_merged(env.ctx, env.logger) is None
+
 
 class TestReviewWorkerShortCircuit:
     def test_a_merged_pr_skips_claude_entirely(self, review_env):
@@ -540,10 +564,57 @@ class TestReviewWorkerShortCircuit:
         env = review_env(pr_url="https://github.com/Org/repo/pull/341",
                          pr_view={"number": 341, "state": "MERGED"})
         worker.run_review_worker(env.ctx, env.log_q, env.state_q, env.abort)
-        assert env.final_status() == "completed"
+        update = env.state_q.items[-1]
+        # `status == "completed"` alone doesn't distinguish this from the
+        # ordinary review-pass path, which also ends "completed" — pin the
+        # "no run occurred" semantics instead: run_outcome mirrors status,
+        # and exit_code is None because no `_run_claude` call ever happened.
+        assert update.status == "completed"
+        assert update.run_outcome == "completed"
+        assert update.exit_code is None
 
     def test_an_open_pr_still_reviews_as_before(self, review_env):
         env = review_env(pr_url="https://github.com/Org/repo/pull/341",
                          pr_view={"number": 341, "state": "OPEN"})
         worker.run_review_worker(env.ctx, env.log_q, env.state_q, env.abort)
         assert env.claude_invocations == 1
+
+    def test_a_merged_pr_found_via_issue_lookup_still_skips_claude(self, review_env):
+        # End-to-end regression for the crash loop this task exists to fix:
+        # ctx.pr_url unset (restart / human label / sibling toolchain), no
+        # open PR at all, but a merged one is found by issue-number lookup.
+        # Before this task: _find_pr_for_issue (open-only) returns None ->
+        # RuntimeError("No open PR found") -> _labels_for_review_crash
+        # rewinds to ac-dev-review -> the next poll re-queues the same
+        # review, forever.
+        env = review_env(
+            pr_url=None,
+            number=268,
+            merged_list=[
+                {"number": 341, "headRefName": "ac/issue-268-attachments",
+                 "url": "https://github.com/Org/repo/pull/341", "body": "", "title": ""},
+            ],
+        )
+        worker.run_review_worker(env.ctx, env.log_q, env.state_q, env.abort)
+        assert env.claude_invocations == 0
+        assert env.final_status() == "completed"
+
+    def test_a_newer_open_pr_is_reviewed_instead_of_a_stale_merged_one(self, review_env):
+        # run_review_worker-level counterpart to the TestCheckPrAlreadyMerged
+        # priority test — proves the full worker entry point, not just the
+        # helper, does not short-circuit a still-open PR.
+        env = review_env(
+            pr_url=None,
+            number=268,
+            merged_list=[
+                {"number": 340, "headRefName": "ac/issue-268-old-attempt",
+                 "url": "https://github.com/Org/repo/pull/340", "body": "", "title": ""},
+            ],
+            open_list=[
+                {"number": 341, "headRefName": "ac/issue-268-attachments",
+                 "url": "https://github.com/Org/repo/pull/341", "body": "", "title": ""},
+            ],
+        )
+        worker.run_review_worker(env.ctx, env.log_q, env.state_q, env.abort)
+        assert env.claude_invocations == 1
+        assert "ac-merged" not in env.labels_added

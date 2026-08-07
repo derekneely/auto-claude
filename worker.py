@@ -1365,29 +1365,58 @@ def _candidate_prs_for_issue(
     return sorted(matches, key=lambda p: p.get("updatedAt", ""), reverse=True)
 
 
+def _prs_for_issue(
+    ctx: IssueContext,
+    logger: WorkerLogger,
+    *,
+    state: str,
+    limit: int | None = None,
+    list_fail_msg: str,
+    parse_fail_msg: str,
+) -> list[dict] | None:
+    """List PRs for this issue's repo in the given `state` via `gh pr list`.
+
+    Shared by `_find_pr_for_issue` (state="open") and `_merged_pr_for_issue`
+    (state="merged") — the two differ only in which PR lifecycle they query,
+    how far back they page, and what they log on failure, not in how they
+    call `gh` or parse its output. Returns None (not an exception, not an
+    empty list) on any `gh`/parse failure, so a caller can tell "nothing
+    matched" from "could not ask" — the contract each caller already had
+    before this helper existed. `list_fail_msg`/`parse_fail_msg` are supplied
+    by the caller so each keeps its own distinct warn text.
+    """
+    args = [
+        "gh", "pr", "list",
+        "--repo", f"{ctx.org}/{ctx.repo}",
+        "--state", state,
+    ]
+    if limit is not None:
+        args += ["--limit", str(limit)]
+    args += ["--json", "number,headRefName,url,body,title,updatedAt"]
+
+    result = _run_cmd(args, logger=logger, timeout=30)
+    if result.returncode != 0:
+        logger.warn(f"{list_fail_msg}: {result.stderr.strip()}")
+        return None
+    try:
+        return json.loads(result.stdout)
+    except json.JSONDecodeError:
+        logger.warn(parse_fail_msg)
+        return None
+
+
 def _find_pr_for_issue(ctx: IssueContext, logger: WorkerLogger) -> dict | None:
     """Look up the open PR for this issue via `gh`, when ctx carries none.
 
     Returns None (not an exception) when no open PR matches — the caller
     treats that as "cannot review yet", not a crash.
     """
-    result = _run_cmd(
-        [
-            "gh", "pr", "list",
-            "--repo", f"{ctx.org}/{ctx.repo}",
-            "--state", "open",
-            "--json", "number,headRefName,url,body,title,updatedAt",
-        ],
-        logger=logger,
-        timeout=30,
+    prs = _prs_for_issue(
+        ctx, logger, state="open",
+        list_fail_msg="Failed to list PRs for review lookup",
+        parse_fail_msg="Failed to parse `gh pr list` output during review lookup",
     )
-    if result.returncode != 0:
-        logger.warn(f"Failed to list PRs for review lookup: {result.stderr.strip()}")
-        return None
-    try:
-        prs = json.loads(result.stdout)
-    except json.JSONDecodeError:
-        logger.warn("Failed to parse `gh pr list` output during review lookup")
+    if prs is None:
         return None
 
     branch_prefix = f"ac/issue-{ctx.number}-"
@@ -1410,25 +1439,21 @@ def _merged_pr_for_issue(ctx: IssueContext, logger: WorkerLogger) -> dict | None
     see, and whose absence produced an unbounded crash loop: no open PR ->
     RuntimeError -> _labels_for_review_crash rewinds to ac-dev-review -> the
     next poll re-queues the same review.
+
+    Only ever consulted by `_check_pr_already_merged` *after* an open-PR
+    lookup has already come back empty — an issue with both a merged PR and
+    a newer open one must keep reviewing the open one, not short-circuit on
+    the stale merged match. Uses `--limit 50` (`gh`'s default is 30):
+    reaching this function already means no open PR matched, so the PR worth
+    finding, if any, is further back in history than the common case — a
+    wider page is deliberate here and not on the open-PR path.
     """
-    result = _run_cmd(
-        [
-            "gh", "pr", "list",
-            "--repo", f"{ctx.org}/{ctx.repo}",
-            "--state", "merged",
-            "--limit", "50",
-            "--json", "number,headRefName,url,body,title,updatedAt",
-        ],
-        logger=logger,
-        timeout=30,
+    prs = _prs_for_issue(
+        ctx, logger, state="merged", limit=50,
+        list_fail_msg="Failed to list merged PRs",
+        parse_fail_msg="Failed to parse `gh pr list --state merged` output",
     )
-    if result.returncode != 0:
-        logger.warn(f"Failed to list merged PRs: {result.stderr.strip()}")
-        return None
-    try:
-        prs = json.loads(result.stdout)
-    except json.JSONDecodeError:
-        logger.warn("Failed to parse `gh pr list --state merged` output")
+    if prs is None:
         return None
 
     branch_prefix = f"ac/issue-{ctx.number}-"
@@ -1442,6 +1467,12 @@ def _check_pr_already_merged(ctx: IssueContext, logger: WorkerLogger) -> dict | 
     Never raises. An unreadable `gh` result returns None, which means the
     review proceeds as normal — the worse failure is skipping a review that
     should have happened, so this errs toward doing the work.
+
+    When `ctx.pr_url` is unset, an *open* PR is checked first and takes
+    priority over any merged match: an issue can have both a stale merged PR
+    (a re-opened issue, a superseded branch) and a newer open one, and the
+    open PR is always the one that still needs reviewing. Only when no open
+    PR exists do we fall back to asking whether one was already merged.
     """
     pr_number = _pr_number(ctx.pr_url)
     if pr_number is not None:
@@ -1465,6 +1496,8 @@ def _check_pr_already_merged(ctx: IssueContext, logger: WorkerLogger) -> dict | 
         # `gh pr view` reports state in caps: OPEN / CLOSED / MERGED.
         return payload if payload.get("state") == "MERGED" else None
 
+    if _find_pr_for_issue(ctx, logger) is not None:
+        return None
     return _merged_pr_for_issue(ctx, logger)
 
 
@@ -1967,6 +2000,42 @@ def _review_merged_labels(ctx: IssueContext, logger: WorkerLogger) -> None:
     _set_labels(ctx, logger, add=add, remove=remove)
     _telemetry(ctx, logger, "merged", labels, stage="review",
                pr=_pr_number(ctx.pr_url))
+
+
+def _short_circuit_review_to_merged(
+    ctx: IssueContext,
+    logger: WorkerLogger,
+    merged: dict,
+    state_queue: Queue,
+    run_id: str,
+    metrics: RunMetrics,
+    pending_summaries: list[dict],
+) -> None:
+    """Transition to ac-merged and report the run as completed with no work done.
+
+    Shared by both places `run_review_worker` can discover a merged PR: via
+    `ctx.pr_url` directly, or via the merged-PR fallback reached only after an
+    open-PR lookup came back empty. Kept as one function so the two call
+    sites cannot drift on what "already merged" reports back to `main`.
+    """
+    ctx.pr_url = merged.get("url") or ctx.pr_url
+    logger.info(
+        f"PR #{merged.get('number')} already merged — skipping review, "
+        f"-> ac-merged (Pending Release)"
+    )
+    _review_merged_labels(ctx, logger)
+    state_queue.put(StateUpdate(
+        issue_id=ctx.issue_id,
+        status="completed",
+        pr_url=ctx.pr_url,
+        run_id=run_id,
+        run_outcome="completed",
+        exit_code=None,
+        duration_seconds=metrics.duration_seconds,
+        cost_usd=metrics.cost_usd,
+        turns=metrics.turns,
+        summaries=pending_summaries or None,
+    ))
 
 
 def _set_labels(
@@ -3057,28 +3126,18 @@ def run_review_worker(
         # before this review was picked up. Runs after the self-lock so the
         # label write is fenced by the lease this worker holds, and before
         # the PR *resolution* below, which lists only open PRs and would
-        # crash-loop on a merged one.
-        merged = _check_pr_already_merged(ctx, logger)
-        if merged is not None:
-            ctx.pr_url = merged.get("url") or ctx.pr_url
-            logger.info(
-                f"PR #{merged.get('number')} already merged — skipping review, "
-                f"-> ac-merged (Pending Release)"
-            )
-            _review_merged_labels(ctx, logger)
-            state_queue.put(StateUpdate(
-                issue_id=ctx.issue_id,
-                status="completed",
-                pr_url=ctx.pr_url,
-                run_id=run_id,
-                run_outcome="completed",
-                exit_code=returncode,
-                duration_seconds=metrics.duration_seconds,
-                cost_usd=metrics.cost_usd,
-                turns=metrics.turns,
-                summaries=pending_summaries or None,
-            ))
-            return
+        # crash-loop on a merged one. Only meaningful when ctx already names
+        # a PR — with no pr_url, "is it merged" can't be answered without an
+        # open-PR lookup first (see below), so that combination is handled
+        # entirely by the resolution block instead of here, to avoid asking
+        # `gh pr list --state open` twice.
+        if ctx.pr_url:
+            merged = _check_pr_already_merged(ctx, logger)
+            if merged is not None:
+                _short_circuit_review_to_merged(
+                    ctx, logger, merged, state_queue, run_id, metrics, pending_summaries,
+                )
+                return
 
         # `ctx.pr_url`/`existing_branch` are only populated when this same
         # daemon process ran the dev worker that opened the PR — a restart, a
@@ -3089,6 +3148,18 @@ def run_review_worker(
         if not ctx.pr_url or not ctx.existing_branch:
             match = _find_pr_for_issue(ctx, logger)
             if match is None:
+                # No *open* PR either — before giving up, check whether one
+                # already merged (a re-opened issue with only a stale merged
+                # PR, or a restart that lost ctx.pr_url entirely). The open
+                # lookup above already ran, so an open PR would have won this
+                # check by construction — this can only fire when nothing
+                # open exists at all.
+                merged = _merged_pr_for_issue(ctx, logger)
+                if merged is not None:
+                    _short_circuit_review_to_merged(
+                        ctx, logger, merged, state_queue, run_id, metrics, pending_summaries,
+                    )
+                    return
                 raise RuntimeError(
                     f"No open PR found for issue #{ctx.number} — cannot review"
                 )
