@@ -1402,6 +1402,72 @@ def _find_pr_for_issue(ctx: IssueContext, logger: WorkerLogger) -> dict | None:
     return candidates[0]
 
 
+def _merged_pr_for_issue(ctx: IssueContext, logger: WorkerLogger) -> dict | None:
+    """Look up a *merged* PR for this issue.
+
+    `_find_pr_for_issue` lists only open PRs by design — it answers "what can
+    I review". This answers "was it already merged", which that query cannot
+    see, and whose absence produced an unbounded crash loop: no open PR ->
+    RuntimeError -> _labels_for_review_crash rewinds to ac-dev-review -> the
+    next poll re-queues the same review.
+    """
+    result = _run_cmd(
+        [
+            "gh", "pr", "list",
+            "--repo", f"{ctx.org}/{ctx.repo}",
+            "--state", "merged",
+            "--limit", "50",
+            "--json", "number,headRefName,url,body,title,updatedAt",
+        ],
+        logger=logger,
+        timeout=30,
+    )
+    if result.returncode != 0:
+        logger.warn(f"Failed to list merged PRs: {result.stderr.strip()}")
+        return None
+    try:
+        prs = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        logger.warn("Failed to parse `gh pr list --state merged` output")
+        return None
+
+    branch_prefix = f"ac/issue-{ctx.number}-"
+    candidates = _candidate_prs_for_issue(prs, ctx.number, branch_prefix)
+    return candidates[0] if candidates else None
+
+
+def _check_pr_already_merged(ctx: IssueContext, logger: WorkerLogger) -> dict | None:
+    """Return the merged PR for this issue, or None if there is nothing merged.
+
+    Never raises. An unreadable `gh` result returns None, which means the
+    review proceeds as normal — the worse failure is skipping a review that
+    should have happened, so this errs toward doing the work.
+    """
+    pr_number = _pr_number(ctx.pr_url)
+    if pr_number is not None:
+        result = _run_cmd(
+            [
+                "gh", "pr", "view", str(pr_number),
+                "--repo", f"{ctx.org}/{ctx.repo}",
+                "--json", "number,state,url,headRefName",
+            ],
+            logger=logger,
+            timeout=30,
+        )
+        if result.returncode != 0:
+            logger.warn(f"Could not read PR #{pr_number} state: {result.stderr.strip()}")
+            return None
+        try:
+            payload = json.loads(result.stdout)
+        except json.JSONDecodeError:
+            logger.warn(f"Could not parse PR #{pr_number} state")
+            return None
+        # `gh pr view` reports state in caps: OPEN / CLOSED / MERGED.
+        return payload if payload.get("state") == "MERGED" else None
+
+    return _merged_pr_for_issue(ctx, logger)
+
+
 def _cleanup_worktree(
     repo_dir: Path,
     worktree_dir: Path,
@@ -1831,6 +1897,17 @@ def _labels_for_review_crash(labels: list[str]) -> tuple[list[str], list[str]]:
     return stages.transition(labels, stages.REVIEW_TRIGGER)
 
 
+def _labels_for_review_merged(labels: list[str]) -> tuple[list[str], list[str]]:
+    """Add/remove when the PR under review has already merged.
+
+    Not a review verdict — there is nothing left to review — so this consumes
+    no attempt and bumps no counter. It is the same terminal the poller's
+    merge sweep writes; the review worker owns the write here because it holds
+    the lease on ac-review-in-progress.
+    """
+    return stages.transition(labels, "ac-merged")
+
+
 def _pr_number(pr_url: str | None) -> int | None:
     """Extract the PR number from a github.com/.../pull/N URL.
 
@@ -1881,6 +1958,15 @@ def _release_review_lock_after_crash(ctx: IssueContext, logger: WorkerLogger) ->
     labels = _get_issue_labels(ctx, logger)
     add, remove = _labels_for_review_crash(labels)
     _set_labels(ctx, logger, add=add, remove=remove)
+
+
+def _review_merged_labels(ctx: IssueContext, logger: WorkerLogger) -> None:
+    """Transition the issue to ac-merged when its PR turned out to be merged."""
+    labels = _get_issue_labels(ctx, logger)
+    add, remove = _labels_for_review_merged(labels)
+    _set_labels(ctx, logger, add=add, remove=remove)
+    _telemetry(ctx, logger, "merged", labels, stage="review",
+               pr=_pr_number(ctx.pr_url))
 
 
 def _set_labels(
@@ -2966,6 +3052,33 @@ def run_review_worker(
         # runner cannot double-claim this review. Inside the try so a lease
         # lost between spawn and here is fenced, not an unhandled crash.
         _claim_review_labels(ctx, logger)
+
+        # [1.5] Nothing to review if the PR already merged — a human merged
+        # before this review was picked up. Runs after the self-lock so the
+        # label write is fenced by the lease this worker holds, and before
+        # the PR *resolution* below, which lists only open PRs and would
+        # crash-loop on a merged one.
+        merged = _check_pr_already_merged(ctx, logger)
+        if merged is not None:
+            ctx.pr_url = merged.get("url") or ctx.pr_url
+            logger.info(
+                f"PR #{merged.get('number')} already merged — skipping review, "
+                f"-> ac-merged (Pending Release)"
+            )
+            _review_merged_labels(ctx, logger)
+            state_queue.put(StateUpdate(
+                issue_id=ctx.issue_id,
+                status="completed",
+                pr_url=ctx.pr_url,
+                run_id=run_id,
+                run_outcome="completed",
+                exit_code=returncode,
+                duration_seconds=metrics.duration_seconds,
+                cost_usd=metrics.cost_usd,
+                turns=metrics.turns,
+                summaries=pending_summaries or None,
+            ))
+            return
 
         # `ctx.pr_url`/`existing_branch` are only populated when this same
         # daemon process ran the dev worker that opened the PR — a restart, a

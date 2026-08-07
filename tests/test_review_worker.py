@@ -14,14 +14,17 @@ sibling toolchain leaves them unset).
 
 from __future__ import annotations
 
+import json
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import worker  # noqa: E402
+from logger import WorkerLogger  # noqa: E402
 from worker import (  # noqa: E402
     IssueContext,
     RunMetrics,
@@ -366,3 +369,181 @@ class TestRunReviewWorkerPrResolution:
         assert reviews == [], "must never approve or request-changes with no PR found"
         assert released == [ctx.issue_id], "the self-lock must be released"
         assert state_queue.items[-1].status == "failed"
+
+
+# ---------------------------------------------------------------------------
+# Merged-PR short-circuit (Task 4)
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def review_env(monkeypatch, tmp_path):
+    """Build a fully-stubbed `run_review_worker` environment.
+
+    Follows this file's existing convention (`_make_ctx`, `_FakeQueue`,
+    `_FakeCompleted`, `_FakeAbortEvent`, direct `monkeypatch.setattr(worker, ...)`
+    on the touchpoints `_stub_happy_path` already stubs) rather than
+    introducing a second fake style.
+
+    `_run_cmd` is faked at the same chokepoint the production code calls —
+    `_check_pr_already_merged` / `_merged_pr_for_issue` route `gh pr view` and
+    `gh pr list --state merged` through it for real, so a test asserting on
+    the result is exercising the actual implementation, not the fixture.
+    `_claim_review_labels` and `_get_issue_labels` are also left real (routed
+    through the same `_run_cmd` fake, answering `gh api ...` with an empty
+    label set) so the self-lock genuinely runs before the short-circuit.
+    """
+
+    def _make(*, pr_url=None, pr_view=None, merged_list=None, number=1, gh_fails=False):
+        ctx = _make_ctx(
+            tmp_path,
+            issue_id=f"repo#{number}",
+            number=number,
+            pr_url=pr_url,
+            existing_branch=f"ac/issue-{number}-x" if pr_url else None,
+        )
+        log_q = _FakeQueue()
+        state_q = _FakeQueue()
+        abort = _FakeAbortEvent()
+        logger = WorkerLogger(log_q, ctx.issue_id, ctx.color_name, ctx.color_code, ctx.repo)
+
+        env = SimpleNamespace(
+            ctx=ctx,
+            logger=logger,
+            log_q=log_q,
+            state_q=state_q,
+            abort=abort,
+            claude_invocations=0,
+            labels_added=[],
+            worktrees_created=[],
+        )
+        env.final_status = lambda: state_q.items[-1].status if state_q.items else None
+
+        def fake_run_cmd(args, **kwargs):
+            if gh_fails:
+                return _FakeCompleted(returncode=1, stderr="gh: boom")
+            if args[:3] == ["gh", "pr", "view"]:
+                return _FakeCompleted(returncode=0, stdout=json.dumps(pr_view or {}))
+            if args[:3] == ["gh", "pr", "list"] and "merged" in args:
+                return _FakeCompleted(returncode=0, stdout=json.dumps(merged_list or []))
+            if args[:3] == ["gh", "pr", "list"]:
+                return _FakeCompleted(returncode=0, stdout="[]")
+            if args[:2] == ["gh", "api"]:
+                return _FakeCompleted(returncode=0, stdout=json.dumps({"labels": []}))
+            return _FakeCompleted(returncode=0, stdout="")
+
+        monkeypatch.setattr(worker, "_run_cmd", fake_run_cmd)
+
+        def fake_set_labels(ctx, logger, add=None, remove=None):
+            if add:
+                env.labels_added.extend(add)
+
+        monkeypatch.setattr(worker, "_set_labels", fake_set_labels)
+
+        def fake_setup_worktree(ctx, repo_dir, worktree_dir, logger):
+            env.worktrees_created.append(worktree_dir)
+            return ctx.existing_branch
+
+        monkeypatch.setattr(worker, "_setup_review_worktree", fake_setup_worktree)
+        monkeypatch.setattr(worker, "_clone_or_fetch", lambda ctx, logger: Path("."))
+        monkeypatch.setattr(
+            worker, "_run_pipeline_checks", lambda ctx, worktree_dir, logger: (True, "ok")
+        )
+        monkeypatch.setattr(worker, "_get_issue_comments", lambda ctx, logger: [])
+        monkeypatch.setattr(worker, "_build_review_prompt", lambda *a, **k: "prompt")
+
+        def fake_run_claude(**kwargs):
+            env.claude_invocations += 1
+            return (0, "REVIEW_VERDICT: PASS", False, None, RunMetrics())
+
+        monkeypatch.setattr(worker, "_run_claude", fake_run_claude)
+        monkeypatch.setattr(worker, "_post_pr_review", lambda *a, **k: None)
+        monkeypatch.setattr(worker, "_write_crash_log", lambda *a, **k: None)
+        monkeypatch.setattr(worker, "_post_crash_comment", lambda *a, **k: (None, "crash body"))
+
+        return env
+
+    return _make
+
+
+class TestLabelsForReviewMerged:
+    def test_it_targets_ac_merged(self):
+        add, remove = worker._labels_for_review_merged(
+            ["ac-review-in-progress", "ac-pr-created"]
+        )
+        assert add == ["ac-merged"]
+        assert "ac-review-in-progress" in remove
+
+    def test_control_labels_are_preserved(self):
+        add, remove = worker._labels_for_review_merged(
+            ["ac-review-in-progress", "ac-pr-created", "ac-attempt-2"]
+        )
+        assert "ac-pr-created" not in remove
+        assert "ac-attempt-2" not in remove
+
+    def test_it_never_targets_ac_done(self):
+        add, _remove = worker._labels_for_review_merged(["ac-review-in-progress"])
+        assert "ac-done" not in add
+
+
+class TestCheckPrAlreadyMerged:
+    def test_a_merged_pr_on_ctx_is_detected(self, review_env):
+        env = review_env(pr_url="https://github.com/Org/repo/pull/341",
+                         pr_view={"number": 341, "state": "MERGED"})
+        assert worker._check_pr_already_merged(env.ctx, env.logger) is not None
+
+    def test_an_open_pr_on_ctx_returns_none(self, review_env):
+        env = review_env(pr_url="https://github.com/Org/repo/pull/341",
+                         pr_view={"number": 341, "state": "OPEN"})
+        assert worker._check_pr_already_merged(env.ctx, env.logger) is None
+
+    def test_a_closed_unmerged_pr_returns_none(self, review_env):
+        env = review_env(pr_url="https://github.com/Org/repo/pull/341",
+                         pr_view={"number": 341, "state": "CLOSED"})
+        assert worker._check_pr_already_merged(env.ctx, env.logger) is None
+
+    def test_with_no_pr_url_it_searches_merged_prs(self, review_env):
+        # _find_pr_for_issue lists only OPEN PRs, so a restart that lost
+        # ctx.pr_url could not see a merged PR at all — the exact path that
+        # produces the "No open PR found" crash loop.
+        env = review_env(pr_url=None, merged_list=[
+            {"number": 341, "headRefName": "ac/issue-268-attachments",
+             "url": "https://github.com/Org/repo/pull/341", "body": "", "title": ""},
+        ], number=268)
+        assert worker._check_pr_already_merged(env.ctx, env.logger) is not None
+
+    def test_a_gh_failure_returns_none_rather_than_raising(self, review_env):
+        env = review_env(pr_url="https://github.com/Org/repo/pull/341",
+                         gh_fails=True)
+        assert worker._check_pr_already_merged(env.ctx, env.logger) is None
+
+
+class TestReviewWorkerShortCircuit:
+    def test_a_merged_pr_skips_claude_entirely(self, review_env):
+        env = review_env(pr_url="https://github.com/Org/repo/pull/341",
+                         pr_view={"number": 341, "state": "MERGED"})
+        worker.run_review_worker(env.ctx, env.log_q, env.state_q, env.abort)
+        assert env.claude_invocations == 0
+
+    def test_a_merged_pr_sets_ac_merged(self, review_env):
+        env = review_env(pr_url="https://github.com/Org/repo/pull/341",
+                         pr_view={"number": 341, "state": "MERGED"})
+        worker.run_review_worker(env.ctx, env.log_q, env.state_q, env.abort)
+        assert "ac-merged" in env.labels_added
+
+    def test_a_merged_pr_never_creates_a_worktree(self, review_env):
+        env = review_env(pr_url="https://github.com/Org/repo/pull/341",
+                         pr_view={"number": 341, "state": "MERGED"})
+        worker.run_review_worker(env.ctx, env.log_q, env.state_q, env.abort)
+        assert env.worktrees_created == []
+
+    def test_a_merged_pr_reports_completed_not_failed(self, review_env):
+        env = review_env(pr_url="https://github.com/Org/repo/pull/341",
+                         pr_view={"number": 341, "state": "MERGED"})
+        worker.run_review_worker(env.ctx, env.log_q, env.state_q, env.abort)
+        assert env.final_status() == "completed"
+
+    def test_an_open_pr_still_reviews_as_before(self, review_env):
+        env = review_env(pr_url="https://github.com/Org/repo/pull/341",
+                         pr_view={"number": 341, "state": "OPEN"})
+        worker.run_review_worker(env.ctx, env.log_q, env.state_q, env.abort)
+        assert env.claude_invocations == 1
