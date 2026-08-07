@@ -240,6 +240,33 @@ class TestAbsentDbRowDoesNotBlankLocalState:
             gh_issues={"field_admin#50": _gh("ac-dev-ready", number=50)},
             harness_id="me", logger=_logger(),
         )
+        record = state.get("field_admin#50")
+        assert record.pr_url == "https://pr/50"
+        # GitHub-owned fields must still rebuild unconditionally from
+        # gh_issues in the preserve branch too — there are now three code
+        # paths past the `fields` dict instead of one, so this is no longer
+        # guaranteed just by reading reconcile.py.
+        assert record.labels == ["ac-dev-ready"]
+        assert record.mode == "dev"
+        assert record.action == "fix"
+        assert record.issue_updated_at == "2026-07-29T00:00:00+00:00"
+
+    def test_known_record_in_different_issue_from_the_only_db_row_is_still_preserved(self, tmp_path):
+        # Guards the per-issue keying itself: a regression back to whole-dict
+        # keying (`if db_rows:` / `if not db_rows:`, the exact mistake the
+        # brief calls out) would pass every other test in this class, since
+        # they all use db_rows={} — under whole-dict keying an empty dict and
+        # a non-empty dict with no row *for this issue* look identical to
+        # every test above. This test tells them apart: db_rows is non-empty,
+        # but the only row in it belongs to a different issue, so field_admin
+        # #50 must still be preserved from its local record, not blanked.
+        state = self._known_state(tmp_path)
+        db_rows = {"field_admin#999": _lease_row(None, None, pr_url="https://pr/other")}
+        reconcile(
+            state=state, db_rows=db_rows,
+            gh_issues={"field_admin#50": _gh("ac-dev-ready", number=50)},
+            harness_id="me", logger=_logger(),
+        )
         assert state.get("field_admin#50").pr_url == "https://pr/50"
 
     def test_known_record_keeps_branch_when_db_rows_is_empty(self, tmp_path):
