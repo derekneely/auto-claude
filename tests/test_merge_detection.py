@@ -19,7 +19,6 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-import stages  # noqa: E402
 from github_client import GithubClient, GithubClientError  # noqa: E402
 from poller import Poller  # noqa: E402
 from state import IssueRecord, IssueStatus, StateStore  # noqa: E402
@@ -91,9 +90,12 @@ class Env:
         self._issue_id = issue_id
         self.warnings = warnings
         self.errors = errors
+        self.queued: list[IssueRecord] = []
 
     def poll(self) -> None:
-        self._poller.poll()
+        new_issues, _retriage = self._poller.poll()
+        # What poll step 5 (main.py) would spawn a worker for on this tick.
+        self.queued = list(new_issues)
 
     def labels_now(self) -> set[str]:
         return set(self._client.label_set)
@@ -270,6 +272,76 @@ class TestClosedWithoutMerging:
         env.poll()
         env.poll()
         assert len([w for w in env.warnings if "closed without merging" in w]) == 1
+
+    def test_dev_review_with_a_closed_pr_is_not_queued_for_review(self, poller_env):
+        # "Leave it exactly where it is" is a no-op at ac-hitl, but NOT at
+        # ac-dev-review: that stage is REVIEW_TRIGGER, so falling through to
+        # the is_reviewable branch sets the record QUEUED and poll step 5
+        # spawns an Opus review worker against a PR a human deliberately
+        # closed — every 60s, forever, because nothing ever changes the
+        # label. The sweep must claim the issue for this tick instead.
+        env = poller_env(stage="ac-dev-review", pr_state=CLOSED,
+                         status=IssueStatus.COMPLETED, mode="dev")
+        env.poll()
+        assert env.record().status != IssueStatus.QUEUED
+        assert env.queued == []
+
+    def test_dev_review_with_a_closed_pr_still_leaves_the_label_alone(self, poller_env):
+        # Containment, not a verdict: no rewind, no ac-done, no close. The
+        # human who closed the PR decides what happens next.
+        env = poller_env(stage="ac-dev-review", pr_state=CLOSED,
+                         status=IssueStatus.COMPLETED, mode="dev")
+        env.poll()
+        assert "ac-dev-review" in env.labels_now()
+        assert "ac-merged" not in env.labels_now()
+        assert "ac-done" not in env.labels_now()
+        assert env.close_calls == []
+
+    def test_it_stays_unqueued_across_repeated_polls(self, poller_env):
+        # The failure this guards is a per-tick spawn loop, so one tick is
+        # not enough evidence.
+        env = poller_env(stage="ac-dev-review", pr_state=CLOSED,
+                         status=IssueStatus.COMPLETED, mode="dev")
+        env.poll()
+        env.poll()
+        env.poll()
+        assert env.record().status != IssueStatus.QUEUED
+        assert env.queued == []
+
+    def test_an_open_pr_at_dev_review_is_still_queued_for_review(self, poller_env):
+        # Control: the containment must be specific to a *confirmed* closed
+        # PR. An open PR at ac-dev-review is exactly what reviews exist for.
+        env = poller_env(stage="ac-dev-review", pr_state=OPEN,
+                         status=IssueStatus.COMPLETED, mode="dev")
+        env.poll()
+        assert env.record().status == IssueStatus.QUEUED
+
+    def test_an_unreadable_pr_at_dev_review_is_still_queued_for_review(self, poller_env):
+        # Control: "could not ask" is not "confirmed closed". A gh failure
+        # must leave the ordinary review path alone rather than silently
+        # suppressing reviews for the duration of a GitHub hiccup.
+        env = poller_env(stage="ac-dev-review", pr_state=GithubClientError("boom"),
+                         status=IssueStatus.COMPLETED, mode="dev")
+        env.poll()
+        assert env.record().status == IssueStatus.QUEUED
+
+
+class TestTheSweepNeverRaises:
+    """`_check_merged`'s docstring promises "Never raises", but only
+    `GithubClientError` is caught. A malformed `get_pr_state` payload would
+    raise KeyError out of `_check_merged`, past `poll()`'s
+    `except GithubClientError`, and stall the whole 60s loop.
+    """
+
+    def test_a_payload_missing_merged_does_not_raise(self, poller_env):
+        env = poller_env(stage="ac-hitl", pr_state={"number": 341})
+        env.poll()  # must not raise
+        assert "ac-merged" not in env.labels_now()
+
+    def test_a_payload_missing_state_does_not_raise(self, poller_env):
+        env = poller_env(stage="ac-hitl", pr_state={"number": 341, "merged": False})
+        env.poll()  # must not raise
+        assert "ac-hitl" in env.labels_now()
 
 
 class TestFailureIsNeverFatal:

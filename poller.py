@@ -89,6 +89,10 @@ class Poller:
             # Release"). This MUST run before the is_terminal guard below —
             # ac-hitl is itself terminal, so a check placed after it would
             # never see the stage where most merges happen.
+            #
+            # It also claims (without writing anything) an issue whose PR was
+            # confirmed closed without merging, so a closed PR at
+            # ac-dev-review cannot be re-queued for review on every tick.
             if self._check_merged(repo, issue, label_names, issue_id):
                 continue
 
@@ -272,12 +276,24 @@ class Poller:
     ) -> bool:
         """Advance `issue_id` to ac-merged if its PR has merged.
 
-        Returns True when the issue was advanced, meaning the caller should
-        skip it for the rest of this poll.
+        Returns True when this poll is done with the issue and the caller
+        must skip every remaining branch for it. That covers two cases:
 
-        Never raises: a GitHub failure here must not stall the poll loop, and
-        must never advance an issue on incomplete information. Both failure
-        paths return False, which simply means "try again next tick".
+        1. The PR merged and the issue was advanced to ac-merged.
+        2. The PR was **confirmed closed without merging**. Nothing is
+           written — the label stays exactly where it is, for a human — but
+           the issue still has to be claimed for this tick. At ac-hitl
+           "leave it where it is" is genuinely inert, but ac-dev-review is
+           REVIEW_TRIGGER: falling through would set the record QUEUED and
+           poll step 5 would spawn an Opus review worker against a PR a
+           human deliberately closed, on every 60s tick, forever.
+
+        Never raises. A GitHub failure, and any payload this cannot read,
+        return False — "could not ask" must never be read as either "merged"
+        or "closed", so an unreadable answer leaves the ordinary paths
+        untouched and simply tries again next tick. Every field read off the
+        `get_pr_state` payload uses `.get()` for that reason: a KeyError here
+        would escape `poll()`'s `except GithubClientError` and stall the loop.
         """
         if stages.stage_of(label_names) not in stages.MERGE_WATCH:
             return False
@@ -295,14 +311,25 @@ class Poller:
             self._logger.warn(f"Could not check PR state for {issue_id}: {exc}")
             return False
 
-        if not pr["merged"]:
-            if pr["state"] == "closed" and issue_id not in self._warned_closed:
+        if not pr.get("merged"):
+            if pr.get("state") != "closed":
+                # Open, or a payload that does not say. Either way this is
+                # not a decision — leave every other branch of the poll to
+                # handle the issue exactly as it would have.
+                return False
+
+            if issue_id not in self._warned_closed:
                 self._warned_closed.add(issue_id)
                 self._logger.warn(
                     f"{issue_id}: PR #{pr_number} was closed without merging — "
                     f"leaving it at {stages.stage_of(label_names)} for a human"
                 )
-            return False
+            # Claim the issue for this tick without writing anything. A human
+            # closing a PR is an explicit decision, so the label stays put and
+            # no rewind, no ac-done and no close happens — but the issue must
+            # not fall through to the is_reviewable branch and be re-queued
+            # for a review of a dead branch on every tick from now on.
+            return True
 
         # Labels first. A record moved to COMPLETED whose label still reads
         # ac-hitl would never be swept again, so the durable half must land
