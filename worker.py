@@ -1405,11 +1405,31 @@ def _prs_for_issue(
         return None
 
 
+class PrLookupUnavailable(Exception):
+    """The open-PR query could not be answered — not "no open PR exists".
+
+    `_prs_for_issue` distinguishes those two outcomes; this exception carries
+    the distinction out to callers that would otherwise collapse it back into
+    a bare `None`. Collapsing it is not a cosmetic loss: the merged-PR
+    fallback downstream reads "no open PR" as licence to look for a merged
+    one, so a single failed `gh pr list --state open` (a secondary rate
+    limit, one 502) could hand an unreviewed PR a terminal ac-merged label on
+    a daemon nobody is watching.
+
+    The right response is always "ask again next tick", never "guess".
+    """
+
+
 def _find_pr_for_issue(ctx: IssueContext, logger: WorkerLogger) -> dict | None:
     """Look up the open PR for this issue via `gh`, when ctx carries none.
 
-    Returns None (not an exception) when no open PR matches — the caller
-    treats that as "cannot review yet", not a crash.
+    Returns None (not an exception) when the query succeeded and no open PR
+    matched — the caller treats that as "cannot review yet", not a crash.
+
+    Raises `PrLookupUnavailable` when the query itself could not be answered.
+    That is deliberately not `None`: the two mean opposite things to every
+    caller, and every caller must handle "could not ask" by retrying rather
+    than by inferring anything about what exists.
     """
     prs = _prs_for_issue(
         ctx, logger, state="open",
@@ -1417,7 +1437,9 @@ def _find_pr_for_issue(ctx: IssueContext, logger: WorkerLogger) -> dict | None:
         parse_fail_msg="Failed to parse `gh pr list` output during review lookup",
     )
     if prs is None:
-        return None
+        raise PrLookupUnavailable(
+            f"Could not list open PRs for issue #{ctx.number} — retrying next tick"
+        )
 
     branch_prefix = f"ac/issue-{ctx.number}-"
     candidates = _candidate_prs_for_issue(prs, ctx.number, branch_prefix)
@@ -1506,7 +1528,17 @@ def _check_pr_already_merged(ctx: IssueContext, logger: WorkerLogger) -> dict | 
         # `gh pr view` reports state in caps: OPEN / CLOSED / MERGED.
         return payload if payload.get("state") == "MERGED" else None
 
-    if _find_pr_for_issue(ctx, logger) is not None:
+    try:
+        open_pr = _find_pr_for_issue(ctx, logger)
+    except PrLookupUnavailable as exc:
+        # "Could not ask" is not "nothing open exists". Falling through to
+        # `_merged_pr_for_issue` here would let one failed open-PR query
+        # promote a stale merged PR for the same issue number into a merged
+        # verdict — and this function's answer short-circuits the review and
+        # writes a terminal label. Never guess merged; try again next tick.
+        logger.warn(f"{exc} — not checking for a merged PR on an unanswered lookup")
+        return None
+    if open_pr is not None:
         return None
     return _merged_pr_for_issue(ctx, logger)
 
@@ -3156,6 +3188,15 @@ def run_review_worker(
         # issue number in that case rather than assuming there's nothing to
         # review; prefer the free/exact values already on ctx when present.
         if not ctx.pr_url or not ctx.existing_branch:
+            # `_find_pr_for_issue` raises PrLookupUnavailable when the query
+            # could not be answered at all, and that exception is deliberately
+            # NOT caught here: it must reach the handler below, which reports
+            # the run failed and releases the self-lock without consuming an
+            # attempt, so the next poll simply asks again. The one thing that
+            # must never happen on an unanswered lookup is falling into the
+            # merged-PR fallback a few lines down and terminalizing the issue
+            # at ac-merged on a stale match. A returned None, by contrast,
+            # means the query *did* answer and nothing open matched.
             match = _find_pr_for_issue(ctx, logger)
             if match is None:
                 # No open PR matched by issue-number lookup. The merged-PR

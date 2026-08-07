@@ -400,7 +400,8 @@ def review_env(monkeypatch, tmp_path):
     """
 
     def _make(*, pr_url=None, pr_view=None, merged_list=None, open_list=None,
-              number=1, gh_fails=False, existing_branch=_UNSET):
+              number=1, gh_fails=False, existing_branch=_UNSET,
+              open_list_fails=False):
         if existing_branch is _UNSET:
             # Default: a PR URL normally arrives together with its branch
             # (both are set by the same dev-worker run). `existing_branch`
@@ -440,6 +441,15 @@ def review_env(monkeypatch, tmp_path):
             if args[:3] == ["gh", "pr", "list"] and "merged" in args:
                 return _FakeCompleted(returncode=0, stdout=json.dumps(merged_list or []))
             if args[:3] == ["gh", "pr", "list"]:
+                # `open_list_fails` models the asymmetric transient: the
+                # open-PR query fails (a secondary rate limit, a single 502)
+                # while the merged-PR query above succeeds. `gh_fails` cannot
+                # express that — it fails everything — and the asymmetry is
+                # exactly what turns "could not ask" into a wrong terminal.
+                if open_list_fails:
+                    return _FakeCompleted(
+                        returncode=1, stderr="gh: API rate limit exceeded"
+                    )
                 return _FakeCompleted(returncode=0, stdout=json.dumps(open_list or []))
             if args[:2] == ["gh", "api"]:
                 return _FakeCompleted(returncode=0, stdout=json.dumps({"labels": []}))
@@ -549,6 +559,88 @@ class TestCheckPrAlreadyMerged:
             ],
         )
         assert worker._check_pr_already_merged(env.ctx, env.logger) is None
+
+
+class TestAFailedOpenLookupIsNeverReadAsNothingOpen:
+    """"Could not ask" must never become "nothing open exists".
+
+    `_prs_for_issue` returns None (not []) on a `gh` non-zero exit or a JSON
+    parse failure precisely so a caller can tell the two apart. Both consumers
+    used to discard that distinction, and the consequence was a *wrong
+    terminal label*: at 3am, `ctx.pr_url` unset (a restart, a human-applied
+    ac-dev-review, or a sibling-toolchain PR), `gh pr list --state open`
+    returns non-zero on a secondary rate limit, `gh pr list --state merged`
+    succeeds and matches a stale merged PR for the same issue number — and an
+    unreviewed open PR gets written ac-merged, unattended.
+
+    Retrying next tick is the correct outcome for a transient failure.
+    """
+
+    _STALE_MERGED = [
+        {"number": 340, "headRefName": "ac/issue-268-old-attempt",
+         "url": "https://github.com/Org/repo/pull/340", "body": "", "title": ""},
+    ]
+
+    def test_the_helper_returns_none_rather_than_the_stale_merged_pr(self, review_env):
+        env = review_env(pr_url=None, number=268, open_list_fails=True,
+                         merged_list=self._STALE_MERGED)
+        assert worker._check_pr_already_merged(env.ctx, env.logger) is None
+
+    def test_a_failed_open_lookup_never_queries_merged_prs_at_all(self, review_env):
+        # Not just "returns None" — it must not even ask. Asking and then
+        # discarding the answer is one refactor away from using it.
+        env = review_env(pr_url=None, number=268, open_list_fails=True,
+                         merged_list=self._STALE_MERGED)
+        seen: list[list[str]] = []
+        real_run_cmd = worker._run_cmd
+
+        def recording_run_cmd(args, **kwargs):
+            seen.append(list(args))
+            return real_run_cmd(args, **kwargs)
+
+        worker._run_cmd = recording_run_cmd
+        try:
+            worker._check_pr_already_merged(env.ctx, env.logger)
+        finally:
+            worker._run_cmd = real_run_cmd
+        assert not any("merged" in args for args in seen)
+
+    def test_find_pr_for_issue_signals_unavailable_rather_than_no_match(self, review_env):
+        # The distinction has to survive at the seam itself, because the
+        # resolution block in run_review_worker is the second consumer.
+        env = review_env(pr_url=None, number=268, open_list_fails=True)
+        with pytest.raises(worker.PrLookupUnavailable):
+            worker._find_pr_for_issue(env.ctx, env.logger)
+
+    def test_an_empty_open_list_is_still_plain_no_match(self, review_env):
+        # The narrowing must not swallow the ordinary case: an open-PR query
+        # that succeeds and matches nothing still means "nothing open".
+        env = review_env(pr_url=None, number=268, open_list=[])
+        assert worker._find_pr_for_issue(env.ctx, env.logger) is None
+
+    def test_the_resolution_block_does_not_terminalize_the_issue(self, review_env):
+        # End-to-end: the whole worker entry point, not just the helper.
+        # Before the fix this run ended `completed` at ac-merged.
+        env = review_env(pr_url=None, number=268, open_list_fails=True,
+                         merged_list=self._STALE_MERGED)
+        worker.run_review_worker(env.ctx, env.log_q, env.state_q, env.abort)
+        assert "ac-merged" not in env.labels_added
+        assert env.claude_invocations == 0
+        # The existing crash-and-retry path: the lock is released without
+        # consuming an attempt and the next poll tries again.
+        assert env.final_status() == "failed"
+
+    def test_an_open_lookup_that_succeeds_and_matches_still_reviews(self, review_env):
+        # Control: the narrowing changes nothing when `gh` answers.
+        env = review_env(
+            pr_url=None, number=268,
+            open_list=[
+                {"number": 341, "headRefName": "ac/issue-268-attachments",
+                 "url": "https://github.com/Org/repo/pull/341", "body": "", "title": ""},
+            ],
+        )
+        worker.run_review_worker(env.ctx, env.log_q, env.state_q, env.abort)
+        assert env.claude_invocations == 1
 
 
 class TestReviewWorkerShortCircuit:
