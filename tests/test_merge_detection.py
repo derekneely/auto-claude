@@ -83,12 +83,14 @@ class Env:
     """Drives one `Poller.poll()` and exposes the fake's recorded state."""
 
     def __init__(self, poller: Poller, client: FakeMergeClient,
-                 state: StateStore, issue_id: str, warnings: list[str]) -> None:
+                 state: StateStore, issue_id: str, warnings: list[str],
+                 errors: list[str]) -> None:
         self._poller = poller
         self._client = client
         self._state = state
         self._issue_id = issue_id
         self.warnings = warnings
+        self.errors = errors
 
     def poll(self) -> None:
         self._poller.poll()
@@ -167,14 +169,15 @@ def poller_env(tmp_path):
             state.save()
 
         warnings: list[str] = []
+        errors: list[str] = []
         logger = SimpleNamespace(
             info=lambda *a, **k: None,
             warn=lambda msg, *a, **k: warnings.append(msg),
-            error=lambda *a, **k: None,
+            error=lambda msg, *a, **k: errors.append(msg),
         )
 
         poller = Poller(make_config(), client, state, logger)
-        return Env(poller, client, state, issue_id, warnings)
+        return Env(poller, client, state, issue_id, warnings, errors)
 
     return _make
 
@@ -274,6 +277,10 @@ class TestFailureIsNeverFatal:
         env = poller_env(stage="ac-hitl", pr_state=GithubClientError("boom"))
         env.poll()  # must not raise
         assert "ac-merged" not in env.labels_now()
+        # Pins the get_pr_state try/except itself: without it, the exception
+        # would propagate up to Poller.poll()'s own try/except (poller.py
+        # :48-49), which routes it to logger.error, not logger.warn.
+        assert env.errors == []
 
     def test_a_gh_error_still_warns(self, poller_env):
         env = poller_env(stage="ac-hitl", pr_state=GithubClientError("boom"))
@@ -287,6 +294,10 @@ class TestFailureIsNeverFatal:
                          status=IssueStatus.QUEUED, label_write_fails=True)
         env.poll()
         assert env.record().status == IssueStatus.QUEUED
+        # Pins the add_label/remove_label try/except itself: without it, the
+        # error would propagate to Poller.poll()'s outer try/except instead
+        # of being caught and warned about here.
+        assert any("Could not advance" in w for w in env.warnings)
 
 
 class TestTheHumanPrerogatives:
