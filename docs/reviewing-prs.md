@@ -29,14 +29,48 @@ ac-pending-review -> ac-dev-ready -> ac-in-progress -> ac-dev-review
 `ac-hitl` is in `stages.TERMINAL` — auto-claude **stops touching the issue**
 once it lands there. It is not a failure state; it means the agent review
 passed (build green, acceptance criteria met, no blocking security finding)
-and the PR is waiting on you. Once you merge the PR, auto-claude's poller
-notices within one poll interval and moves the issue to `ac-merged`
-("Pending Release") itself — you do not set that label. Only `ac-done`, at
-release time, is set by a human.
+and the PR is waiting on you. Only `ac-done`, at release time, is set by a
+human.
+
+### Merging: automatic, with one precondition
+
+Once you merge the PR, auto-claude's poller normally notices within one poll
+interval and moves the issue to `ac-merged` ("Pending Release") itself.
+
+**The precondition:** the sweep only runs for an issue whose local state
+record still carries the PR's URL (`poller.py`, `_check_merged`). Usually it
+does — the dev worker that opened the PR recorded it. But it can be missing:
+
+- the issue's PR was opened by a human or by the sibling `/loop` toolchain, so
+  auto-claude has no record of it at all; or
+- the record was rebuilt at startup from a state store that no longer had the
+  URL (`reconcile.py` re-reads `pr_url` from the shared database on every
+  reconciliation, so an unreachable row blanks a good local value).
+
+At `ac-dev-review` that gap is covered anyway: the review worker relocates the
+PR from the issue number and short-circuits to `ac-merged` itself. **At
+`ac-hitl` there is no such cover** — the stage is terminal, so no worker ever
+runs and nothing else will look again.
+
+So: if the board card has not moved to **Pending Release** within a couple of
+poll intervals after you merged, nothing is coming. Set the label by hand:
+
+```powershell
+gh issue edit <n> --repo Accelevation/field_admin `
+  --add-label ac-merged --remove-label ac-hitl
+```
+
+Leave the issue **open** — `ac-merged` means pending release, and closing it
+is part of the human `ac-done` step.
+
+### Closing a PR without merging
 
 If a PR tied to an `ac-dev-review` or `ac-hitl` issue is closed **without**
-merging, the poller logs one warning and leaves the issue at its current
-stage — it does not guess, so a human decides what happens next.
+merging, auto-claude logs one warning per daemon run and leaves the issue at
+its current stage — it does not rewind, does not set `ac-done`, and does not
+close anything. It also stops re-queueing that issue for review, so a closed
+PR does not cost an agent run per poll. Nothing further will happen until a
+human moves the label.
 
 So: **anything at `ac-hitl` is your queue.**
 
@@ -67,7 +101,8 @@ Two consequences worth knowing:
 
 - **Merging into `dev` will not close the issue**, `Closes #N` or not, and
   nothing in auto-claude ever calls the close API. The poller advances the
-  label to `ac-merged` automatically once it sees the PR merged. Setting
+  label to `ac-merged` automatically once it sees the PR merged, provided it
+  still knows that issue's PR URL (see the precondition above). Setting
   `ac-done` and closing the issue at release time both stay manual, human
   steps.
 - To check merge state from an issue number:
@@ -169,10 +204,14 @@ use the persistent worktree for everyday review, since it skips a full
 gh pr merge 334 --repo Accelevation/field_admin --squash
 ```
 
-Merging does **not** close the issue, `Closes #<n>` or not — see above. There
-is nothing left to do here: auto-claude notices the merge on its next poll
-(within one interval) and moves the issue to `ac-merged` itself. Set
-`ac-done` yourself once the change is released.
+Merging does **not** close the issue, `Closes #<n>` or not — see above.
+auto-claude normally notices the merge on its next poll and moves the issue to
+`ac-merged` itself, so there is usually nothing left to do. **Confirm the card
+reached Pending Release**: that advance depends on auto-claude still knowing
+the PR URL for the issue, which is not guaranteed at `ac-hitl` — see
+[Merging: automatic, with one precondition](#merging-automatic-with-one-precondition)
+for when to set `ac-merged` by hand. Set `ac-done` yourself once the change is
+released.
 
 **Send back** — comment what is wrong and set the issue to `ac-dev-ready` with
 the attempt label bumped. The poller picks it up and a dev worker reworks the
