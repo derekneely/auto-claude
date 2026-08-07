@@ -16,7 +16,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from state import IssueRecord, IssueStatus, StateStore  # noqa: E402
+from state import IssueRecord, IssueStatus, StateStore, VALID_TRANSITIONS  # noqa: E402
 
 
 def _record(issue_id="r#1", status=IssueStatus.DISCOVERED):
@@ -92,3 +92,22 @@ class TestSaveIsUntouched:
         seen.clear()
         store.save()
         assert seen == []
+
+
+class TestQueuedCanCompleteOnAnExternalMerge:
+    def test_queued_may_transition_to_completed(self):
+        # A merge is a completion that arrives without the issue ever passing
+        # through IN_PROGRESS — the review worker never ran because the human
+        # merged first. Without this, poll step 5 would keep spawning a review
+        # worker for a record whose label already says ac-merged.
+        assert IssueStatus.COMPLETED in VALID_TRANSITIONS[IssueStatus.QUEUED]
+
+    def test_queued_to_completed_is_accepted_by_the_store(self, tmp_path):
+        store = StateStore(tmp_path / "issues.json")
+        store.add(_record(status=IssueStatus.QUEUED))
+        store.transition("r#1", IssueStatus.COMPLETED)
+        assert store.get("r#1").status == IssueStatus.COMPLETED
+
+    def test_queued_to_needs_info_is_still_rejected(self):
+        # The widening is narrow on purpose — only COMPLETED was added.
+        assert IssueStatus.NEEDS_INFO not in VALID_TRANSITIONS[IssueStatus.QUEUED]

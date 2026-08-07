@@ -262,6 +262,25 @@ class TestAttempts:
         assert stages.attempts_exhausted(["ac-attempt-3", "ac-attempt-2"])
 
 
+class TestMergeWatch:
+    def test_merge_watch_holds_exactly_the_two_human_facing_stages(self):
+        assert stages.MERGE_WATCH == frozenset({"ac-dev-review", "ac-hitl"})
+
+    def test_locked_stages_are_never_watched(self):
+        # A lease holder owns the label write on a locked stage; main sweeping
+        # it would race the worker's own fenced write at the end of its run.
+        assert not (stages.MERGE_WATCH & stages.LOCKED)
+
+    def test_merge_watch_never_includes_ac_merged_itself(self):
+        # Re-sweeping an already-merged issue would re-write the same label
+        # every 60s forever.
+        assert "ac-merged" not in stages.MERGE_WATCH
+
+    def test_every_watched_stage_is_a_real_stage_label(self):
+        for label in stages.MERGE_WATCH:
+            assert label in stages.STAGE_LABELS
+
+
 class TestTransition:
     """Label add/remove sets. Exactly one stage label must survive."""
 

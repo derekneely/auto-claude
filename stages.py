@@ -56,6 +56,16 @@ TERMINAL = frozenset({"ac-hitl", "ac-merged", "ac-done", "ac-blocked"})
 # A stage owned by a runner that is actively working. Not ours to touch.
 LOCKED = frozenset({"ac-in-progress", "ac-review-in-progress"})
 
+# Stages where a merged PR should advance the issue to ac-merged, swept by
+# `Poller._poll_repo`. Deliberately excludes every member of LOCKED: a lease
+# holder owns the label write there, and `main` sweeping it would race the
+# worker's own fenced write. The review worker handles its own stage itself.
+#
+# `ac-dev-review` is watched, not just `ac-hitl`, because a human routinely
+# merges before the review worker ever picks the issue up — and a merged PR
+# cannot be usefully reviewed.
+MERGE_WATCH = frozenset({"ac-dev-review", "ac-hitl"})
+
 # Where a stale lock rewinds to. Mirrors the sibling planner's stale-lock reset
 # mapping so a lock left by either runner recovers to the same place.
 STALE_RESET: dict[str, str] = {

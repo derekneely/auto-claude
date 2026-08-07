@@ -42,7 +42,12 @@ VALID_TRANSITIONS: dict[str, list[str]] = {
     IssueStatus.DISCOVERED:  [IssueStatus.TRIAGING, IssueStatus.SKIPPED],
     IssueStatus.TRIAGING:    [IssueStatus.QUEUED, IssueStatus.NEEDS_INFO, IssueStatus.SKIPPED],
     IssueStatus.NEEDS_INFO:  [IssueStatus.TRIAGING, IssueStatus.QUEUED, IssueStatus.SKIPPED],
-    IssueStatus.QUEUED:      [IssueStatus.IN_PROGRESS, IssueStatus.SKIPPED],
+    # COMPLETED is reachable from QUEUED only via an external event: the PR
+    # merged before a worker ever claimed the issue (see stages.MERGE_WATCH).
+    # Without it, the merge sweep could relabel an issue to ac-merged while
+    # its record stayed QUEUED, and poll step 5 would spawn a review worker
+    # against a merged PR on the very same tick.
+    IssueStatus.QUEUED:      [IssueStatus.IN_PROGRESS, IssueStatus.COMPLETED, IssueStatus.SKIPPED],
     IssueStatus.IN_PROGRESS: [IssueStatus.COMPLETED, IssueStatus.FAILED, IssueStatus.INTERRUPTED, IssueStatus.SKIPPED],
     IssueStatus.FAILED:      [IssueStatus.QUEUED, IssueStatus.DISCOVERED, IssueStatus.SKIPPED],
     IssueStatus.INTERRUPTED: [IssueStatus.QUEUED, IssueStatus.DISCOVERED, IssueStatus.SKIPPED],
