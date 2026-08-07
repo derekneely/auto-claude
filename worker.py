@@ -15,6 +15,7 @@ from multiprocessing import Event, Queue
 from pathlib import Path
 
 import stages
+from github_client import pr_number_from_url
 from db.harness import Harness
 from db.journal import NullJournal
 from db.pool import Database
@@ -1831,11 +1832,12 @@ def _labels_for_review_crash(labels: list[str]) -> tuple[list[str], list[str]]:
 
 
 def _pr_number(pr_url: str | None) -> int | None:
-    """Extract the PR number from a github.com/.../pull/N URL."""
-    if not pr_url:
-        return None
-    tail = pr_url.rstrip("/").rsplit("/", 1)[-1]
-    return int(tail) if tail.isdigit() else None
+    """Extract the PR number from a github.com/.../pull/N URL.
+
+    Delegates to `github_client.pr_number_from_url` so the poller and the
+    worker cannot drift on what counts as a PR URL.
+    """
+    return pr_number_from_url(pr_url)
 
 
 def _claim_review_labels(ctx: IssueContext, logger: WorkerLogger) -> None:

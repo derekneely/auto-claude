@@ -21,6 +21,19 @@ class GithubClientError(Exception):
         self.stderr = stderr
 
 
+def pr_number_from_url(pr_url: str | None) -> int | None:
+    """Extract the PR number from a github.com/.../pull/N URL.
+
+    Lives here rather than in `worker` so `poller` can use it without
+    importing the worker module — that import would pull the whole
+    multiprocessing worker stack into the poll path.
+    """
+    if not pr_url:
+        return None
+    tail = pr_url.rstrip("/").rsplit("/", 1)[-1]
+    return int(tail) if tail.isdigit() else None
+
+
 class GithubClient:
     """Wraps the gh CLI to interact with GitHub."""
 
@@ -254,6 +267,22 @@ class GithubClient:
     def get_pr_review_comments(self, repo: str, pr_number: int) -> list[dict]:
         """Return all inline review comments on a pull request."""
         return self._gh_api(f"/repos/{self.org}/{repo}/pulls/{pr_number}/comments")
+
+    def get_pr_state(self, repo: str, pr_number: int) -> dict:
+        """Return a PR's merge state.
+
+        Uses `/pulls/{n}` rather than `/issues/{n}`: the issues endpoint
+        serves pull requests too, but omits the `merged` boolean, and this
+        caller must never infer a merge from `state == "closed"` — a PR
+        closed without merging looks identical there.
+        """
+        payload = self._gh_api(f"/repos/{self.org}/{repo}/pulls/{pr_number}")
+        return {
+            "number": payload.get("number", pr_number),
+            "state": payload.get("state", ""),
+            "merged": bool(payload.get("merged", False)),
+            "merged_at": payload.get("merged_at"),
+        }
 
     def clone_repo(self, repo: str, target_dir: Path) -> None:
         """Clone a repository to target_dir (longer timeout for large repos)."""
