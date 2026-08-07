@@ -1473,6 +1473,16 @@ def _check_pr_already_merged(ctx: IssueContext, logger: WorkerLogger) -> dict | 
     (a re-opened issue, a superseded branch) and a newer open one, and the
     open PR is always the one that still needs reviewing. Only when no open
     PR exists do we fall back to asking whether one was already merged.
+
+    `run_review_worker`'s only call site guards this function on
+    `if ctx.pr_url:`, so in production the no-`pr_url` branch below runs only
+    for the edge case of a `ctx.pr_url` that fails to parse (see
+    `_pr_number`) — not for the common "not yet populated" case, which
+    `run_review_worker` now resolves itself via `_find_pr_for_issue` /
+    `_merged_pr_for_issue` directly, to avoid double-querying `gh pr list
+    --state open` (see the comment at that call site). The branch stays here,
+    correct and exercised by `TestCheckPrAlreadyMerged`'s no-`pr_url` cases,
+    for any future caller that queries with `pr_url` unset from the start.
     """
     pr_number = _pr_number(ctx.pr_url)
     if pr_number is not None:
@@ -3148,18 +3158,24 @@ def run_review_worker(
         if not ctx.pr_url or not ctx.existing_branch:
             match = _find_pr_for_issue(ctx, logger)
             if match is None:
-                # No *open* PR either — before giving up, check whether one
-                # already merged (a re-opened issue with only a stale merged
-                # PR, or a restart that lost ctx.pr_url entirely). The open
-                # lookup above already ran, so an open PR would have won this
-                # check by construction — this can only fire when nothing
-                # open exists at all.
-                merged = _merged_pr_for_issue(ctx, logger)
-                if merged is not None:
-                    _short_circuit_review_to_merged(
-                        ctx, logger, merged, state_queue, run_id, metrics, pending_summaries,
-                    )
-                    return
+                # No open PR matched by issue-number lookup. The merged-PR
+                # fallback is gated on `not ctx.pr_url` deliberately: when
+                # ctx.pr_url IS set (only existing_branch was missing), the
+                # [1.5] block above already asked `gh pr view` about this
+                # exact PR and got back "not merged" — that confirmed-open
+                # PR must never be overridden by an unrelated stale merged
+                # match just because _find_pr_for_issue's branch/body
+                # heuristics didn't relocate its branch name. Only when
+                # ctx.pr_url was never known at all is "no open PR matched"
+                # actually ambiguous between "nothing exists" and "it merged".
+                if not ctx.pr_url:
+                    merged = _merged_pr_for_issue(ctx, logger)
+                    if merged is not None:
+                        _short_circuit_review_to_merged(
+                            ctx, logger, merged, state_queue, run_id, metrics,
+                            pending_summaries,
+                        )
+                        return
                 raise RuntimeError(
                     f"No open PR found for issue #{ctx.number} — cannot review"
                 )

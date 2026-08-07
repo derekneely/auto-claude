@@ -375,6 +375,9 @@ class TestRunReviewWorkerPrResolution:
 # Merged-PR short-circuit (Task 4)
 # ---------------------------------------------------------------------------
 
+_UNSET = object()
+
+
 @pytest.fixture
 def review_env(monkeypatch, tmp_path):
     """Build a fully-stubbed `run_review_worker` environment.
@@ -397,13 +400,20 @@ def review_env(monkeypatch, tmp_path):
     """
 
     def _make(*, pr_url=None, pr_view=None, merged_list=None, open_list=None,
-              number=1, gh_fails=False):
+              number=1, gh_fails=False, existing_branch=_UNSET):
+        if existing_branch is _UNSET:
+            # Default: a PR URL normally arrives together with its branch
+            # (both are set by the same dev-worker run). `existing_branch`
+            # can still be forced to None explicitly — e.g. to reproduce a
+            # ctx.pr_url set by a human/sibling-toolchain PR whose branch
+            # was never recorded, which is a real, separately-handled case.
+            existing_branch = f"ac/issue-{number}-x" if pr_url else None
         ctx = _make_ctx(
             tmp_path,
             issue_id=f"repo#{number}",
             number=number,
             pr_url=pr_url,
-            existing_branch=f"ac/issue-{number}-x" if pr_url else None,
+            existing_branch=existing_branch,
         )
         log_q = _FakeQueue()
         state_q = _FakeQueue()
@@ -618,3 +628,35 @@ class TestReviewWorkerShortCircuit:
         worker.run_review_worker(env.ctx, env.log_q, env.state_q, env.abort)
         assert env.claude_invocations == 1
         assert "ac-merged" not in env.labels_added
+
+    def test_a_confirmed_open_pr_missing_its_branch_is_not_overridden_by_a_stale_merged_pr(
+        self, review_env
+    ):
+        # Round-2 regression: ctx.pr_url already names PR #341, `gh pr view`
+        # confirms it OPEN (so [1.5] does not short-circuit), but
+        # existing_branch is unset — the pre-existing guard the resolution
+        # block exists for (a human/sibling-toolchain PR whose branch was
+        # never recorded on ctx). `_find_pr_for_issue` cannot relocate #341
+        # either (open_list is empty here — its branch/body don't match our
+        # heuristics). The resolution block must NOT then fall back to the
+        # unrelated stale merged PR #340 that `_merged_pr_for_issue` would
+        # otherwise find — #341 was already confirmed not merged.
+        env = review_env(
+            pr_url="https://github.com/Org/repo/pull/341",
+            pr_view={"number": 341, "state": "OPEN"},
+            existing_branch=None,
+            number=268,
+            merged_list=[
+                {"number": 340, "headRefName": "ac/issue-268-old-attempt",
+                 "url": "https://github.com/Org/repo/pull/340", "body": "", "title": ""},
+            ],
+        )
+        # run_review_worker never lets an exception escape — it is caught,
+        # reported as a failed run, and the lock released. The behavior under
+        # test is what did NOT happen along the way: no silent short-circuit
+        # to ac-merged, no rewrite of ctx.pr_url to the stale PR, no review.
+        worker.run_review_worker(env.ctx, env.log_q, env.state_q, env.abort)
+        assert env.claude_invocations == 0
+        assert "ac-merged" not in env.labels_added
+        assert env.ctx.pr_url == "https://github.com/Org/repo/pull/341"
+        assert env.final_status() == "failed"
