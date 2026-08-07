@@ -4,9 +4,9 @@ from __future__ import annotations
 
 import stages
 from config import Config
-from github_client import GithubClient, GithubClientError
+from github_client import GithubClient, GithubClientError, pr_number_from_url
 from logger import MainLogger
-from state import IssueRecord, IssueStatus, StateStore
+from state import InvalidTransitionError, IssueRecord, IssueStatus, StateStore
 
 # Statuses `StateStore.transition()` can reach QUEUED from in a single hop.
 # DISCOVERED is one hop further (via TRIAGING) — see the ac-dev-review branch
@@ -29,6 +29,11 @@ class Poller:
         self._github = github
         self._state = state
         self._logger = logger
+
+        # Issues whose PR was closed without merging, already warned about.
+        # Process-lifetime only: a restart re-warning once is correct, a 60s
+        # poll loop re-warning 1,440 times a day is not.
+        self._warned_closed: set[str] = set()
 
     def poll(self) -> tuple[list[IssueRecord], list[IssueRecord]]:
         """Poll all repos and return (new_issues, retriage_issues)."""
@@ -79,6 +84,13 @@ class Poller:
                 if record.labels != label_names:
                     self._state.update(issue_id, labels=label_names)
                     self._state.save()
+
+            # A merged PR advances the issue to ac-merged ("Pending
+            # Release"). This MUST run before the is_terminal guard below —
+            # ac-hitl is itself terminal, so a check placed after it would
+            # never see the stage where most merges happen.
+            if self._check_merged(repo, issue, label_names, issue_id):
+                continue
 
             # Terminal stages are hands-off, unconditionally. A human who set
             # ac-blocked/ac-hitl/ac-merged/ac-done must have that stick even
@@ -250,3 +262,79 @@ class Poller:
                     )
 
         return new_issues, retriage_issues
+
+    def _check_merged(
+        self,
+        repo: str,
+        issue: dict,
+        label_names: list[str],
+        issue_id: str,
+    ) -> bool:
+        """Advance `issue_id` to ac-merged if its PR has merged.
+
+        Returns True when the issue was advanced, meaning the caller should
+        skip it for the rest of this poll.
+
+        Never raises: a GitHub failure here must not stall the poll loop, and
+        must never advance an issue on incomplete information. Both failure
+        paths return False, which simply means "try again next tick".
+        """
+        if stages.stage_of(label_names) not in stages.MERGE_WATCH:
+            return False
+        if not self._state.is_known(issue_id):
+            return False
+
+        record = self._state.get(issue_id)
+        pr_number = pr_number_from_url(record.pr_url)
+        if pr_number is None:
+            return False
+
+        try:
+            pr = self._github.get_pr_state(repo, pr_number)
+        except GithubClientError as exc:
+            self._logger.warn(f"Could not check PR state for {issue_id}: {exc}")
+            return False
+
+        if not pr["merged"]:
+            if pr["state"] == "closed" and issue_id not in self._warned_closed:
+                self._warned_closed.add(issue_id)
+                self._logger.warn(
+                    f"{issue_id}: PR #{pr_number} was closed without merging — "
+                    f"leaving it at {stages.stage_of(label_names)} for a human"
+                )
+            return False
+
+        # Labels first. A record moved to COMPLETED whose label still reads
+        # ac-hitl would never be swept again, so the durable half must land
+        # before the local half.
+        add, remove = stages.transition(label_names, "ac-merged")
+        try:
+            for label in add:
+                self._github.add_label(repo, issue["number"], label)
+            for label in remove:
+                self._github.remove_label(repo, issue["number"], label)
+        except GithubClientError as exc:
+            self._logger.warn(f"Could not advance {issue_id} to ac-merged: {exc}")
+            return False
+
+        if record.status != IssueStatus.COMPLETED:
+            try:
+                self._state.transition(issue_id, IssueStatus.COMPLETED)
+            except InvalidTransitionError:
+                # The label is the source of truth and it is already correct;
+                # startup reconciliation derives COMPLETED from ac-merged
+                # (reconcile.py) and will settle any residual mismatch.
+                self._logger.warn(
+                    f"{issue_id}: merged, but local status {record.status} "
+                    f"could not move to completed"
+                )
+        self._state.update(
+            issue_id,
+            labels=[lbl for lbl in label_names if lbl not in remove] + add,
+            worker_pid=None,
+        )
+        self._state.save()
+        self._logger.info(
+            f"{issue_id} — PR #{pr_number} merged, -> ac-merged (Pending Release)"
+        )
+        return True
