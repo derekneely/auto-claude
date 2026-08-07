@@ -457,3 +457,76 @@ class TestLabelSnapshotFollowsGitHub:
         make_poller([make_issue(221, ["ac-hitl"])], store).poll()
 
         assert published == []
+
+
+class TestRetriageDoesNotFireOnOurOwnWrite:
+    """Re-triage triggers on any updated_at change, and auto-claude's own
+    label write bumps updated_at. `main._run_triage` re-fetches updated_at
+    after posting the needs-info comment to close that gap. Without it, every
+    60s poll would re-triage an issue no human has answered — a triage call
+    per tick until someone responds.
+    """
+
+    @staticmethod
+    def _seed_needs_info(state, issue_id, repo, number, issue_updated_at):
+        # seed_record's status-path table stops at DISCOVERED/QUEUED/etc and
+        # has no route to NEEDS_INFO, so this walks the DISCOVERED ->
+        # TRIAGING -> NEEDS_INFO path directly and then stamps the
+        # GitHub-side timestamp the retriage check compares against.
+        record = IssueRecord(
+            issue_id=issue_id,
+            repo=repo,
+            number=number,
+            title="issue",
+            body="",
+            labels=["ac-input-needed"],
+            action="implement",
+            status=IssueStatus.DISCOVERED,
+            discovered_at="2026-07-01T00:00:00Z",
+            updated_at="2026-07-01T00:00:00Z",
+            issue_updated_at="2026-07-01T00:00:00Z",
+            mode="dev",
+        )
+        state.add(record)
+        state.transition(issue_id, IssueStatus.TRIAGING)
+        state.transition(issue_id, IssueStatus.NEEDS_INFO)
+        state.update(issue_id, issue_updated_at=issue_updated_at)
+        state.save()
+        return state.get(issue_id)
+
+    def test_a_needs_info_issue_whose_timestamp_matches_is_not_retriaged(self, state):
+        issue_id = "field_admin#30"
+        self._seed_needs_info(state, issue_id, "field_admin", 30,
+                               issue_updated_at="T1")
+
+        payload = [make_issue(30, ["ac-input-needed"], updated_at="T1")]
+        _new, retriage = make_poller(payload, state).poll()
+
+        assert retriage == []
+
+    def test_a_genuine_human_response_is_retriaged(self, state):
+        issue_id = "field_admin#31"
+        self._seed_needs_info(state, issue_id, "field_admin", 31,
+                               issue_updated_at="T1")
+
+        payload = [make_issue(31, ["ac-input-needed"], updated_at="T2")]
+        _new, retriage = make_poller(payload, state).poll()
+
+        assert [r.issue_id for r in retriage] == [issue_id]
+
+    def test_run_triage_refetches_updated_at_after_posting(self):
+        # Source-text assertion: the re-fetch is the only thing standing
+        # between needs_info and a per-tick triage loop, and it is easy to
+        # drop during an unrelated refactor of the needs-info branch. The
+        # brief's proposed spelling was "issue_updated_at=fresh.get" — the
+        # real code matches that exactly (main.py:693-694), so it is asserted
+        # verbatim here.
+        import inspect
+
+        import main as main_module
+
+        body = inspect.getsource(main_module._run_triage)
+        assert "issue_updated_at=fresh.get" in body, (
+            "main._run_triage must re-read updated_at after applying "
+            "ac-input-needed, or the poller re-triages its own label write"
+        )

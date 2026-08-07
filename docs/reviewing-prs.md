@@ -23,14 +23,20 @@ The stage machine is:
 ```
 ac-pending-review -> ac-dev-ready -> ac-in-progress -> ac-dev-review
                                  -> ac-review-in-progress -> ac-hitl
-                                 -> ac-merged -> ac-done
+                                 -> ac-merged (automatic on PR merge) -> ac-done
 ```
 
 `ac-hitl` is in `stages.TERMINAL` — auto-claude **stops touching the issue**
 once it lands there. It is not a failure state; it means the agent review
 passed (build green, acceptance criteria met, no blocking security finding)
-and the PR is waiting on you. From `ac-hitl` onward, `ac-merged` and `ac-done`
-are set by a human, not by the daemon.
+and the PR is waiting on you. Once you merge the PR, auto-claude's poller
+notices within one poll interval and moves the issue to `ac-merged`
+("Pending Release") itself — you do not set that label. Only `ac-done`, at
+release time, is set by a human.
+
+If a PR tied to an `ac-dev-review` or `ac-hitl` issue is closed **without**
+merging, the poller logs one warning and leaves the issue at its current
+stage — it does not guess, so a human decides what happens next.
 
 So: **anything at `ac-hitl` is your queue.**
 
@@ -59,8 +65,11 @@ continues, because linkage is metadata and the work is already done.
 
 Two consequences worth knowing:
 
-- **Merging into `dev` will not close the issue**, `Closes #N` or not. Closing
-  it is part of the human `ac-merged` → `ac-done` step.
+- **Merging into `dev` will not close the issue**, `Closes #N` or not, and
+  nothing in auto-claude ever calls the close API. The poller advances the
+  label to `ac-merged` automatically once it sees the PR merged. Setting
+  `ac-done` and closing the issue at release time both stay manual, human
+  steps.
 - To check merge state from an issue number:
 
   ```powershell
@@ -160,8 +169,10 @@ use the persistent worktree for everyday review, since it skips a full
 gh pr merge 334 --repo Accelevation/field_admin --squash
 ```
 
-The body ends with `Closes #<n>`, so merging closes the issue. Move the stage
-label to `ac-merged`, then `ac-done` once it is released.
+Merging does **not** close the issue, `Closes #<n>` or not — see above. There
+is nothing left to do here: auto-claude notices the merge on its next poll
+(within one interval) and moves the issue to `ac-merged` itself. Set
+`ac-done` yourself once the change is released.
 
 **Send back** — comment what is wrong and set the issue to `ac-dev-ready` with
 the attempt label bumped. The poller picks it up and a dev worker reworks the

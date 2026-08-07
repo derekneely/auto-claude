@@ -11,9 +11,6 @@ These were in the original plan but explicitly deferred to reduce MVP scope.
 ### Crash Recovery / Worktree Resumption
 Detect existing worktrees with commits from a previous interrupted run and skip straight to the push step instead of re-running from scratch. Simpler retry (re-run from scratch) is fine for v1.
 
-### Re-Triage Cycle
-Automatically detect when a user responds to `needs_info` questions by monitoring `updated_at` changes on GitHub. Re-triage with full comment context. For now, user can manually re-label the issue after answering questions.
-
 ### Distributed Lock via `claude-in-progress` Label
 Use the `claude-in-progress` GitHub label as a distributed lock so two auto-claude instances don't pick up the same issue. Only one instance will run for MVP, so this is unnecessary.
 
