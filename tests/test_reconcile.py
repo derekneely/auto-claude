@@ -209,3 +209,148 @@ class TestTerminalLabelMapsToCompleted:
             harness_id="me", logger=_logger(),
         )
         assert state.get("field_admin#1").status == IssueStatus.COMPLETED
+
+
+class TestAbsentDbRowDoesNotBlankLocalState:
+    """A Postgres outage (or a merely-empty db_rows dict) must not destroy
+    locally-held pr_url/branch/counters on a record reconciliation already
+    knows about. Absence of a DB row carries no information — see
+    .superpowers/sdd/2026-08-07-merge-detection/task-7-brief.md. Before this
+    fix, `counters = db_row or {}` treated a missing row the same as a row
+    full of empty/zero values, so one outage blanked every known record."""
+
+    def _known_state(self, tmp_path, **overrides):
+        state = StateStore(tmp_path / "issues.json")
+        fields = dict(
+            issue_id="field_admin#50", repo="field_admin", number=50,
+            title="t", body="", labels=["ac-dev-ready"], action="fix",
+            status=IssueStatus.QUEUED, discovered_at="x", updated_at="x",
+            issue_updated_at="x", branch="fix/50", pr_url="https://pr/50",
+            triage_attempts=1, rework_count=2, continuation_count=3,
+            error="boom",
+        )
+        fields.update(overrides)
+        state.add(IssueRecord(**fields))
+        return state
+
+    def test_known_record_keeps_pr_url_when_db_rows_is_empty(self, tmp_path):
+        state = self._known_state(tmp_path)
+        reconcile(
+            state=state, db_rows={},
+            gh_issues={"field_admin#50": _gh("ac-dev-ready", number=50)},
+            harness_id="me", logger=_logger(),
+        )
+        assert state.get("field_admin#50").pr_url == "https://pr/50"
+
+    def test_known_record_keeps_branch_when_db_rows_is_empty(self, tmp_path):
+        state = self._known_state(tmp_path)
+        reconcile(
+            state=state, db_rows={},
+            gh_issues={"field_admin#50": _gh("ac-dev-ready", number=50)},
+            harness_id="me", logger=_logger(),
+        )
+        assert state.get("field_admin#50").branch == "fix/50"
+
+    def test_known_record_keeps_rework_count_when_db_rows_is_empty(self, tmp_path):
+        state = self._known_state(tmp_path)
+        reconcile(
+            state=state, db_rows={},
+            gh_issues={"field_admin#50": _gh("ac-dev-ready", number=50)},
+            harness_id="me", logger=_logger(),
+        )
+        assert state.get("field_admin#50").rework_count == 2
+
+    def test_known_record_keeps_triage_attempts_when_db_rows_is_empty(self, tmp_path):
+        state = self._known_state(tmp_path)
+        reconcile(
+            state=state, db_rows={},
+            gh_issues={"field_admin#50": _gh("ac-dev-ready", number=50)},
+            harness_id="me", logger=_logger(),
+        )
+        assert state.get("field_admin#50").triage_attempts == 1
+
+    def test_known_record_keeps_continuation_count_when_db_rows_is_empty(self, tmp_path):
+        state = self._known_state(tmp_path)
+        reconcile(
+            state=state, db_rows={},
+            gh_issues={"field_admin#50": _gh("ac-dev-ready", number=50)},
+            harness_id="me", logger=_logger(),
+        )
+        assert state.get("field_admin#50").continuation_count == 3
+
+    def test_known_record_keeps_error_when_db_rows_is_empty(self, tmp_path):
+        state = self._known_state(tmp_path)
+        reconcile(
+            state=state, db_rows={},
+            gh_issues={"field_admin#50": _gh("ac-dev-ready", number=50)},
+            harness_id="me", logger=_logger(),
+        )
+        assert state.get("field_admin#50").error == "boom"
+
+    def test_present_db_row_still_overrides_pr_url(self, tmp_path):
+        # The authority rule still holds where a row genuinely exists.
+        state = self._known_state(tmp_path)
+        db_rows = {"field_admin#50": _lease_row(None, None, pr_url="https://pr/new")}
+        reconcile(
+            state=state, db_rows=db_rows,
+            gh_issues={"field_admin#50": _gh("ac-dev-ready", number=50)},
+            harness_id="me", logger=_logger(),
+        )
+        assert state.get("field_admin#50").pr_url == "https://pr/new"
+
+    def test_status_is_still_derived_from_github_stage_during_total_outage(self, tmp_path):
+        # Pins that this fix did not weaken the anti-stranding guarantee:
+        # status must still come from GitHub's stage + lease, never from the
+        # stale local status, even when db_rows is entirely empty.
+        state = self._known_state(
+            tmp_path, status=IssueStatus.IN_PROGRESS,
+        )
+        reconcile(
+            state=state, db_rows={},
+            gh_issues={"field_admin#50": _gh("ac-dev-review", number=50)},
+            harness_id="me", logger=_logger(),
+        )
+        assert state.get("field_admin#50").status == IssueStatus.QUEUED
+
+    def test_unknown_issue_with_empty_db_rows_still_gets_current_defaults(self, tmp_path):
+        state = StateStore(tmp_path / "issues.json")
+        reconcile(
+            state=state, db_rows={},
+            gh_issues={"field_admin#60": _gh("ac-dev-ready", number=60)},
+            harness_id="me", logger=_logger(),
+        )
+        record = state.get("field_admin#60")
+        assert record is not None
+        assert record.pr_url is None
+        assert record.branch is None
+        assert record.triage_attempts == 0
+        assert record.rework_count == 0
+        assert record.continuation_count == 0
+        assert record.error is None
+
+
+class TestAcHitlSurvivesDbOutageForMergeDetection:
+    """Regression tied to this branch's merge-detection feature
+    (docs behind ac-hitl -> ac-merged). Poller._check_merged returns early
+    when record.pr_url is empty, and ac-hitl is a terminal stage with no
+    worker fallback — so if a Postgres outage at startup blanked pr_url here,
+    the issue would rot at ac-hitl forever with nothing left to notice the PR
+    ever merged. Placed alongside the other absent-db-row cases in this file
+    (not in a poller-specific test file) because the defect and its fix are
+    entirely in reconcile.py; the poller behaviour it protects is asserted
+    by poller tests elsewhere."""
+
+    def test_ac_hitl_record_keeps_pr_url_through_total_db_outage(self, tmp_path):
+        state = StateStore(tmp_path / "issues.json")
+        state.add(IssueRecord(
+            issue_id="field_admin#70", repo="field_admin", number=70,
+            title="t", body="", labels=["ac-hitl"], action="fix",
+            status=IssueStatus.COMPLETED, discovered_at="x", updated_at="x",
+            issue_updated_at="x", branch="fix/70", pr_url="https://pr/70",
+        ))
+        reconcile(
+            state=state, db_rows={},
+            gh_issues={"field_admin#70": _gh("ac-hitl", number=70)},
+            harness_id="me", logger=_logger(),
+        )
+        assert state.get("field_admin#70").pr_url == "https://pr/70"

@@ -261,8 +261,13 @@ def _reconcile_at_startup(config, github, state, db, harness, dbsync, logger: Ma
     """Rebuild `state` from GitHub + Postgres before the poll loop starts.
     See reconcile.py and docs/plans/12-shared-state-in-postgres.md, "Startup
     reconciliation". db=None (disabled or unreachable) reconciles against an
-    empty db_rows dict — identical to a genuinely empty database on the very
-    first run, which the design already treats as the normal case.
+    empty db_rows dict, but that is not treated as authoritative emptiness:
+    reconcile() preserves each already-known record's locally-held branch,
+    pr_url, and attempt/rework counters when its db_rows entry is absent,
+    rather than overwriting them with None/0. A genuinely empty database on
+    the very first run has no local record to preserve, so it still gets the
+    plain defaults — the two situations only look alike when there is
+    nothing to lose.
 
     Expired leases are released in Postgres FIRST, before `db_rows` is
     fetched: `dbsync.release_expired()` issues the actual `UPDATE` that

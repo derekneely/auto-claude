@@ -102,22 +102,53 @@ def reconcile(*, state: StateStore, db_rows: dict[str, dict],
         if _lease_expired(db_row, now):
             leases_released.append(issue_id)
 
-        counters = db_row or {}
         fields = dict(
             status=status,
             mode=mode,
             labels=gh.get("labels", []),
             action=gh.get("action", "implement"),
             issue_updated_at=gh.get("issue_updated_at", ""),
-            branch=counters.get("branch"),
-            pr_url=counters.get("pr_url"),
-            triage_attempts=counters.get("triage_attempts", 0),
-            rework_count=counters.get("rework_count", 0),
-            continuation_count=counters.get("continuation_count", 0),
-            error=counters.get("last_error"),
         )
 
-        if state.is_known(issue_id):
+        existing = state.get(issue_id)
+        if db_row is not None:
+            # DB row present: it is authoritative for the fields it owns,
+            # exactly as before.
+            fields.update(
+                branch=db_row.get("branch"),
+                pr_url=db_row.get("pr_url"),
+                triage_attempts=db_row.get("triage_attempts", 0),
+                rework_count=db_row.get("rework_count", 0),
+                continuation_count=db_row.get("continuation_count", 0),
+                error=db_row.get("last_error"),
+            )
+        elif existing is not None:
+            # DB row absent for *this* issue (Postgres outage, or a row that
+            # simply hasn't been written yet) but we already have a local
+            # record: absence carries no information, so preserve what's
+            # there instead of blanking it. Overwriting with None/0 here used
+            # to silently disable merge detection at ac-hitl (Poller.
+            # _check_merged bails out on an empty pr_url, and ac-hitl is
+            # terminal with no worker fallback to ever retry it) and defeat
+            # the ac-blocked backstop by resetting exhausted attempt/rework
+            # counters back to 0.
+            fields.update(
+                branch=existing.branch,
+                pr_url=existing.pr_url,
+                triage_attempts=existing.triage_attempts,
+                rework_count=existing.rework_count,
+                continuation_count=existing.continuation_count,
+                error=existing.error,
+            )
+        else:
+            # Genuinely new record with no DB row yet: nothing local to
+            # preserve, so fall back to the current defaults.
+            fields.update(
+                branch=None, pr_url=None, triage_attempts=0,
+                rework_count=0, continuation_count=0, error=None,
+            )
+
+        if existing is not None:
             state.update(issue_id, **fields)
         else:
             state.add(IssueRecord(
