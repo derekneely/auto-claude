@@ -99,6 +99,10 @@ class IssueRecord:
     branch: str | None = None
     pr_url: str | None = None
     triage_attempts: int = 0
+    # How many times triage has bounced this issue to ac-input-needed. Distinct
+    # from triage_attempts, which counts every triage run including proceeds.
+    # Capped by claude.max_needs_info_rounds so the bot cannot ask forever.
+    needs_info_rounds: int = 0
     error: str | None = None
     rework_count: int = 0
     continuation_count: int = 0

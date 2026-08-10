@@ -39,6 +39,17 @@ class ClaudeConfig:
     grace_budget_usd: float
     max_turns_dev: int
     action_models: dict[str, str]  # action -> model override
+    # Triage investigates with read-only tools before deciding, so it needs a
+    # turn budget and a wall clock that a one-shot classifier did not.
+    triage_timeout_seconds: int = 300
+    triage_max_turns: int = 30
+    # Attempt 2 re-runs on a stronger model rather than repeating attempt 1
+    # byte-for-byte — an identical retry of a model-shaped failure just fails
+    # again. Defaults to dev_model at load time.
+    triage_escalation_model: str = ""
+    # How many times triage may bounce one issue to ac-input-needed before it
+    # stops asking and hands the issue to a human as ac-blocked.
+    max_needs_info_rounds: int = 3
 
 
 @dataclass(frozen=True)
@@ -154,6 +165,12 @@ def load_config(config_path: Path | None = None) -> Config:
         grace_budget_usd=claude_raw.get("grace_budget_usd", 1.0),
         max_turns_dev=claude_raw.get("max_turns_dev", 50),
         action_models=claude_raw.get("action_models", {}),
+        triage_timeout_seconds=claude_raw.get("triage_timeout_seconds", 300),
+        triage_max_turns=claude_raw.get("triage_max_turns", 30),
+        triage_escalation_model=claude_raw.get(
+            "triage_escalation_model", claude_raw["dev_model"]
+        ),
+        max_needs_info_rounds=claude_raw.get("max_needs_info_rounds", 3),
     )
 
     integrations_raw = raw.get("integrations", {})

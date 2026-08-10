@@ -27,9 +27,17 @@ dev_actions = ["fix", "implement", "test", "rework"]
 rework_label = "ac-rework"
 
 [claude]
-triage_model = "claude-haiku-4-5"
+# Triage is not a text classifier — it runs in the repo checkout with read-only
+# tools and is expected to resolve issue/PR references and read code before
+# deciding. Haiku is too weak to drive that, and a triage agent that gives up
+# and asks the human is the whole problem.
+triage_model = "claude-sonnet-5"
 dev_model = "claude-sonnet-5"          # default model for dev actions
 light_model = "claude-haiku-4-5"         # used for handoff summaries
+triage_timeout_seconds = 300             # wall clock for one triage investigation
+triage_max_turns = 30                    # tool-call budget for that investigation
+triage_escalation_model = "claude-sonnet-5"  # attempt 2 after attempt 1 fails
+max_needs_info_rounds = 3                # then ac-blocked instead of asking again
 permission_mode = "bypassPermissions"
 max_budget_usd = 10.0
 output_format = "stream-json"

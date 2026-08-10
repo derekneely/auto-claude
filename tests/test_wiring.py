@@ -495,7 +495,7 @@ class TestReviewSkipsTriage:
         called = []
         state = FakeState()
         engine = SimpleNamespace(triage=lambda r: called.append(r) or SimpleNamespace(
-            decision="proceed", confidence="high", summary="ok",
+            decision="proceed", confidence="high", summary="ok", findings="",
         ))
         main._run_triage(
             self._record("dev"), state, FakeGithub(), engine,

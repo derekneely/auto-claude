@@ -519,14 +519,15 @@ class TestRetriageDoesNotFireOnOurOwnWrite:
         # between needs_info and a per-tick triage loop, and it is easy to
         # drop during an unrelated refactor of the needs-info branch. The
         # brief's proposed spelling was "issue_updated_at=fresh.get" — the
-        # real code matches that exactly (main.py:693-694), so it is asserted
-        # verbatim here.
+        # real code matches that exactly, so it is asserted verbatim here.
+        # The re-fetch now lives in the shared comment poster, which every
+        # triage comment path (findings, questions, stuck) routes through.
         import inspect
 
         import main as main_module
 
-        body = inspect.getsource(main_module._run_triage)
+        body = inspect.getsource(main_module._post_triage_comment)
         assert "issue_updated_at=fresh.get" in body, (
-            "main._run_triage must re-read updated_at after applying "
+            "main._post_triage_comment must re-read updated_at after applying "
             "ac-input-needed, or the poller re-triages its own label write"
         )

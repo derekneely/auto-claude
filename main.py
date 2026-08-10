@@ -39,7 +39,12 @@ from poller import Poller
 from process_manager import ProcessManager
 from reconcile import reconcile
 from state import IssueStatus, StateStore
-from triage import TriageEngine, format_clarifying_comment
+from triage import (
+    TriageEngine,
+    format_clarifying_comment,
+    format_findings_comment,
+    format_stuck_comment,
+)
 
 BANNER = r"""
    ___       __           _______             __
@@ -675,43 +680,84 @@ def _run_triage(record, state, github, triage_engine, config, logger,
         state.transition(record.issue_id, IssueStatus.QUEUED)
         state.save()
         logger.info(f"{record.issue_id} -> {state.get(record.issue_id).status}")
-    else:
+        # A proceed can still carry a report: "go check X and tell me what you
+        # find" is answered by investigating and then getting on with the work,
+        # not by refusing to start. Stage stays put — the issue is queued.
+        if decision.findings:
+            _post_triage_comment(
+                record, state, github, logger, dry_run, dbsync,
+                body=format_findings_comment(decision, config),
+                stage=None,
+                what="triage findings",
+            )
+        return
+
+    rounds = record.needs_info_rounds + 1
+    state.update(record.issue_id, needs_info_rounds=rounds)
+
+    if rounds > config.claude.max_needs_info_rounds:
+        # Asking a fourth time is not going to work. Hand it to a human rather
+        # than looping the issue between ac-input-needed and ac-dev-ready.
         state.transition(record.issue_id, IssueStatus.NEEDS_INFO)
         state.save()
+        logger.warn(
+            f"{record.issue_id} hit {rounds} needs_info rounds — blocking for a human"
+        )
+        _post_triage_comment(
+            record, state, github, logger, dry_run, dbsync,
+            body=format_stuck_comment(decision, rounds),
+            stage="ac-blocked",
+            what="stuck notice",
+        )
+        return
 
-        if not dry_run:
-            comment = format_clarifying_comment(decision, config)
-            try:
-                comment_url = github.post_comment(record.repo, record.number, comment)
-                # Move the stage backwards off ac-dev-ready: the issue is not
-                # ready after all, and leaving the trigger label on would make
-                # the next poll pick it straight back up.
-                add, remove = stages.transition(record.labels, "ac-input-needed")
-                for label in add:
-                    github.add_label(record.repo, record.number, label)
-                for label in remove:
-                    github.remove_label(record.repo, record.number, label)
-                # Re-fetch updated_at so the poller doesn't treat our own
-                # comment as a user response and immediately re-triage
-                try:
-                    fresh = github.get_issue(record.repo, record.number)
-                    state.update(record.issue_id,
-                                 issue_updated_at=fresh.get("updated_at", ""))
-                    state.save()
-                except Exception:
-                    pass
-                # Runless — triage is an inline call from `main`, not a
-                # worker run, so `run_id` is NULL by design.
-                if dbsync is not None:
-                    dbsync.add_summary(
-                        issue_id=record.issue_id, run_id=None, kind="triage",
-                        body=comment, comment_url=comment_url,
-                    )
-                logger.info(f"Posted clarifying questions on {record.issue_id}")
-            except Exception as exc:
-                logger.error(f"Failed to post comment on {record.issue_id}: {exc}")
-        else:
-            logger.info(f"DRY-RUN: would post clarifying questions on {record.issue_id}")
+    state.transition(record.issue_id, IssueStatus.NEEDS_INFO)
+    state.save()
+    _post_triage_comment(
+        record, state, github, logger, dry_run, dbsync,
+        body=format_clarifying_comment(decision, config),
+        # Move the stage backwards off ac-dev-ready: the issue is not ready
+        # after all, and leaving the trigger label on would make the next poll
+        # pick it straight back up.
+        stage="ac-input-needed",
+        what="clarifying questions",
+    )
+
+
+def _post_triage_comment(record, state, github, logger, dry_run, dbsync,
+                         *, body: str, stage: str | None, what: str) -> None:
+    """Post a triage comment, optionally move the stage label, record it."""
+    if dry_run:
+        logger.info(f"DRY-RUN: would post {what} on {record.issue_id}")
+        return
+
+    try:
+        comment_url = github.post_comment(record.repo, record.number, body)
+        if stage is not None:
+            add, remove = stages.transition(record.labels, stage)
+            for label in add:
+                github.add_label(record.repo, record.number, label)
+            for label in remove:
+                github.remove_label(record.repo, record.number, label)
+        # Re-fetch updated_at so the poller doesn't treat our own comment as a
+        # user response and immediately re-triage.
+        try:
+            fresh = github.get_issue(record.repo, record.number)
+            state.update(record.issue_id,
+                         issue_updated_at=fresh.get("updated_at", ""))
+            state.save()
+        except Exception:
+            pass
+        # Runless — triage is an inline call from `main`, not a worker run, so
+        # `run_id` is NULL by design.
+        if dbsync is not None:
+            dbsync.add_summary(
+                issue_id=record.issue_id, run_id=None, kind="triage",
+                body=body, comment_url=comment_url,
+            )
+        logger.info(f"Posted {what} on {record.issue_id}")
+    except Exception as exc:
+        logger.error(f"Failed to post comment on {record.issue_id}: {exc}")
 
 
 def _run_single_issue(args, config, state, github, triage_engine, logger,
@@ -917,7 +963,7 @@ def main() -> None:
     _reconcile_at_startup(config, github, state, db, harness, dbsync, logger)
 
     poller = Poller(config, github, state, logger)
-    triage_engine = TriageEngine(config, github)
+    triage_engine = TriageEngine(config, github, logger)
 
     # Create multiprocessing queues
     log_queue = multiprocessing.Queue()

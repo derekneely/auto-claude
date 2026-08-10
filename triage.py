@@ -14,21 +14,56 @@ from github_client import GithubClient, GithubClientError
 from state import IssueRecord
 
 
+# Read-only tool allowlist for the triage run. Everything not listed here is
+# denied outright in --print mode, so triage can look but never touch: no
+# writes, no `gh issue comment`, no `gh pr merge`. `gh api` is deliberately
+# absent — `gh api -X POST` would slip a mutation past a prefix rule.
+TRIAGE_TOOLS: tuple[str, ...] = (
+    "Read",
+    "Grep",
+    "Glob",
+    "Bash(gh issue view:*)",
+    "Bash(gh issue list:*)",
+    "Bash(gh pr view:*)",
+    "Bash(gh pr list:*)",
+    "Bash(gh pr diff:*)",
+    "Bash(gh search:*)",
+    "Bash(git log:*)",
+    "Bash(git show:*)",
+    "Bash(git diff:*)",
+    "Bash(git status:*)",
+)
+
+
 @dataclass
 class TriageDecision:
     decision: str       # "proceed" or "needs_info"
     confidence: str     # "high", "medium", "low"
     summary: str
     questions: list[str]
+    # What triage actually checked and concluded. Posted to the issue verbatim
+    # on every decision — "go review X and report back" is a legitimate ask,
+    # and without this field it had nowhere to land.
+    findings: str = ""
 
 
 class TriageEngine:
-    """Evaluates issues via Claude CLI to decide proceed vs. needs_info."""
+    """Evaluates issues via Claude CLI to decide proceed vs. needs_info.
 
-    def __init__(self, config: Config, github: GithubClient) -> None:
+    The run is an investigation, not a classification: it executes inside the
+    repository checkout with read-only tools so it can resolve `#123`
+    references, diff PRs, and read the code before deciding.
+    """
+
+    def __init__(self, config: Config, github: GithubClient, logger=None) -> None:
         self._config = config
         self._github = github
+        self._logger = logger
         self._system_prompt = self._load_system_prompt()
+
+    def _log(self, level: str, message: str) -> None:
+        if self._logger is not None:
+            getattr(self._logger, level)(message)
 
     def _load_system_prompt(self) -> str:
         prompt_file = self._config.paths.prompts_dir / "triage.txt"
@@ -43,60 +78,142 @@ class TriageEngine:
             pass  # Proceed with no comments — triage can still work
 
         user_prompt = self._build_prompt(record, comments)
+        cwd = self._repo_cwd(record)
+        claude = self._config.claude
+        timeout = claude.triage_timeout_seconds
 
-        # Attempt 1
-        decision = self._attempt_triage(user_prompt)
-        if decision is not None:
-            return decision
+        # Attempt 2 escalates model and wall clock. Repeating attempt 1
+        # verbatim only re-runs whatever shape of failure just happened.
+        attempts = (
+            (claude.triage_model, timeout),
+            (claude.triage_escalation_model or claude.dev_model, timeout * 2),
+        )
 
-        # Attempt 2 (retry)
-        decision = self._attempt_triage(user_prompt)
-        if decision is not None:
-            return decision
+        for n, (model, attempt_timeout) in enumerate(attempts, start=1):
+            decision = self._attempt_triage(user_prompt, cwd, model, attempt_timeout, n)
+            if decision is not None:
+                return decision
 
-        # Conservative fallback
+        # Conservative fallback. Deliberately does NOT invent a clarifying
+        # question — triage errored out, it did not find a real gap, and
+        # pretending otherwise is what makes the human do the agent's job.
+        self._log("error", "Triage failed on both attempts — falling back to needs_info")
         return TriageDecision(
             decision="needs_info",
             confidence="low",
-            summary="Triage failed after 2 attempts — defaulting to needs_info",
-            questions=["Could you provide more details about the expected behavior?"],
+            summary=(
+                "Triage could not complete — the investigation run failed twice. "
+                "No conclusion was reached about this issue."
+            ),
+            questions=[
+                "Triage errored out rather than finding a real gap. Re-apply the "
+                "stage label to retry, or say how you'd like to proceed."
+            ],
         )
 
-    def _attempt_triage(self, user_prompt: str) -> TriageDecision | None:
+    def _attempt_triage(
+        self,
+        user_prompt: str,
+        cwd: Path,
+        model: str,
+        timeout: int,
+        attempt: int,
+    ) -> TriageDecision | None:
         """Single triage attempt. Returns None on failure."""
         try:
-            raw_output = self._invoke_claude_triage(user_prompt)
+            raw_output = self._invoke_claude_triage(user_prompt, cwd, model, timeout)
             return self._parse_response(raw_output)
-        except (subprocess.SubprocessError, json.JSONDecodeError, KeyError, ValueError):
+        except (subprocess.SubprocessError, json.JSONDecodeError, KeyError, ValueError) as exc:
+            # Swallowing this bare is how a run that failed for a knowable
+            # reason turned into a content-free question on the issue.
+            self._log(
+                "warn",
+                f"Triage attempt {attempt} ({model}) failed: "
+                f"{type(exc).__name__}: {exc}",
+            )
             return None
 
+    def _repo_cwd(self, record: IssueRecord) -> Path:
+        """The checkout triage investigates from.
+
+        Without this the CLI ran in auto-claude's own directory, so every tool
+        call landed in the wrong repository.
+        """
+        checkout = self._config.paths.repos_dir / record.repo
+        if checkout.is_dir():
+            return checkout
+        self._log(
+            "warn",
+            f"No checkout at {checkout} — triaging {record.issue_id} without repo access",
+        )
+        repos_dir = self._config.paths.repos_dir
+        return repos_dir if repos_dir.is_dir() else Path.cwd()
+
     def _build_prompt(self, record: IssueRecord, comments: list[dict]) -> str:
-        """Build the user prompt with issue context."""
+        """Build the user prompt with issue context.
+
+        Comments posted after our own last comment are marked [NEW]: they are
+        the human answering us, and an instruction in one of them is the task.
+        Flattened undifferentiated, a "go look it up yourself" reply read as
+        just more background and triage asked the same question again.
+        """
+        repo_slug = f"{self._config.github.org}/{record.repo}"
         parts = [
-            f"Issue #{record.number} in {self._config.github.org}/{record.repo}: {record.title}",
+            f"Issue #{record.number} in {repo_slug}: {record.title}",
             f"Action requested: {record.action} (from label ac-{record.action})",
+            f"Your working directory is a checkout of {repo_slug}. "
+            f"Use --repo {repo_slug} on `gh` commands.",
             "",
             "Issue Body:",
             record.body or "(no body)",
         ]
 
+        bot_login = self._config.github.bot_login
+        last_bot = -1
+        if bot_login:
+            for i, c in enumerate(comments):
+                if c.get("user", {}).get("login") == bot_login:
+                    last_bot = i
+
         if comments:
             parts.append("")
-            parts.append("Comments:")
-            for c in comments:
+            parts.append("Comments (oldest first):")
+            for i, c in enumerate(comments):
                 user = c.get("user", {}).get("login", "unknown")
-                body = c.get("body", "")
-                parts.append(f"  @{user}: {body}")
+                created = c.get("created_at", "")
+                is_new = last_bot >= 0 and i > last_bot
+                marker = "  [NEW — posted after your last comment]" if is_new else ""
+                parts.append("")
+                parts.append(f"--- @{user} at {created}{marker} ---")
+                parts.append(c.get("body", ""))
+
+        if last_bot >= 0 and last_bot < len(comments) - 1:
+            parts.append("")
+            parts.append(
+                "The [NEW] comment(s) above are the human responding to your last "
+                "request. Any instruction in them is your task: carry it out with "
+                "your tools and report the result in `findings`. Do not re-ask "
+                "anything they just told you to go find out yourself."
+            )
 
         return "\n".join(parts)
 
-    def _invoke_claude_triage(self, user_prompt: str) -> str:
-        """Call Claude CLI for triage and return raw stdout."""
+    def _invoke_claude_triage(
+        self, user_prompt: str, cwd: Path, model: str, timeout: int
+    ) -> str:
+        """Call Claude CLI for triage and return raw stdout.
+
+        Runs in the repo checkout with a read-only tool allowlist, so triage
+        can resolve references and read code instead of guessing from the
+        issue text. Tools outside TRIAGE_TOOLS are denied in --print mode.
+        """
         cmd = [
             "claude",
             "--print",
             "--output-format", "json",
-            "--model", self._config.claude.triage_model,
+            "--model", model,
+            "--max-turns", str(self._config.claude.triage_max_turns),
+            "--allowedTools", ",".join(TRIAGE_TOOLS),
             "--no-session-persistence",
             "--system-prompt", self._system_prompt,
             user_prompt,
@@ -106,7 +223,8 @@ class TriageEngine:
             cmd,
             text=True,
             capture_output=True,
-            timeout=60,
+            timeout=timeout,
+            cwd=str(cwd),
             env=build_env(current_token()),
             # Explicit: text=True alone decodes with the Windows locale codec
             # (cp1252), which dies on any non-ASCII byte in Claude's output.
@@ -140,6 +258,7 @@ class TriageEngine:
             confidence=inner.get("confidence", "medium"),
             summary=inner.get("summary", ""),
             questions=inner.get("questions", []),
+            findings=inner.get("findings", "") or "",
         )
 
     def _extract_json_from_text(self, text: str) -> dict:
@@ -161,6 +280,11 @@ def format_clarifying_comment(decision: TriageDecision, config: Config) -> str:
         f"> {decision.summary}\n",
     ]
 
+    if decision.findings:
+        lines.append("**What I checked:**\n")
+        lines.append(decision.findings)
+        lines.append("")
+
     if decision.questions:
         lines.append("**Questions:**\n")
         for q in decision.questions:
@@ -168,5 +292,58 @@ def format_clarifying_comment(decision: TriageDecision, config: Config) -> str:
 
     lines.append("")
     lines.append("_Please respond to the questions above, then auto-claude will re-evaluate._")
+
+    return redact("\n".join(lines))
+
+
+def format_findings_comment(decision: TriageDecision, config: Config) -> str:
+    """Report a `proceed` triage that actually investigated something.
+
+    "Go look at X and tell me what you find" is a normal instruction, and
+    before this the only way triage could say anything back was by refusing to
+    proceed. A proceed with findings now reports and then gets on with it.
+    """
+    from redact import redact
+
+    lines = [
+        "**auto-claude** triage — proceeding:\n",
+        f"> {decision.summary}\n",
+    ]
+
+    if decision.findings:
+        lines.append("**Findings:**\n")
+        lines.append(decision.findings)
+        lines.append("")
+
+    lines.append("_Queued for implementation._")
+
+    return redact("\n".join(lines))
+
+
+def format_stuck_comment(decision: TriageDecision, rounds: int) -> str:
+    """Posted when triage has bounced one issue to ac-input-needed too often."""
+    from redact import redact
+
+    lines = [
+        f"**auto-claude** has asked for clarification {rounds} times on this "
+        "issue without reaching a decision. Marking `ac-blocked` and handing it "
+        "to a human rather than asking again.\n",
+        f"> {decision.summary}\n",
+    ]
+
+    if decision.findings:
+        lines.append("**What I checked:**\n")
+        lines.append(decision.findings)
+        lines.append("")
+
+    if decision.questions:
+        lines.append("**Still open:**\n")
+        for q in decision.questions:
+            lines.append(f"- {q}")
+        lines.append("")
+
+    lines.append(
+        "_Re-apply `ac-dev-ready` once the issue body is updated to unblock it._"
+    )
 
     return redact("\n".join(lines))
