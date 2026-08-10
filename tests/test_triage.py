@@ -337,3 +337,82 @@ class TestStuckComment:
         assert "ac-blocked" in body
         assert "Checked #389." in body
         assert "Which phase?" in body
+
+
+# ---------------------------------------------------------------------------
+# Response parsing
+# ---------------------------------------------------------------------------
+
+class TestResponseParsing:
+    """The model is asked for bare JSON and mostly complies. Mostly is not a
+    parser contract — on field_admin#152 it opened with a sentence of
+    narration and then fenced the object, both attempts died, and the issue
+    got a content-free question."""
+
+    def _parse(self, config, inner: str):
+        engine = TriageEngine(config, FakeGithub())
+        return engine._parse_response(json.dumps({"result": inner}))
+
+    def test_bare_json(self, config):
+        d = self._parse(config, json.dumps(PROCEED))
+        assert d.decision == "proceed"
+
+    def test_a_fenced_object(self, config):
+        d = self._parse(config, "```json\n" + json.dumps(PROCEED) + "\n```")
+        assert d.decision == "proceed"
+
+    def test_prose_then_a_fenced_object(self, config):
+        # The exact shape that failed twice on #152.
+        inner = (
+            "All work is confirmed done and already closed by the human. "
+            "Reporting findings.\n\n```json\n" + json.dumps(PROCEED) + "\n```"
+        )
+        d = self._parse(config, inner)
+        assert d.decision == "proceed"
+        assert d.findings == PROCEED["findings"]
+
+    def test_prose_before_and_after(self, config):
+        inner = "Here you go:\n" + json.dumps(PROCEED) + "\nHope that helps."
+        assert self._parse(config, inner).decision == "proceed"
+
+    def test_braces_inside_string_values_do_not_break_the_scan(self, config):
+        payload = dict(PROCEED, findings="Config uses `{ ignoreDuringBuilds: true }`")
+        inner = "Note:\n```json\n" + json.dumps(payload) + "\n```"
+        assert self._parse(config, inner).findings == payload["findings"]
+
+    def test_escaped_quotes_inside_string_values_survive(self, config):
+        payload = dict(PROCEED, findings='package.json has \\"lint\\": \\"eslint .\\"')
+        inner = "Findings below.\n" + json.dumps(payload)
+        assert self._parse(config, inner).findings == payload["findings"]
+
+    def test_a_decoy_object_in_the_prose_is_skipped(self, config):
+        inner = (
+            "The repo config looks like {\"eslint\": {\"ignoreDuringBuilds\": true}} "
+            "today.\n\n```json\n" + json.dumps(PROCEED) + "\n```"
+        )
+        assert self._parse(config, inner).decision == "proceed"
+
+    def test_a_reply_with_no_object_at_all_still_raises(self, config):
+        with pytest.raises(json.JSONDecodeError):
+            self._parse(config, "I could not determine an answer.")
+
+    def test_an_empty_reply_still_raises(self, config):
+        with pytest.raises(json.JSONDecodeError):
+            self._parse(config, "")
+
+
+class TestRawReplyIsLogged:
+    def test_an_unparseable_reply_is_shown_in_the_log(self, config, monkeypatch):
+        # Empty stdout and unparseable stdout raise the identical
+        # JSONDecodeError message, so the log must carry the reply itself.
+        _capture_run(monkeypatch, json.dumps({"result": "no json here at all"}))
+        warnings = []
+
+        class Log:
+            def warn(self, m): warnings.append(m)
+            def error(self, m): pass
+            def info(self, m): pass
+
+        TriageEngine(config, FakeGithub(), Log()).triage(_record())
+
+        assert any("no json here at all" in w for w in warnings)

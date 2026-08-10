@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import re
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
@@ -33,6 +32,51 @@ TRIAGE_TOOLS: tuple[str, ...] = (
     "Bash(git diff:*)",
     "Bash(git status:*)",
 )
+
+
+def _first_json_object(text: str, required_key: str = "decision") -> dict:
+    """The first balanced `{...}` in `text` that parses and has `required_key`.
+
+    Brace-counting rather than a regex, because the object's own string values
+    contain braces and escaped quotes. `required_key` is what stops a `{` in
+    the model's prose or in a quoted code sample from being mistaken for the
+    decision object.
+    """
+    depth = 0
+    start = -1
+    in_string = False
+    escaped = False
+
+    for i, ch in enumerate(text):
+        if in_string:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_string = False
+            continue
+
+        if ch == '"':
+            in_string = True
+        elif ch == "{":
+            if depth == 0:
+                start = i
+            depth += 1
+        elif ch == "}" and depth > 0:
+            depth -= 1
+            if depth == 0:
+                try:
+                    candidate = json.loads(text[start:i + 1])
+                except json.JSONDecodeError:
+                    candidate = None
+                if isinstance(candidate, dict) and required_key in candidate:
+                    return candidate
+                start = -1
+
+    raise json.JSONDecodeError(
+        f"no JSON object containing {required_key!r} in model output", text, 0
+    )
 
 
 @dataclass
@@ -120,6 +164,7 @@ class TriageEngine:
         attempt: int,
     ) -> TriageDecision | None:
         """Single triage attempt. Returns None on failure."""
+        raw_output = ""
         try:
             raw_output = self._invoke_claude_triage(user_prompt, cwd, model, timeout)
             return self._parse_response(raw_output)
@@ -131,6 +176,12 @@ class TriageEngine:
                 f"Triage attempt {attempt} ({model}) failed: "
                 f"{type(exc).__name__}: {exc}",
             )
+            # An empty stdout and an unparseable reply raise the same
+            # JSONDecodeError message ("line 1 column 1"), which sends anyone
+            # reading the log after the wrong layer. Show what came back.
+            if raw_output:
+                from redact import redact
+                self._log("warn", f"Triage raw reply: {redact(raw_output[:1200])}")
             return None
 
     def _repo_cwd(self, record: IssueRecord) -> Path:
@@ -262,13 +313,26 @@ class TriageEngine:
         )
 
     def _extract_json_from_text(self, text: str) -> dict:
-        """Extract JSON from text that may contain markdown fences or extra whitespace."""
-        # Strip markdown code fences if present
+        """Extract the decision object from the model's reply.
+
+        The prompt asks for bare JSON and the model usually obliges, but not
+        always — it opens with a sentence of narration and then fences the
+        object. Anchored fence-stripping only ever handled a fence at
+        character 0, so any preamble made the whole triage fail, twice, and
+        post a content-free question to the issue.
+        """
         text = text.strip()
-        text = re.sub(r"^```(?:json)?\s*", "", text)
-        text = re.sub(r"\s*```$", "", text)
-        text = text.strip()
-        return json.loads(text)
+
+        # Fast path: the whole reply is the object.
+        try:
+            parsed = json.loads(text)
+        except json.JSONDecodeError:
+            pass
+        else:
+            if isinstance(parsed, dict):
+                return parsed
+
+        return _first_json_object(text)
 
 
 def format_clarifying_comment(decision: TriageDecision, config: Config) -> str:
