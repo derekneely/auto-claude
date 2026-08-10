@@ -166,12 +166,21 @@ class Poller:
                 # Re-triage: issue is needs_info and GitHub updated_at changed
                 if (record.status == IssueStatus.NEEDS_INFO
                         and issue.get("updated_at", "") != record.issue_updated_at):
+                    # Refresh the body too, not just the timestamp. The thing
+                    # that moved updated_at is often an edit to the issue body
+                    # answering the very question triage asked — re-triaging
+                    # the stored copy would re-read the text from before the
+                    # answer and ask again. (Labels are already refreshed
+                    # above; comments are fetched live by the triage engine.)
                     self._state.update(
                         issue_id,
+                        title=issue.get("title", record.title),
+                        body=issue.get("body", "") or "",
+                        action=action,
                         issue_updated_at=issue.get("updated_at", ""),
                     )
                     self._state.save()
-                    retriage_issues.append(record)
+                    retriage_issues.append(self._state.get(issue_id))
                     self._logger.info(
                         f"Re-triage candidate: {issue_id} (updated since needs_info)"
                     )

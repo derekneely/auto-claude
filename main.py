@@ -760,6 +760,30 @@ def _post_triage_comment(record, state, github, logger, dry_run, dbsync,
         logger.error(f"Failed to post comment on {record.issue_id}: {exc}")
 
 
+def _refresh_from_github(record, state, github, logger):
+    """Re-read title/body/labels for an issue already in state.
+
+    Best-effort: a failed fetch leaves the stored copy in place rather than
+    aborting the run, since a stale body still triages better than nothing.
+    """
+    try:
+        data = github.get_issue(record.repo, record.number)
+    except Exception as exc:  # noqa: BLE001 — refresh is an improvement, not a gate
+        logger.warn(f"Could not refresh {record.issue_id} from GitHub: {exc}")
+        return record
+
+    labels = [lbl["name"] for lbl in data.get("labels", [])]
+    state.update(
+        record.issue_id,
+        title=data.get("title", record.title),
+        body=data.get("body", "") or "",
+        labels=labels,
+        issue_updated_at=data.get("updated_at", record.issue_updated_at),
+    )
+    state.save()
+    return state.get(record.issue_id)
+
+
 def _run_single_issue(args, config, state, github, triage_engine, logger,
                        process_manager) -> None:
     """Process a single issue (--issue mode) and wait for the worker to finish."""
@@ -830,8 +854,18 @@ def _run_single_issue(args, config, state, github, triage_engine, logger,
         state.add(record)
         state.save()
 
-    # Triage if needed
-    if record.status in (IssueStatus.DISCOVERED,):
+    # Triage if needed. NEEDS_INFO is included deliberately: the poller only
+    # re-triages a parked issue when GitHub's updated_at moves, so without this
+    # the only way to say "go look at this again" was to post a throwaway
+    # comment to bump the timestamp. Naming the issue explicitly IS that
+    # instruction, and NEEDS_INFO -> TRIAGING is already a legal transition.
+    if record.status in (IssueStatus.DISCOVERED, IssueStatus.NEEDS_INFO):
+        if record.status == IssueStatus.NEEDS_INFO:
+            # The stored body and labels are from whenever triage last parked
+            # this issue. Re-triaging the stale copy would re-decide on facts
+            # the human has since edited, and `_run_triage` computes its label
+            # transition from `record.labels`.
+            record = _refresh_from_github(record, state, github, logger)
         _run_triage(record, state, github, triage_engine, config, logger,
                     dbsync=process_manager.dbsync)
         record = state.get(issue_id)

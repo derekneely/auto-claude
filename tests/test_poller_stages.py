@@ -531,3 +531,66 @@ class TestRetriageDoesNotFireOnOurOwnWrite:
             "main._post_triage_comment must re-read updated_at after applying "
             "ac-input-needed, or the poller re-triages its own label write"
         )
+
+
+class TestRetriageRereadsTheIssue:
+    """A re-triage must read the issue as it is now, not as it was when parked.
+
+    The trigger for a re-triage is "updated_at moved", and the most common
+    reason it moved is that the human edited the body to answer the question
+    triage asked. Re-triaging the stored copy would read the text from before
+    the answer and ask the same question again.
+    """
+
+    def _parked(self, state, *, body="old body", title="old title"):
+        from state import IssueRecord, IssueStatus
+
+        issue_id = "field_admin#40"
+        state.add(IssueRecord(
+            issue_id=issue_id, repo="field_admin", number=40,
+            title=title, body=body, labels=["ac-input-needed"],
+            action="implement", status=IssueStatus.DISCOVERED,
+            discovered_at="", updated_at="", issue_updated_at="T1",
+            mode="dev",
+        ))
+        state.transition(issue_id, IssueStatus.TRIAGING)
+        state.transition(issue_id, IssueStatus.NEEDS_INFO)
+        state.update(issue_id, issue_updated_at="T1")
+        state.save()
+        return issue_id
+
+    def test_the_edited_body_reaches_triage(self, state):
+        self._parked(state)
+        payload = [make_issue(40, ["ac-input-needed"], updated_at="T2")]
+        payload[0]["body"] = "new body answering the question"
+
+        _new, retriage = make_poller(payload, state).poll()
+
+        assert [r.body for r in retriage] == ["new body answering the question"]
+
+    def test_the_edited_title_reaches_triage(self, state):
+        self._parked(state)
+        payload = [make_issue(40, ["ac-input-needed"], updated_at="T2")]
+        payload[0]["title"] = "clearer title"
+
+        _new, retriage = make_poller(payload, state).poll()
+
+        assert [r.title for r in retriage] == ["clearer title"]
+
+    def test_the_refreshed_body_is_persisted_not_just_handed_over(self, state):
+        issue_id = self._parked(state)
+        payload = [make_issue(40, ["ac-input-needed"], updated_at="T2")]
+        payload[0]["body"] = "new body"
+
+        make_poller(payload, state).poll()
+
+        assert state.get(issue_id).body == "new body"
+
+    def test_an_unchanged_timestamp_still_does_not_retrigger(self, state):
+        self._parked(state)
+        payload = [make_issue(40, ["ac-input-needed"], updated_at="T1")]
+        payload[0]["body"] = "edited but timestamp unchanged"
+
+        _new, retriage = make_poller(payload, state).poll()
+
+        assert retriage == []

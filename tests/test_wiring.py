@@ -540,3 +540,94 @@ class TestPrNumber:
 
     def test_none_for_a_non_numeric_tail(self):
         assert worker._pr_number("https://github.com/o/r/pulls") is None
+
+
+class TestSingleIssueCanForceRetriage:
+    """`--issue` on a parked needs_info issue must re-triage it.
+
+    The poller only re-triages when GitHub's updated_at moves, so a needs_info
+    issue whose timestamp already matches is unreachable. Without this, the
+    only way to ask for another look was to post a throwaway comment purely to
+    bump the timestamp — the human doing the harness's job again.
+    """
+
+    def _args(self):
+        return SimpleNamespace(issue="field_admin#152")
+
+    def _state_with(self, status):
+        from state import IssueRecord
+
+        record = IssueRecord(
+            issue_id="field_admin#152", repo="field_admin", number=152,
+            title="stale title", body="stale body", labels=["ac-input-needed"],
+            action="implement", status=status,
+            discovered_at="", updated_at="", issue_updated_at="T1",
+        )
+
+        class State:
+            def __init__(self):
+                self.record = record
+                self.updates = []
+
+            def get(self, _id):
+                return self.record
+
+            def update(self, _id, **fields):
+                self.updates.append(fields)
+                for k, v in fields.items():
+                    setattr(self.record, k, v)
+
+            def save(self):
+                pass
+
+            def transition(self, _id, _status):
+                pass
+
+        return State()
+
+    def _github(self):
+        class G:
+            def get_issue(self, repo, number):
+                return {
+                    "title": "fresh title",
+                    "body": "fresh body",
+                    "labels": [{"name": "ac-input-needed"}],
+                    "updated_at": "T2",
+                }
+        return G()
+
+    def _run(self, state, github, monkeypatch):
+        """Drive --issue with _run_triage stubbed, so this asserts routing only."""
+        seen = []
+        monkeypatch.setattr(main, "_run_triage",
+                            lambda record, *a, **k: seen.append(record))
+        main._run_single_issue(
+            self._args(), _config(), state, github,
+            SimpleNamespace(), _logger(), SimpleNamespace(dbsync=None),
+        )
+        return seen
+
+    def test_a_parked_needs_info_issue_is_retriaged(self, monkeypatch):
+        seen = self._run(self._state_with("needs_info"), self._github(), monkeypatch)
+
+        assert seen, "--issue on a needs_info record must re-triage it"
+
+    def test_a_discovered_issue_is_still_triaged(self, monkeypatch):
+        seen = self._run(self._state_with("discovered"), self._github(), monkeypatch)
+
+        assert seen
+
+    def test_the_stale_body_and_labels_are_refreshed_first(self, monkeypatch):
+        seen = self._run(self._state_with("needs_info"), self._github(), monkeypatch)
+
+        assert seen[0].body == "fresh body"
+        assert seen[0].title == "fresh title"
+
+    def test_a_failed_refresh_still_triages_on_the_stored_copy(self, monkeypatch):
+        class Broken:
+            def get_issue(self, repo, number):
+                raise RuntimeError("gh down")
+
+        seen = self._run(self._state_with("needs_info"), Broken(), monkeypatch)
+
+        assert seen and seen[0].body == "stale body"
