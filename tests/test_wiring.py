@@ -433,6 +433,26 @@ class TestSyncBoards:
         )
         assert not Path(called[0]["cwd"]).exists(), "scratch dir leaked"
 
+    def test_a_scratch_dir_that_cannot_be_removed_does_not_fail_the_sync(
+        self, monkeypatch, tmp_path
+    ):
+        # A `gh` grandchild outliving a killed `node` keeps the scratch cwd open
+        # on Windows, and rmtree then raises WinError 32 *after* the sync itself
+        # already succeeded. Cleaning up temp is not worth a run-level warning.
+        handles = []
+
+        def fake(**kw):
+            handles.append(open(Path(kw["cwd"]) / "held.lock", "w"))
+
+        monkeypatch.setattr(main, "sync_board", fake)
+        try:
+            main._sync_boards(  # must not raise
+                _config(tools_root=tmp_path), FakeGithubFiles(), _logger()
+            )
+        finally:
+            for handle in handles:
+                handle.close()
+
 
 class FakeState:
     def __init__(self):

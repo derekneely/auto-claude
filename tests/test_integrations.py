@@ -18,6 +18,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+import integrations  # noqa: E402
 from integrations import (  # noqa: E402
     RunResult,
     TelemetryEvent,
@@ -239,6 +240,19 @@ class TestSyncBoard:
         runner = FakeRunner(RunResult(1, "", "error: missing gh scope"))
         sync_board(REPO_ROOT, TOOLS_ROOT, run=runner, log=messages.append)
         assert messages
+
+    def test_gets_far_longer_than_a_single_telemetry_write(self):
+        # project-sync.mjs costs one graphql round trip per assigned issue, so it
+        # scales with the board while log-event.mjs is one insert. Sharing the
+        # 30s telemetry budget made every non-trivial board time out.
+        runner = FakeRunner()
+        sync_board(REPO_ROOT, TOOLS_ROOT, run=runner)
+        assert runner.calls[0]["timeout"] > integrations.DEFAULT_TIMEOUT_SECONDS
+
+    def test_an_explicit_timeout_still_wins(self):
+        runner = FakeRunner()
+        sync_board(REPO_ROOT, TOOLS_ROOT, run=runner, timeout=9)
+        assert runner.calls[0]["timeout"] == 9
 
 
 class TestDefaultRunnerEncoding:

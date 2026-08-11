@@ -624,7 +624,13 @@ def _sync_boards(config, github, logger: MainLogger) -> None:
             # missing projectBoard block as "disabled", not as an error.
             continue
 
-        with tempfile.TemporaryDirectory(prefix="ac-board-sync-") as scratch:
+        # ignore_cleanup_errors because the scratch dir is the sync's cwd, and on
+        # Windows a `gh` grandchild that outlived a killed `node` keeps a handle
+        # on it - rmtree then raises WinError 32 and turns a best-effort side
+        # effect into a run-level warning. A leaked temp dir is the cheaper loss.
+        with tempfile.TemporaryDirectory(
+            prefix="ac-board-sync-", ignore_cleanup_errors=True
+        ) as scratch:
             pipeline_json = Path(scratch) / PIPELINE_JSON_RELATIVE_PATH
             pipeline_json.parent.mkdir(parents=True, exist_ok=True)
             pipeline_json.write_text(text, encoding="utf-8")

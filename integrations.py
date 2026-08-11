@@ -33,6 +33,14 @@ from ghauth import build_env, current_token
 
 DEFAULT_TIMEOUT_SECONDS = 30
 
+# project-sync.mjs is not a single request like log-event.mjs: it walks every
+# assigned issue in a repo and spends a `gh api graphql` round trip per issue to
+# move its board card. On a board with real work on it that alone blows past 30s,
+# and the timeout is worse than the delay it prevents - a killed `node` leaves
+# its `gh` grandchildren alive on Windows, still holding the scratch cwd open
+# (WinError 32 on cleanup) and still mutating the board unsupervised.
+BOARD_SYNC_TIMEOUT_SECONDS = 300
+
 # Paths are relative to the claude-tools checkout root (the `claude_tools_root`
 # config key), not to auto-claude's own root.
 _LOG_EVENT_SCRIPT = Path("tooling") / "pipeline-metrics" / "scripts" / "log-event.mjs"
@@ -222,7 +230,7 @@ def sync_board(
     assignee: str | None = None,
     dry_run: bool = False,
     run: Runner = _subprocess_runner,
-    timeout: int = DEFAULT_TIMEOUT_SECONDS,
+    timeout: int = BOARD_SYNC_TIMEOUT_SECONDS,
     log: Callable[[str], None] | None = None,
 ) -> BoardSyncResult | None:
     """Sync the Projects v2 board after a stage transition.
